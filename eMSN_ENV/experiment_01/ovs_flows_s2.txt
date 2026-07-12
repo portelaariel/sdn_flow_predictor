@@ -1,0 +1,2 @@
+OFPST_FLOW reply (OF1.3) (xid=0x2):
+ cookie=0x0, duration=354.800s, table=0, n_packets=72, n_bytes=4320, reset_counts dl_type=0x88cc actions=CONTROLLER:65535

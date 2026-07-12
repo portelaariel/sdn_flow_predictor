@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Logs
+logs/
+*.log
+
+# Experiment outputs
+prediction_history_domain*/
+*.pcap
+
+# Mininet
+mn.log
+
+# Editor
+.vscode/
+.idea/
+
+# Sistema
+.DS_Store

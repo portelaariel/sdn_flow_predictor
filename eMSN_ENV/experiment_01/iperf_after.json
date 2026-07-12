@@ -1,0 +1,10 @@
+{
+	"start":	{
+		"connected":	[],
+		"version":	"iperf 3.9",
+		"system_info":	"Linux u22-yasin4 5.15.0-164-generic #174-Ubuntu SMP Fri Nov 14 20:25:16 UTC 2025 x86_64"
+	},
+	"intervals":	[],
+	"end":	{
+	}
+}
