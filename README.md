@@ -53,28 +53,12 @@ coordenação entre domínios.
 
 ### 2.1 Ingestão (independente de topologia)
 
-Os DPIDs **não são configurados**, são descobertos a cada ciclo via
-`GET /stats/switches`. Isso significa que o módulo funciona em qualquer
-topologia (linear, árvore, mesh, c×s arbitrário) e se adapta
-automaticamente quando switches entram ou saem da rede.
+São mantidas duas granularidades de séries temporais, criadas sob demanda:
 
-São mantidas duas granularidades de séries temporais, criadas sob
-demanda:
-
-  ---------------------------------------------------------------------------------------
-  Série             Chave                        Fonte                  Papel
-  ----------------- ---------------------------- ---------------------- -----------------
-  **Porta**         `port:{dpid}:{port_no}`      `/stats/port/{dpid}`   Visão de enlace;
-                                                 (rx+tx bytes)          detecta quedas de
-                                                                        link e saturação
-                                                                        agregada
-
-  **Fluxo**         `flow:{dpid}:{src}->{dst}`   `/stats/flow/{dpid}`   Visão fina; base
-                                                 (match nw_src/nw_dst)  da **mitigação**
-                                                                        (há um par
-                                                                        src/dst
-                                                                        inequívoco)
-  ---------------------------------------------------------------------------------------
+| Série | Chave | Fonte | Papel |
+| --- | --- | --- | --- |
+| **Porta** | `port:{dpid}:{port_no}` | `/stats/port/{dpid}` (rx+tx bytes) | Visão de enlace; detecta quedas de link e saturação agregada. |
+| **Fluxo** | `flow:{dpid}:{src}->{dst}` | `/stats/flow/{dpid}` (match `nw_src`/`nw_dst`) | Visão fina; base da **mitigação** (há um par src/dst inequívoco). |
 
 ### 2.2 Pré-processamento
 
@@ -110,36 +94,13 @@ o resíduo compare a observação contra uma predição genuína
 
 ### 2.4 Detecção de anomalias - z-score robusto sobre resíduos
 
-O detector opera sobre o **resíduo** (observado − predito), não sobre o
-valor bruto. Isso é o que torna a detecção sensível a *desvios do
-padrão* e não a valores absolutos: um fluxo que sempre roda a 800 Mbps é
-normal; um que salta de 5 para 200 Mbps é anômalo, mesmo sendo menor em
-valor absoluto.
-
-A estatística usa **mediana + MAD** (Median Absolute Deviation) em vez
-de média + desvio-padrão. A razão é prática: em janelas curtas, um único
-pico anômalo contamina a média/σ e "cega" o detector para os picos
-seguintes (mascaramento). Mediana e MAD são resistentes a até 50% de
-contaminação. Adicionalmente, resíduos classificados como anômalos **não
-entram na janela**, um ataque prolongado não vira "o novo normal".
-
 Três classes de anomalia são emitidas:
 
-  ------------------------------------------------------------------------------------
-  Tipo                 Gatilho       Interpretação típica               Mitigável?
-  -------------------- ------------- ------------------------------- -----------------
-  `THROUGHPUT_SPIKE`   resíduo \>    DDoS volumétrico, exfiltração,   ✅ (se série de
-                       +k·σ em série elephant flow inesperado             fluxo)
-                       de                                            
-                       fluxo/porta                                   
-
-  `THROUGHPUT_DROP`    resíduo \<    Falha de link, blackhole, regra    ❌ (alerta
-                       −k·σ          DROP indevida                        apenas)
-
-  `NEW_FLOW_SURGE`     nº de fluxos  Port scan, SYN flood               ❌ (alerta
-                       no dpid \> 3× distribuído                          apenas)
-                       baseline                                      
-  ------------------------------------------------------------------------------------
+| Tipo | Gatilho | Interpretação típica | Mitigável? |
+| --- | --- | --- | --- |
+| `THROUGHPUT_SPIKE` | resíduo > +k·σ em série de fluxo/porta | DDoS volumétrico, exfiltração, *elephant flow* inesperado | ✅ (se série de fluxo) |
+| `THROUGHPUT_DROP` | resíduo < −k·σ | Falha de link, *blackhole*, regra DROP indevida | ❌ (alerta apenas) |
+| `NEW_FLOW_SURGE` | nº de fluxos no DPID > 3× baseline | Port scan, SYN flood distribuído | ❌ (alerta apenas) |
 
 ### 2.5 Mitigação autônoma - guard-rails antes de agir
 
@@ -181,15 +142,32 @@ precision/recall ao longo do experimento.
 
 ## 3. API REST
 
-| Método | Endpoint | Função |
-| --- | --- | --- |
-| GET | `/` | Health check |
-| GET | `/predictor/status` | Uptime, número de séries, configuração efetiva e estatísticas de feedback |
-| GET | `/predictor/predictions?top=N` | Top-N séries por vazão com previsão h=1 e h=5 |
-| GET | `/predictor/predictions/<key>` | Detalhes de uma série: previsão multi-horizonte e histórico |
-| GET | `/predictor/anomalies?limit=N` | Lista de anomalias recentes e resultado da mitigação |
-| POST | `/predictor/feedback` | Refina os thresholds por série |
-| POST | `/predictor/config` | Ajusta `auto_mitigate`, `dry_run`, `min_rate_bps` e `cooldown_s` em tempo de execução |
+  ------------------------------------------------------------------------------------
+  Método                Endpoint                         Função
+  --------------------- -------------------------------- -----------------------------
+  GET                   `/`                              Health check
+
+  GET                   `/predictor/status`              Uptime, nº de séries, config
+                                                         efetiva, stats de feedback
+
+  GET                   `/predictor/predictions?top=N`   Top-N séries por vazão com
+                                                         forecast h=1 e h=5
+
+  GET                   `/predictor/predictions/<key>`   Detalhe de uma série:
+                                                         forecast multi-horizonte +
+                                                         histórico completo (para
+                                                         plotar)
+
+  GET                   `/predictor/anomalies?limit=N`   Anomalias recentes com
+                                                         resultado da mitigação
+
+  POST                  `/predictor/feedback`            `{"anomaly_id", "verdict"}`
+                                                         --- refina thresholds
+
+  POST                  `/predictor/config`              Ajuste runtime:
+                                                         `auto_mitigate`, `dry_run`,
+                                                         `min_rate_bps`, `cooldown_s`
+  ------------------------------------------------------------------------------------
 
 **Exemplo de anomalia retornada:**
 
@@ -232,11 +210,23 @@ executar `deploy_flow_predictor.sh 20`.
 GETs HTTP ao Ryu (um por dpid por tipo de stat), não pelo processamento.
 Referências de dimensionamento:
 
-| Escala | Séries estimadas | RAM do módulo | CPU/ciclo | Ajuste sugerido |
-| --- | ---: | ---: | ---: | --- |
-| 4 switches / 8 hosts (testbed atual) | ~40 | < 5 MB | < 5 ms | padrão |
-| 20 switches / 100 fluxos ativos | ~500 | ~20 MB | ~50 ms | `POLL_INTERVAL_S=3` |
-| 100 switches / 2000 fluxos | ~5.000 | ~150 MB | ~400 ms | `POLL_INTERVAL_S=5` + sharding de DPIDs |
+  ----------------------------------------------------------------------------------
+  Escala        Séries estimadas   RAM do módulo   CPU/ciclo Ajuste sugerido
+  ----------- ------------------ --------------- ----------- -----------------------
+  4 switches,               \~40         \< 5 MB     \< 5 ms padrão
+  8 hosts                                                    
+  (testbed                                                   
+  atual)                                                     
+
+  20                       \~500         \~20 MB     \~50 ms `POLL_INTERVAL_S=3`
+  switches,                                                  
+  100 fluxos                                                 
+  ativos                                                     
+
+  100                    \~5.000        \~150 MB    \~400 ms `POLL_INTERVAL_S=5` +
+  switches,                                                  sharding de dpids em 2
+  2000 fluxos                                                instâncias
+  ----------------------------------------------------------------------------------
 
 **Flexibilidade de topologia**: nenhum pressuposto sobre número de
 switches, forma da topologia ou esquema de IPs. Novas séries nascem
