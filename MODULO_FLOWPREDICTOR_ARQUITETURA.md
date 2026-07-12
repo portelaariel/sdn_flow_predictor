@@ -5,7 +5,7 @@
 O **FlowPredictor** é o quarto microserviço por domínio, projetado para se encaixar na arquitetura existente sem modificar nenhum componente atual. Ele consome as **mesmas fontes de dados já disponíveis** (Ryu ofctl_rest), reutiliza o **mesmo mecanismo de mitigação** (FlowBlocker `/flowblocker/service`) e segue o **mesmo padrão operacional** (Flask, ENV vars, logging `[METRICS]`, ETCD opcional).
 
 ```
-┌──────────────────────── DOMÍNIO i ────────────────────────────┐
+┌──────────────────────── DOMÍNIO i ─────────────────────────────┐
 │                                                                │
 │   [Ryu-Core-i]  ◄──── polling GET /stats/* ────┐               │
 │   192.168.(10+i).10:808(0+i)                   │               │
