@@ -142,32 +142,15 @@ precision/recall ao longo do experimento.
 
 ## 3. API REST
 
-  ------------------------------------------------------------------------------------
-  Método                Endpoint                         Função
-  --------------------- -------------------------------- -----------------------------
-  GET                   `/`                              Health check
-
-  GET                   `/predictor/status`              Uptime, nº de séries, config
-                                                         efetiva, stats de feedback
-
-  GET                   `/predictor/predictions?top=N`   Top-N séries por vazão com
-                                                         forecast h=1 e h=5
-
-  GET                   `/predictor/predictions/<key>`   Detalhe de uma série:
-                                                         forecast multi-horizonte +
-                                                         histórico completo (para
-                                                         plotar)
-
-  GET                   `/predictor/anomalies?limit=N`   Anomalias recentes com
-                                                         resultado da mitigação
-
-  POST                  `/predictor/feedback`            `{"anomaly_id", "verdict"}`
-                                                         --- refina thresholds
-
-  POST                  `/predictor/config`              Ajuste runtime:
-                                                         `auto_mitigate`, `dry_run`,
-                                                         `min_rate_bps`, `cooldown_s`
-  ------------------------------------------------------------------------------------
+| Método | Endpoint | Função |
+| --- | --- | --- |
+| GET | `/` | Health check |
+| GET | `/predictor/status` | Uptime, nº de séries, configuração efetiva e estatísticas de feedback |
+| GET | `/predictor/predictions?top=N` | Top-N séries por vazão com *forecast* h=1 e h=5 |
+| GET | `/predictor/predictions/<key>` | Detalhe de uma série: *forecast* multi-horizonte + histórico completo |
+| GET | `/predictor/anomalies?limit=N` | Anomalias recentes com resultado da mitigação |
+| POST | `/predictor/feedback` | `{"anomaly_id", "verdict"}` — refina *thresholds* |
+| POST | `/predictor/config` | Ajuste em tempo de execução: `auto_mitigate`, `dry_run`, `min_rate_bps`, `cooldown_s` |
 
 **Exemplo de anomalia retornada:**
 
@@ -210,23 +193,11 @@ executar `deploy_flow_predictor.sh 20`.
 GETs HTTP ao Ryu (um por dpid por tipo de stat), não pelo processamento.
 Referências de dimensionamento:
 
-  ----------------------------------------------------------------------------------
-  Escala        Séries estimadas   RAM do módulo   CPU/ciclo Ajuste sugerido
-  ----------- ------------------ --------------- ----------- -----------------------
-  4 switches,               \~40         \< 5 MB     \< 5 ms padrão
-  8 hosts                                                    
-  (testbed                                                   
-  atual)                                                     
-
-  20                       \~500         \~20 MB     \~50 ms `POLL_INTERVAL_S=3`
-  switches,                                                  
-  100 fluxos                                                 
-  ativos                                                     
-
-  100                    \~5.000        \~150 MB    \~400 ms `POLL_INTERVAL_S=5` +
-  switches,                                                  sharding de dpids em 2
-  2000 fluxos                                                instâncias
-  ----------------------------------------------------------------------------------
+| Escala | Séries estimadas | RAM do módulo | CPU/ciclo | Ajuste sugerido |
+| --- | ---: | ---: | ---: | --- |
+| 4 switches / 8 hosts (testbed atual) | ~40 | < 5 MB | < 5 ms | padrão |
+| 20 switches / 100 fluxos ativos | ~500 | ~20 MB | ~50 ms | `POLL_INTERVAL_S=3` |
+| 100 switches / 2000 fluxos | ~5.000 | ~150 MB | ~400 ms | `POLL_INTERVAL_S=5` + *sharding* de DPIDs em 2 instâncias |
 
 **Flexibilidade de topologia**: nenhum pressuposto sobre número de
 switches, forma da topologia ou esquema de IPs. Novas séries nascem
