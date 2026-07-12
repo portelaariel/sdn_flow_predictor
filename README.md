@@ -25,7 +25,7 @@ ENV vars, logging `[METRICS]`, ETCD opcional).
     └────────────────────────────────────────────────────────────────┘
 
 **Decisão de design fundamental**: o módulo é *read-only* sobre o plano
-de controle. Ele nunca instala flows diretamente --- toda ação corretiva
+de controle. Ele nunca instala flows diretamente, toda ação corretiva
 passa pelo FlowBlocker, que já implementa a lógica cross-domain, os
 guard-rails e a instalação OF 1.0. Isso preserva a separação de
 responsabilidades da arquitetura e evita duplicação da lógica de
@@ -53,7 +53,7 @@ coordenação entre domínios.
 
 ### 2.1 Ingestão (independente de topologia)
 
-Os DPIDs **não são configurados** --- são descobertos a cada ciclo via
+Os DPIDs **não são configurados**, são descobertos a cada ciclo via
 `GET /stats/switches`. Isso significa que o módulo funciona em qualquer
 topologia (linear, árvore, mesh, c×s arbitrário) e se adapta
 automaticamente quando switches entram ou saem da rede.
@@ -81,12 +81,12 @@ demanda:
 Os contadores do OpenFlow são **cumulativos**, então o módulo calcula
 taxa por delta: `rate_bps = (Δbytes × 8) / Δt`. Dois casos degenerados
 são tratados explicitamente: delta negativo (contador resetou porque o
-flow foi reinstalado ou o switch reiniciou --- comum com os timeouts de
+flow foi reinstalado ou o switch reiniciou, comum com os timeouts de
 5s do SimpleSwitch) e Δt ≤ 0 (amostras fora de ordem). Séries abaixo de
 `MIN_RATE_BPS` alimentam o modelo mas não geram alertas, filtrando o
 ruído de ARP/LLDP.
 
-### 2.3 Predição --- Holt (suavização exponencial dupla)
+### 2.3 Predição - Holt (suavização exponencial dupla)
 
 **Por que Holt e não LSTM/ARIMA?** Três razões alinhadas aos seus
 requisitos de escalabilidade:
@@ -96,7 +96,7 @@ requisitos de escalabilidade:
     menos de 1 MB de RAM e microssegundos de CPU por ciclo. Modelos de
     deep learning exigiriam GPU/batching e quebrariam a promessa de
     "qualquer topologia sem perda de desempenho".
-2.  **Captura nível E tendência** --- melhor que EWMA puro para rampas
+2.  **Captura nível E tendência** - melhor que EWMA puro para rampas
     de tráfego (ex.: início de um iperf), reduzindo falsos positivos
     durante crescimento legítimo.
 3.  **Interface pluggável**: a classe `HoltPredictor` expõe apenas
@@ -104,11 +104,11 @@ requisitos de escalabilidade:
     um modelo treinado offline exige alterar uma única classe, sem tocar
     no coletor, detector ou mitigador.
 
-A predição de 1 passo é feita **antes** do `update()` --- garantindo que
+A predição de 1 passo é feita **antes** do `update()`,  garantindo que
 o resíduo compare a observação contra uma predição genuína
 (out-of-sample), não contra um modelo que já viu o valor.
 
-### 2.4 Detecção de anomalias --- z-score robusto sobre resíduos
+### 2.4 Detecção de anomalias - z-score robusto sobre resíduos
 
 O detector opera sobre o **resíduo** (observado − predito), não sobre o
 valor bruto. Isso é o que torna a detecção sensível a *desvios do
@@ -121,7 +121,7 @@ de média + desvio-padrão. A razão é prática: em janelas curtas, um único
 pico anômalo contamina a média/σ e "cega" o detector para os picos
 seguintes (mascaramento). Mediana e MAD são resistentes a até 50% de
 contaminação. Adicionalmente, resíduos classificados como anômalos **não
-entram na janela** --- um ataque prolongado não vira "o novo normal".
+entram na janela**, um ataque prolongado não vira "o novo normal".
 
 Três classes de anomalia são emitidas:
 
@@ -141,7 +141,7 @@ Três classes de anomalia são emitidas:
                        baseline                                      
   ------------------------------------------------------------------------------------
 
-### 2.5 Mitigação autônoma --- guard-rails antes de agir
+### 2.5 Mitigação autônoma - guard-rails antes de agir
 
 A resposta automatizada só é segura se for **conservadora por
 construção**. O mitigador aplica cinco portões em sequência antes de
@@ -149,20 +149,20 @@ qualquer POST ao FlowBlocker:
 
 1.  `AUTO_MITIGATE` habilitado (kill-switch global, ajustável em
     runtime);
-2.  Apenas `THROUGHPUT_SPIKE` **em série de fluxo** --- nunca bloqueia
+2.  Apenas `THROUGHPUT_SPIKE` **em série de fluxo** - nunca bloqueia
     uma porta inteira ou age sobre quedas (bloquear em resposta a uma
     queda agravaria a falha);
 3.  Whitelist de IPs de infraestrutura (gateways, DNS, controladores);
-4.  Cooldown por par `(src,dst)` --- evita tempestade de políticas
+4.  Cooldown por par `(src,dst)` - evita tempestade de políticas
     idênticas;
-5.  `DRY_RUN` --- modo de sombra que loga `[METRICS][MITIGATION_DRYRUN]`
+5.  `DRY_RUN` - modo de sombra que loga `[METRICS][MITIGATION_DRYRUN]`
     sem executar, permitindo validar o comportamento em produção antes
     de armar o gatilho.
 
 Quando executada, a mitigação reutiliza integralmente o fluxo
 cross-domain já validado do FlowBlocker: se o par src/dst atravessa
 domínios, o FlowBlocker local instala o DROP no seu DPID e propaga ao
-peer via `/receive_flow` --- o FlowPredictor não precisa conhecer a
+peer via `/receive_flow`, o FlowPredictor não precisa conhecer a
 topologia inter-domínio.
 
 ### 2.6 Ciclo de feedback
@@ -172,7 +172,7 @@ topologia inter-domínio.
 **da série específica** (×1.25 por FP, ×0.95 por TP, com limites \[2.5,
 10.0\]). O efeito é que séries naturalmente "nervosas" (tráfego bursty
 legítimo) ficam progressivamente menos sensíveis, enquanto séries
-estáveis ganham sensibilidade --- a precisão se refina por série, não
+estáveis ganham sensibilidade, a precisão se refina por série, não
 por um único knob global. Os vereditos ficam registrados na anomalia e
 nas estatísticas expostas em `/predictor/status`, permitindo medir
 precision/recall ao longo do experimento.
@@ -239,7 +239,7 @@ precision/recall ao longo do experimento.
 ## 4. ESCALABILIDADE E FLEXIBILIDADE
 
 **Horizontal (multi-domínio)**: um FlowPredictor por domínio, sem estado
-compartilhado obrigatório --- o padrão exato do FlowBlocker. Cada
+compartilhado obrigatório, o padrão exato do FlowBlocker. Cada
 instância monitora apenas os DPIDs do seu controlador; a visibilidade
 global é opcional via chave ETCD `flowpredictor/state/<cid>` (mesmo
 prefixo-pattern das domain tables). Escalar de 2 para 20 domínios é
@@ -276,7 +276,7 @@ timeout de 5s, então fluxos ociosos somem naturalmente do
 
 ------------------------------------------------------------------------
 
-## 5. INTEGRAÇÃO COM O TESTBED --- PASSO A PASSO
+## 5. INTEGRAÇÃO COM O TESTBED - PASSO A PASSO
 
 ``` bash
 # 1. Inicializar toda a infraestrutura
