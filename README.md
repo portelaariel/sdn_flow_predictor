@@ -51,19 +51,14 @@ coordenação entre domínios.
                                              ▼
                                       (ciclo se refina continuamente)
 
-### 2.1 Ingestão (independente de topologia)
-
-Os DPIDs **não são configurados**, são descobertos a cada ciclo via
-`GET /stats/switches`. Isso significa que o módulo funciona em qualquer
-topologia (linear, árvore, mesh, c×s arbitrário) e se adapta
-automaticamente quando switches entram ou saem da rede.
+### 2.1
 
 São mantidas duas granularidades de séries temporais, criadas sob demanda:
 
 | Série | Chave | Fonte | Papel |
-|-------|-------|-------|-------|
+|---|---|---|---|
 | **Porta** | `port:{dpid}:{port_no}` | `/stats/port/{dpid}` (rx+tx bytes) | Visão do enlace; detecta quedas de link e saturação agregada. |
-| **Fluxo** | `flow:{dpid}:{src}->{dst}` | `/stats/flow/{dpid}` (match `nw_src`/`nw_dst`) | Visão fina do tráfego; utilizada como base para a mitigação automática. |
+| **Fluxo** | `flow:{dpid}:{src}->{dst}` | `/stats/flow/{dpid}` (`nw_src`/`nw_dst`) | Visão fina do tráfego; utilizada como base para a mitigação automática. |
 
 ### 2.2 Pré-processamento
 
@@ -97,25 +92,12 @@ A predição de 1 passo é feita **antes** do `update()`,  garantindo que
 o resíduo compare a observação contra uma predição genuína
 (out-of-sample), não contra um modelo que já viu o valor.
 
-### 2.4 Detecção de anomalias - z-score robusto sobre resíduos
-
-O detector opera sobre o **resíduo** (observado − predito), não sobre o
-valor bruto. Isso é o que torna a detecção sensível a *desvios do
-padrão* e não a valores absolutos: um fluxo que sempre roda a 800 Mbps é
-normal; um que salta de 5 para 200 Mbps é anômalo, mesmo sendo menor em
-valor absoluto.
-
-A estatística usa **mediana + MAD** (Median Absolute Deviation) em vez
-de média + desvio-padrão. A razão é prática: em janelas curtas, um único
-pico anômalo contamina a média/σ e "cega" o detector para os picos
-seguintes (mascaramento). Mediana e MAD são resistentes a até 50% de
-contaminação. Adicionalmente, resíduos classificados como anômalos **não
-entram na janela**, um ataque prolongado não vira "o novo normal".
+### 2.4
 
 Três classes de anomalia são emitidas:
 
 | Tipo | Gatilho | Interpretação típica | Mitigável? |
-|------|----------|----------------------|------------|
+|---|---|---|---|
 | `THROUGHPUT_SPIKE` | Resíduo > +k·σ em série de fluxo/porta | DDoS volumétrico, exfiltração ou *elephant flow* inesperado | ✅ Sim (apenas para séries de fluxo) |
 | `THROUGHPUT_DROP` | Resíduo < −k·σ | Falha de link, *blackhole* ou regra DROP indevida | ❌ Não (apenas alerta) |
 | `NEW_FLOW_SURGE` | Nº de novos fluxos no DPID > 3× o baseline distribuído | Port scan, SYN flood ou explosão de novos fluxos | ❌ Não (apenas alerta) |
@@ -348,7 +330,7 @@ reduzindo erros de configuração.
 
 ## 6. Limitações
 
-O detector é univariado por série - não correlaciona anomalias entre
+O detector é univariado por série --- não correlaciona anomalias entre
 séries (um DDoS distribuído aparece como N spikes independentes, não
 como um evento único); uma camada de agregação por dst_ip é a extensão
 natural. O `NEW_FLOW_SURGE` com os timeouts de 5s do SimpleSwitch pode
