@@ -181,34 +181,17 @@ precision/recall ao longo do experimento.
 
 ## 3. API REST
 
-  ------------------------------------------------------------------------------------
-  Método                Endpoint                         Função
-  --------------------- -------------------------------- -----------------------------
-  GET                   `/`                              Health check
+| Método | Endpoint | Função |
+|--------|----------|--------|
+| GET | `/` | Health check |
+| GET | `/predictor/status` | Uptime, número de séries, configuração efetiva e estatísticas de feedback |
+| GET | `/predictor/predictions?top=N` | Top-N séries por vazão com previsões |
+| GET | `/predictor/predictions/<key>` | Histórico e previsão detalhada de uma série |
+| GET | `/predictor/anomalies?limit=N` | Anomalias recentes e resultado da mitigação |
+| POST | `/predictor/feedback` | Atualiza thresholds a partir de um veredito |
+| POST | `/predictor/config` | Ajusta `auto_mitigate`, `dry_run`, `min_rate_bps` e `cooldown_s` em tempo de execução |
 
-  GET                   `/predictor/status`              Uptime, nº de séries, config
-                                                         efetiva, stats de feedback
-
-  GET                   `/predictor/predictions?top=N`   Top-N séries por vazão com
-                                                         forecast h=1 e h=5
-
-  GET                   `/predictor/predictions/<key>`   Detalhe de uma série:
-                                                         forecast multi-horizonte +
-                                                         histórico completo (para
-                                                         plotar)
-
-  GET                   `/predictor/anomalies?limit=N`   Anomalias recentes com
-                                                         resultado da mitigação
-
-  POST                  `/predictor/feedback`            `{"anomaly_id", "verdict"}`
-                                                         --- refina thresholds
-
-  POST                  `/predictor/config`              Ajuste runtime:
-                                                         `auto_mitigate`, `dry_run`,
-                                                         `min_rate_bps`, `cooldown_s`
-  ------------------------------------------------------------------------------------
-
-**Exemplo de anomalia retornada:**
+**Exemplo de anomalia retornada:****
 
 ``` json
 {
@@ -249,25 +232,13 @@ executar `deploy_flow_predictor.sh 20`.
 GETs HTTP ao Ryu (um por dpid por tipo de stat), não pelo processamento.
 Referências de dimensionamento:
 
-  ----------------------------------------------------------------------------------
-  Escala        Séries estimadas   RAM do módulo   CPU/ciclo Ajuste sugerido
-  ----------- ------------------ --------------- ----------- -----------------------
-  4 switches,               \~40         \< 5 MB     \< 5 ms padrão
-  8 hosts                                                    
-  (testbed                                                   
-  atual)                                                     
+| Escala | Séries estimadas | RAM | CPU/ciclo | Ajuste sugerido |
+|--------|------------------:|----:|----------:|-----------------|
+| 4 switches / 8 hosts | ~40 | < 5 MB | < 5 ms | padrão |
+| 20 switches / 100 fluxos | ~500 | ~20 MB | ~50 ms | `POLL_INTERVAL_S=3` |
+| 100 switches / 2000 fluxos | ~5000 | ~150 MB | ~400 ms | `POLL_INTERVAL_S=5` + sharding |
 
-  20                       \~500         \~20 MB     \~50 ms `POLL_INTERVAL_S=3`
-  switches,                                                  
-  100 fluxos                                                 
-  ativos                                                     
-
-  100                    \~5.000        \~150 MB    \~400 ms `POLL_INTERVAL_S=5` +
-  switches,                                                  sharding de dpids em 2
-  2000 fluxos                                                instâncias
-  ----------------------------------------------------------------------------------
-
-**Flexibilidade de topologia**: nenhum pressuposto sobre número de
+**Flexibilidade de topologia****: nenhum pressuposto sobre número de
 switches, forma da topologia ou esquema de IPs. Novas séries nascem
 quando o primeiro contador aparece; séries de fluxos expirados
 simplesmente param de ser atualizadas (os flows do SimpleSwitch têm
@@ -369,13 +340,13 @@ reduzindo erros de configuração.
 
 ## 6. Limitações
 
-O detector é univariado por série --- não correlaciona anomalias entre
+O detector é univariado por série, não correlaciona anomalias entre
 séries (um DDoS distribuído aparece como N spikes independentes, não
 como um evento único); uma camada de agregação por dst_ip é a extensão
 natural. O `NEW_FLOW_SURGE` com os timeouts de 5s do SimpleSwitch pode
 oscilar em tráfego bursty legítimo, por isso é apenas alerta. E,
-coerente com o restante do testbed, os endpoints não têm autenticação
---- o `/predictor/config` em especial deveria receber um token antes de
+coerente com o restante do testbed, os endpoints não têm autenticação,
+ o `/predictor/config` em especial deveria receber um token antes de
 qualquer uso fora de laboratório (o padrão está no seu doc
 DEPLOYMENT_TECNICO_AVANCADO § Security Hardening).
 
