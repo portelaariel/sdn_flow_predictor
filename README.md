@@ -301,13 +301,13 @@ reduzindo erros de configuração.
 
 ## 6. Limitações
 
-O detector é univariado por série --- não correlaciona anomalias entre
+O detector é univariado por série, não correlaciona anomalias entre
 séries (um DDoS distribuído aparece como N spikes independentes, não
 como um evento único); uma camada de agregação por dst_ip é a extensão
 natural. O `NEW_FLOW_SURGE` com os timeouts de 5s do SimpleSwitch pode
 oscilar em tráfego bursty legítimo, por isso é apenas alerta. E,
-coerente com o restante do testbed, os endpoints não têm autenticação
---- o `/predictor/config` em especial deveria receber um token antes de
+coerente com o restante do testbed, os endpoints não têm autenticação,
+ o `/predictor/config` em especial deveria receber um token antes de
 qualquer uso fora de laboratório (o padrão está no seu doc
 DEPLOYMENT_TECNICO_AVANCADO § Security Hardening).
 
