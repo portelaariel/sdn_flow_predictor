@@ -1,181 +1,390 @@
-# SDN Test Bed Setup with Ryu-Core, Flow Blocker, Simple Switch, and ETCD Cluster
+# FLOWPREDICTOR --- MÓDULO DE PREDIÇÃO DE VAZÃO E DETECÇÃO DE ANOMALIAS
 
-This guide will walk you through the process of setting up a Software-Defined Networking (SDN) test bed using Docker containers and Mininet. The test bed will deploy multiple controller sets, each including Ryu-Core, Flow Blocker, Simple Switch, and a Mininet topology with Open vSwitch (OVS).
+## 1. VISÃO GERAL
 
-## Overview
+O **FlowPredictor** é o quarto microserviço por domínio, projetado para
+se encaixar na arquitetura existente sem modificar nenhum componente
+atual. Ele consome as **mesmas fontes de dados já disponíveis** (Ryu
+ofctl_rest), reutiliza o **mesmo mecanismo de mitigação** (FlowBlocker
+`/flowblocker/service`) e segue o **mesmo padrão operacional** (Flask,
+ENV vars, logging `[METRICS]`, ETCD opcional).
 
-The test bed consists of the following components:
-- **Ryu-Core**: SDN controller responsible for managing the OpenFlow protocol and controlling OVS switches.
-- **Flow Blocker**: Enforces network security policies by managing flow rules.
-- **Simple Switch**: Provides basic packet forwarding capabilities.
-- **ETCD Cluster**: A 3-node ETCD cluster for configuration management across the SDN components.
+    ┌──────────────────────── DOMÍNIO i ─────────────────────────────┐
+    │                                                                │
+    │   [Ryu-Core-i]  ◄──── polling GET /stats/* ────┐               │
+    │   192.168.(10+i).10:808(0+i)                   │               │
+    │        │                                       │               │
+    │   [SimpleSwitch-i]                    [FlowPredictor-i] NOVO   │
+    │   192.168.(10+i).20                   192.168.(10+i).40        │
+    │                                       :606(0+i)                │
+    │   [FlowBlocker-i] ◄── POST /service ──┘   │                    │
+    │   192.168.(10+i).30                       │                    │
+    │        │                                  │                    │
+    │        └────────── [ETCD Cluster] ────────┘                    │
+    │                    (estado compartilhado multi-domínio)        │
+    └────────────────────────────────────────────────────────────────┘
 
-## Prerequisites
+**Decisão de design fundamental**: o módulo é *read-only* sobre o plano
+de controle. Ele nunca instala flows diretamente --- toda ação corretiva
+passa pelo FlowBlocker, que já implementa a lógica cross-domain, os
+guard-rails e a instalação OF 1.0. Isso preserva a separação de
+responsabilidades da arquitetura e evita duplicação da lógica de
+coordenação entre domínios.
 
-Make sure you have the following installed:
-- **Docker**: For containerization.
-- **Docker Compose** (optional): For managing multiple containers.
-- **Mininet**: Network emulator for simulating network topologies.
-- **Open vSwitch (OVS)**: For virtual switches.
-- **Python 3.6+**: Required for running the Mininet setup script.
-- **Git**: To clone this repository.
+------------------------------------------------------------------------
 
-## Steps to Set Up the Environment
+## 2. PIPELINE DE DADOS (Ingestão → Predição → Detecção → Mitigação → Feedback)
 
-### 1. Clone the Repository
+       ┌─────────────┐   Δbytes/Δt    ┌──────────────┐  resíduo   ┌──────────────┐
+       │  COLETOR    │──────────────► │  PREDITOR    │──────────► │  DETECTOR    │
+       │ /stats/port │  (taxa bps)    │  Holt        │ obs - pred │  z-score MAD │
+       │ /stats/flow │                │ (nível+trend)│            │  adaptativo  │
+       └─────────────┘                └──────────────┘            └──────┬───────┘
+            ▲ poll 2s                                                    │ anomalia
+            │                                                            ▼
+       ┌────┴────────┐                ┌──────────────┐  guard-rails ┌────────────┐
+       │  Ryu REST   │                │  FEEDBACK    │◄─────────────│ MITIGADOR  │
+       │  (ofctl)    │                │  API humana/ │  registro    │ FlowBlocker│
+       └─────────────┘                │  externa     │              │ POST       │
+                                      └──────┬───────┘              └────────────┘
+                                             │ ajusta z_threshold da série
+                                             ▼
+                                      (ciclo se refina continuamente)
 
-First, clone the repository to your local machine:
+### 2.1 Ingestão (independente de topologia)
 
-```bash
-git clone https://gitlab.com/saedi.yasin/evolved-microservice-based-sdn-network.git
-cd <repository-name>
+Os DPIDs **não são configurados** --- são descobertos a cada ciclo via
+`GET /stats/switches`. Isso significa que o módulo funciona em qualquer
+topologia (linear, árvore, mesh, c×s arbitrário) e se adapta
+automaticamente quando switches entram ou saem da rede.
+
+São mantidas duas granularidades de séries temporais, criadas sob
+demanda:
+
+  ---------------------------------------------------------------------------------------
+  Série             Chave                        Fonte                  Papel
+  ----------------- ---------------------------- ---------------------- -----------------
+  **Porta**         `port:{dpid}:{port_no}`      `/stats/port/{dpid}`   Visão de enlace;
+                                                 (rx+tx bytes)          detecta quedas de
+                                                                        link e saturação
+                                                                        agregada
+
+  **Fluxo**         `flow:{dpid}:{src}->{dst}`   `/stats/flow/{dpid}`   Visão fina; base
+                                                 (match nw_src/nw_dst)  da **mitigação**
+                                                                        (há um par
+                                                                        src/dst
+                                                                        inequívoco)
+  ---------------------------------------------------------------------------------------
+
+### 2.2 Pré-processamento
+
+Os contadores do OpenFlow são **cumulativos**, então o módulo calcula
+taxa por delta: `rate_bps = (Δbytes × 8) / Δt`. Dois casos degenerados
+são tratados explicitamente: delta negativo (contador resetou porque o
+flow foi reinstalado ou o switch reiniciou --- comum com os timeouts de
+5s do SimpleSwitch) e Δt ≤ 0 (amostras fora de ordem). Séries abaixo de
+`MIN_RATE_BPS` alimentam o modelo mas não geram alertas, filtrando o
+ruído de ARP/LLDP.
+
+### 2.3 Predição --- Holt (suavização exponencial dupla)
+
+**Por que Holt e não LSTM/ARIMA?** Três razões alinhadas aos seus
+requisitos de escalabilidade:
+
+1.  **Custo O(1) por amostra e \~100 bytes de estado por série.** Uma
+    topologia com 50 switches × 40 fluxos ativos = 2.000 séries custam
+    menos de 1 MB de RAM e microssegundos de CPU por ciclo. Modelos de
+    deep learning exigiriam GPU/batching e quebrariam a promessa de
+    "qualquer topologia sem perda de desempenho".
+2.  **Captura nível E tendência** --- melhor que EWMA puro para rampas
+    de tráfego (ex.: início de um iperf), reduzindo falsos positivos
+    durante crescimento legítimo.
+3.  **Interface pluggável**: a classe `HoltPredictor` expõe apenas
+    `update(value)` e `predict(horizon)`. Trocar por ARIMA, Prophet ou
+    um modelo treinado offline exige alterar uma única classe, sem tocar
+    no coletor, detector ou mitigador.
+
+A predição de 1 passo é feita **antes** do `update()` --- garantindo que
+o resíduo compare a observação contra uma predição genuína
+(out-of-sample), não contra um modelo que já viu o valor.
+
+### 2.4 Detecção de anomalias --- z-score robusto sobre resíduos
+
+O detector opera sobre o **resíduo** (observado − predito), não sobre o
+valor bruto. Isso é o que torna a detecção sensível a *desvios do
+padrão* e não a valores absolutos: um fluxo que sempre roda a 800 Mbps é
+normal; um que salta de 5 para 200 Mbps é anômalo, mesmo sendo menor em
+valor absoluto.
+
+A estatística usa **mediana + MAD** (Median Absolute Deviation) em vez
+de média + desvio-padrão. A razão é prática: em janelas curtas, um único
+pico anômalo contamina a média/σ e "cega" o detector para os picos
+seguintes (mascaramento). Mediana e MAD são resistentes a até 50% de
+contaminação. Adicionalmente, resíduos classificados como anômalos **não
+entram na janela** --- um ataque prolongado não vira "o novo normal".
+
+Três classes de anomalia são emitidas:
+
+  ------------------------------------------------------------------------------------
+  Tipo                 Gatilho       Interpretação típica               Mitigável?
+  -------------------- ------------- ------------------------------- -----------------
+  `THROUGHPUT_SPIKE`   resíduo \>    DDoS volumétrico, exfiltração,   ✅ (se série de
+                       +k·σ em série elephant flow inesperado             fluxo)
+                       de                                            
+                       fluxo/porta                                   
+
+  `THROUGHPUT_DROP`    resíduo \<    Falha de link, blackhole, regra    ❌ (alerta
+                       −k·σ          DROP indevida                        apenas)
+
+  `NEW_FLOW_SURGE`     nº de fluxos  Port scan, SYN flood               ❌ (alerta
+                       no dpid \> 3× distribuído                          apenas)
+                       baseline                                      
+  ------------------------------------------------------------------------------------
+
+### 2.5 Mitigação autônoma --- guard-rails antes de agir
+
+A resposta automatizada só é segura se for **conservadora por
+construção**. O mitigador aplica cinco portões em sequência antes de
+qualquer POST ao FlowBlocker:
+
+1.  `AUTO_MITIGATE` habilitado (kill-switch global, ajustável em
+    runtime);
+2.  Apenas `THROUGHPUT_SPIKE` **em série de fluxo** --- nunca bloqueia
+    uma porta inteira ou age sobre quedas (bloquear em resposta a uma
+    queda agravaria a falha);
+3.  Whitelist de IPs de infraestrutura (gateways, DNS, controladores);
+4.  Cooldown por par `(src,dst)` --- evita tempestade de políticas
+    idênticas;
+5.  `DRY_RUN` --- modo de sombra que loga `[METRICS][MITIGATION_DRYRUN]`
+    sem executar, permitindo validar o comportamento em produção antes
+    de armar o gatilho.
+
+Quando executada, a mitigação reutiliza integralmente o fluxo
+cross-domain já validado do FlowBlocker: se o par src/dst atravessa
+domínios, o FlowBlocker local instala o DROP no seu DPID e propaga ao
+peer via `/receive_flow` --- o FlowPredictor não precisa conhecer a
+topologia inter-domínio.
+
+### 2.6 Ciclo de feedback
+
+`POST /predictor/feedback` com
+`{"anomaly_id": "...", "verdict": "false_positive"}` ajusta o threshold
+**da série específica** (×1.25 por FP, ×0.95 por TP, com limites \[2.5,
+10.0\]). O efeito é que séries naturalmente "nervosas" (tráfego bursty
+legítimo) ficam progressivamente menos sensíveis, enquanto séries
+estáveis ganham sensibilidade --- a precisão se refina por série, não
+por um único knob global. Os vereditos ficam registrados na anomalia e
+nas estatísticas expostas em `/predictor/status`, permitindo medir
+precision/recall ao longo do experimento.
+
+------------------------------------------------------------------------
+
+## 3. API REST
+
+  ------------------------------------------------------------------------------------
+  Método                Endpoint                         Função
+  --------------------- -------------------------------- -----------------------------
+  GET                   `/`                              Health check
+
+  GET                   `/predictor/status`              Uptime, nº de séries, config
+                                                         efetiva, stats de feedback
+
+  GET                   `/predictor/predictions?top=N`   Top-N séries por vazão com
+                                                         forecast h=1 e h=5
+
+  GET                   `/predictor/predictions/<key>`   Detalhe de uma série:
+                                                         forecast multi-horizonte +
+                                                         histórico completo (para
+                                                         plotar)
+
+  GET                   `/predictor/anomalies?limit=N`   Anomalias recentes com
+                                                         resultado da mitigação
+
+  POST                  `/predictor/feedback`            `{"anomaly_id", "verdict"}`
+                                                         --- refina thresholds
+
+  POST                  `/predictor/config`              Ajuste runtime:
+                                                         `auto_mitigate`, `dry_run`,
+                                                         `min_rate_bps`, `cooldown_s`
+  ------------------------------------------------------------------------------------
+
+**Exemplo de anomalia retornada:**
+
+``` json
+{
+  "anomaly_id": "a3f8c92e1b04",
+  "kind": "THROUGHPUT_SPIKE",
+  "key": "flow:1:10.0.0.1->10.0.0.4",
+  "meta": {"type": "flow", "dpid": 1, "nw_src": "10.0.0.1", "nw_dst": "10.0.0.4"},
+  "observed_bps": 94500000.0,
+  "predicted_bps": 1200000.0,
+  "z_score": 18.7,
+  "threshold": 4.0,
+  "ts_detect_ns": 1752230000123456789,
+  "cid": "192.168.10.10",
+  "mitigation": {
+    "attempted": true,
+    "executed": true,
+    "reason": "FlowBlocker HTTP 200",
+    "flowblocker_response": {
+      "message": "Cross-controller flow rules installed successfully",
+      "policy_id": "auto-a3f8c92e1b04"
+    }
+  }
+}
 ```
-### 2. Build Docker Images
-Build the Docker images for the Ryu-Core, Flow Blocker, Simple Switch, and ETCD components.
 
-```bash
-# Build Ryu-Core Image
-docker build -t ryu-core ./ryu_core
-```
-# Build Flow Blocker Image
-```bash
-docker build -t flow-blocker ./flow_blocker
-```
-# Build Simple Switch Image
-```bash
-docker build -t simple-switch-rest-vr ./simple_switch
-```
-# (Optional) Build ETCD Image if using a custom ETCD
-```bash
-docker build -t etcd-image ./etcd
-```
+------------------------------------------------------------------------
 
-### 3. Set Up the ETCD Cluster
-Create a 3-node ETCD cluster using Docker:
+## 4. ESCALABILIDADE E FLEXIBILIDADE
 
-```bash
-# Create ETCD network
-docker network create --subnet=192.168.253.0/24 etcd-network
-# Run ETCD containers
-for i in {1..3}; do
-    docker run -d --name etcd$i --network etcd-network --ip 192.168.253.$((10+i)) \
-    -p $((2378 + i)):2379 -p $((2380 + i)):2380 \
-    -e ALLOW_NONE_AUTHENTICATION=yes \
-    bitnami/etcd:latest
-done
-```
-### 4. Set Up the Ryu-Core, Flow Blocker, and Simple Switch Containers
-Run the Docker containers for Ryu-Core, Flow Blocker, and Simple Switch for each domain. The example below sets up two domains (Domain 1 and Domain 2):
+**Horizontal (multi-domínio)**: um FlowPredictor por domínio, sem estado
+compartilhado obrigatório --- o padrão exato do FlowBlocker. Cada
+instância monitora apenas os DPIDs do seu controlador; a visibilidade
+global é opcional via chave ETCD `flowpredictor/state/<cid>` (mesmo
+prefixo-pattern das domain tables). Escalar de 2 para 20 domínios é
+executar `deploy_flow_predictor.sh 20`.
 
-```bash
-# Domain 1 (Controller 1, Flow Blocker 1, Simple Switch 1)
-docker run -d --name ryu-core-1 --network ryu-network-1 --ip 192.168.10.10 \
--e SIMPLESWITCH_URL="http://192.168.10.20:9090/packetin" \
--e FLOWBLOCKER_URL="http://192.168.10.30:7070/flowblocker/domain_table" \
--e CONTROLLER_ID="192.168.10.10" \
--e OFP_TCP_PORT=6633 \
--e WSGI_PORT=8080 \
--p 6633:6633 -p 8080:8080 ryu-core
+**Vertical (dentro do domínio)**: o custo por ciclo é dominado pelos
+GETs HTTP ao Ryu (um por dpid por tipo de stat), não pelo processamento.
+Referências de dimensionamento:
 
-docker run -d --name simple-switch-1 --network ryu-network-1 --ip 192.168.10.20 \
--e RYU_BASE_URL="http://192.168.10.10:8080" \
--p 9090:9090 simple-switch-rest-vr
+  ----------------------------------------------------------------------------------
+  Escala        Séries estimadas   RAM do módulo   CPU/ciclo Ajuste sugerido
+  ----------- ------------------ --------------- ----------- -----------------------
+  4 switches,               \~40         \< 5 MB     \< 5 ms padrão
+  8 hosts                                                    
+  (testbed                                                   
+  atual)                                                     
 
-docker run -d --name flow-blocker-1 --network ryu-network-1 --ip 192.168.10.30 \
--e RYU_BASE_URL="http://192.168.10.10:8080" \
--p 7070:7070 flow-blocker
+  20                       \~500         \~20 MB     \~50 ms `POLL_INTERVAL_S=3`
+  switches,                                                  
+  100 fluxos                                                 
+  ativos                                                     
 
-# Domain 2 (Controller 2, Flow Blocker 2, Simple Switch 2)
-docker run -d --name ryu-core-2 --network ryu-network-2 --ip 192.168.11.10 \
--e SIMPLESWITCH_URL="http://192.168.11.20:9092/packetin" \
--e FLOWBLOCKER_URL="http://192.168.11.30:7071/flowblocker/domain_table" \
--e CONTROLLER_ID="192.168.11.10" \
--e OFP_TCP_PORT=6634 \
--e WSGI_PORT=8081 \
--p 6634:6634 -p 8081:8081 ryu-core
+  100                    \~5.000        \~150 MB    \~400 ms `POLL_INTERVAL_S=5` +
+  switches,                                                  sharding de dpids em 2
+  2000 fluxos                                                instâncias
+  ----------------------------------------------------------------------------------
 
-docker run -d --name simple-switch-2 --network ryu-network-2 --ip 192.168.11.20 \
--e RYU_BASE_URL="http://192.168.11.10:8081" \
--p 9092:9090 simple-switch-rest-vr
+**Flexibilidade de topologia**: nenhum pressuposto sobre número de
+switches, forma da topologia ou esquema de IPs. Novas séries nascem
+quando o primeiro contador aparece; séries de fluxos expirados
+simplesmente param de ser atualizadas (os flows do SimpleSwitch têm
+timeout de 5s, então fluxos ociosos somem naturalmente do
+`/stats/flow`).
 
-docker run -d --name flow-blocker-2 --network ryu-network-2 --ip 192.168.11.30 \
--e RYU_BASE_URL="http://192.168.11.10:8081" \
--p 7071:7070 flow-blocker
-5. Connect Flow Blockers to ETCD Cluster
-Ensure that the Flow Blockers are connected to the ETCD network for configuration management:
-```
-```bash
-docker network connect etcd-network flow-blocker-1
-docker network connect etcd-network flow-blocker-2
-```
-### 6. Generate Mininet Topology
-Use the provided Bash script to generate the Mininet topology based on your configuration (e.g., c=2 and s=2):
+------------------------------------------------------------------------
 
-```bash
-# Run the environment setup script
+## 5. INTEGRAÇÃO COM O TESTBED --- PASSO A PASSO
+
+``` bash
+# 1. Inicializar toda a infraestrutura
 ./setup_env.sh
-```
-This will generate a Python Mininet topology script (setup_mininet.py) based on the input parameters.
 
-### 7. Run Mininet Topology
-After generating the topology, run the Mininet script to simulate the network:
+# O setup_env.sh realiza automaticamente o bootstrap de:
+# - ETCD
+# - Ryu-Core
+# - SimpleSwitch
+# - FlowBlocker
+# - FlowPredictor
 
-```bash
-sudo python3 setup_mininet.py
-```
+# 2. Criar a topologia Mininet
+sudo CSETS=2 SPER=2 ./setup_mininet.py
 
-Mininet will set up the OVS switches and connect them to the Ryu-Core controllers, allowing traffic to flow between the hosts.
+# 3. Confirmar que os microserviços estão operacionais
+docker ps
 
-### 8. Verify and Monitor the Environment
-Monitor the containers and network to ensure everything is running smoothly:
+# 4. Verificar coleta (aguarde ~30 s de warm-up = 15 amostras × 2 s)
+curl http://127.0.0.1:6060/predictor/status | jq .
+curl http://127.0.0.1:6060/predictor/predictions | jq .
 
-```bash
-#Ryu-Core Logs:
-docker logs ryu-core-1
-docker logs ryu-core-2
+# 4. Provocar uma anomalia (no Mininet, após tráfego baseline estável)
+mininet> h4 iperf3 -s -D
+mininet> h1 ping -c 30 10.0.0.4 -i 0.5        # baseline ~modesto por ~15s
+mininet> h1 iperf3 -c 10.0.0.4 -t 20           # SPIKE súbito
 
-#Flow Blocker Logs:
-docker logs flow-blocker-1
-docker logs flow-blocker-2
+# 5. Observar detecção + dry-run da mitigação
+curl http://127.0.0.1:6060/predictor/anomalies | jq '.anomalies[0]'
+docker logs flow-predictor-0 | grep "\[METRICS\]\[MITIGATION_DRYRUN\]"
 
-#Simple Switch Logs:
-docker logs simple-switch-1
-docker logs simple-switch-2
-```
+# 6. Armar mitigação real e repetir o passo 4
+curl -X POST http://127.0.0.1:6060/predictor/config \
+  -H "Content-Type: application/json" -d '{"dry_run": false}'
 
-Mininet CLI: Use the Mininet CLI to test connectivity between hosts:
+# 7. Confirmar o DROP instalado pelo FlowBlocker (cross-domain!)
+# Executar no terminal do host (fora do CLI do Mininet)
+sudo ovs-ofctl -O OpenFlow10 dump-flows s1 | grep nw_src=10.0.0.1
 
-```bash
-sudo mn --test pingall
-```
+# Validar no Mininet
+mininet> h1 ping -c 3 10.0.0.4                 # deve falhar
 
-9. Tear Down the Environment
-Once you're done with the test bed, you can tear down the environment by stopping and removing the Docker containers:
-
-```bash
-docker stop $(docker ps -aq)
-docker rm $(docker ps -aq)
-```
-You can also remove the custom Docker networks:
-
-```bash
-docker network rm etcd-network ryu-network-1 ryu-network-2
+# 8. Se foi falso positivo, ensinar o módulo
+curl -X POST http://127.0.0.1:6060/predictor/feedback \
+  -H "Content-Type: application/json" \
+  -d '{"anomaly_id": "a3f8c92e1b04", "verdict": "false_positive"}'
 ```
 
-This SDN test bed setup allows for easy deployment of Ryu-Core, Flow Blocker, Simple Switch, and an ETCD cluster across multiple domains. By containerizing these components and using Mininet for network simulation, the test bed provides a flexible environment to test and validate SDN architectures, including performance, scalability, and security policies.
+**Correlação de métricas fim-a-fim**: os logs
+estruturados permitem medir a latência total de resposta autônoma
+cruzando timestamps em nanosegundos, no mesmo estilo dos logs
+existentes:
 
-vbnet
-Copy code
+    [METRICS][ANOMALY_DETECT]   id=... ts_ns=T1        (FlowPredictor)
+    [METRICS][MITIGATION_APPLY] ts_send_ns=T2          (FlowPredictor → FlowBlocker)
+    [METRICS][POLICY_APPLY]     ts_decide_ns=T3        (FlowBlocker, já existente)
+    [METRICS][FLOW_MOD]         ts_send_ns=T4          (via ofctl_rest)
 
-### Explanation:
-- The README file provides a step-by-step guide to set up the test bed, starting from building Docker images, configuring ETCD, and running Ryu-Core, Flow Blocker, and Simple Switch instances.
-- It includes commands for connecting Flow Blocker to the ETCD cluster, generating Mininet topologies, and monitoring the environment.
-- Finally, it provides instructions for tearing down the environment when finished. 
+    Latência de resposta autônoma = T4 − T1
 
+### 5.1 Validação da infraestrutura
 
+Antes de iniciar os experimentos, recomenda-se verificar o estado dos
+microserviços:
 
+``` bash
+docker ps
+```
 
+Estado esperado:
 
+-   `ryu-core-*` → healthy
+-   `simple-switch-*` → healthy
+-   `flow-blocker-*` → healthy
+-   `flow-predictor-*` → Up
 
+Os Docker Healthchecks utilizam os endpoints e portas corretos de cada
+instância, permitindo validar automaticamente ambientes com múltiplos
+domínios.
 
+### 5.2 Bootstrap automatizado
 
+Nesta versão, o FlowPredictor foi integrado ao processo de inicialização
+do ambiente. Dessa forma, não é mais necessário executar manualmente
+`deploy_flow_predictor.sh` durante o fluxo normal de utilização. Todo o
+ambiente é preparado pelo `setup_env.sh`, simplificando a implantação e
+reduzindo erros de configuração.
+
+------------------------------------------------------------------------
+
+## 6. Limitações
+
+O detector é univariado por série --- não correlaciona anomalias entre
+séries (um DDoS distribuído aparece como N spikes independentes, não
+como um evento único); uma camada de agregação por dst_ip é a extensão
+natural. O `NEW_FLOW_SURGE` com os timeouts de 5s do SimpleSwitch pode
+oscilar em tráfego bursty legítimo, por isso é apenas alerta. E,
+coerente com o restante do testbed, os endpoints não têm autenticação
+--- o `/predictor/config` em especial deveria receber um token antes de
+qualquer uso fora de laboratório (o padrão está no seu doc
+DEPLOYMENT_TECNICO_AVANCADO § Security Hardening).
+
+Caminho de evolução sem quebra de interface: (1) preditor sazonal
+Holt-Winters para tráfego com padrão diário, (2) exportador Prometheus
+nos snapshots já existentes, (3) modelo global treinado offline injetado
+via a interface pluggável do `HoltPredictor`.
+
+------------------------------------------------------------------------
+
+**Versão**: 1.1 · **Data**: 2026-07-12 · **Status**: ✅ Integrado ao
+setup_env.sh e validado em ambiente multi-domínio
