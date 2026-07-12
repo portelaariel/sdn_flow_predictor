@@ -10,7 +10,7 @@ O **FlowPredictor** é o quarto microserviço por domínio, projetado para se en
 │   [Ryu-Core-i]  ◄──── polling GET /stats/* ────┐               │
 │   192.168.(10+i).10:808(0+i)                   │               │
 │        │                                       │               │
-│   [SimpleSwitch-i]                    [FlowPredictor-i] ⭐NOVO │
+│   [SimpleSwitch-i]                    [FlowPredictor-i] NOVO   │
 │   192.168.(10+i).20                   192.168.(10+i).40        │
 │                                       :606(0+i)                │
 │   [FlowBlocker-i] ◄── POST /service ──┘   │                    │
