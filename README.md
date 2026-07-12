@@ -299,24 +299,5 @@ reduzindo erros de configuração.
 
 ------------------------------------------------------------------------
 
-## 6. Limitações
-
-O detector é univariado por série, não correlaciona anomalias entre
-séries (um DDoS distribuído aparece como N spikes independentes, não
-como um evento único); uma camada de agregação por dst_ip é a extensão
-natural. O `NEW_FLOW_SURGE` com os timeouts de 5s do SimpleSwitch pode
-oscilar em tráfego bursty legítimo, por isso é apenas alerta. E,
-coerente com o restante do testbed, os endpoints não têm autenticação,
- o `/predictor/config` em especial deveria receber um token antes de
-qualquer uso fora de laboratório (o padrão está no seu doc
-DEPLOYMENT_TECNICO_AVANCADO § Security Hardening).
-
-Caminho de evolução sem quebra de interface: (1) preditor sazonal
-Holt-Winters para tráfego com padrão diário, (2) exportador Prometheus
-nos snapshots já existentes, (3) modelo global treinado offline injetado
-via a interface pluggável do `HoltPredictor`.
-
-------------------------------------------------------------------------
-
 **Versão**: 1.1 · **Data**: 2026-07-12 · **Status**: ✅ Integrado ao
 setup_env.sh e validado em ambiente multi-domínio
