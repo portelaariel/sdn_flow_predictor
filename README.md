@@ -211,7 +211,15 @@ timeout de 5s, então fluxos ociosos somem naturalmente do
 ## 5. INTEGRAÇÃO COM O TESTBED - PASSO A PASSO
 
 ``` bash
-# 1. Inicializar toda a infraestrutura
+# 0. Pré-requisito (rodar UMA VEZ, na raiz do repositório): buildar as
+#    imagens base. O setup_env.sh NÃO builda estas três automaticamente,
+#    só a flow_predictor_cnsm.
+sudo docker build -t ryu_core_cnsm -f ryu_apps/Dockerfile ryu_apps/
+sudo docker build -t simpleswitch_cnsm -f rest_client/Dockerfile rest_client/
+sudo docker build -t flow_blocker_cnsm -f flow_blocker/Dockerfile flow_blocker/
+
+# 1. Inicializar toda a infraestrutura (dentro de eMSN_ENV/)
+cd eMSN_ENV
 ./setup_env.sh
 
 # O setup_env.sh realiza automaticamente o bootstrap de:

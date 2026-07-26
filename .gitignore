@@ -12,6 +12,7 @@ prediction_history_domain*/
 
 # Mininet
 mn.log
+eMSN_ENV/setup_mininet.py
 
 # Editor
 .vscode/

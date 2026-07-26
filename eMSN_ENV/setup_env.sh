@@ -11,7 +11,7 @@ read -p "Enter the number of switches per controller set (s): " s
 RYU_IMG=ryu_core_cnsm
 SSW_IMG=simpleswitch_cnsm
 FB_IMG=flow_blocker_cnsm
-ETCD_IMG=bitnami/etcd
+ETCD_IMG=bitnamilegacy/etcd:3.5
 
 # Base addressing/ports per controller set
 SUBNET_BASE=10
@@ -379,7 +379,7 @@ if [[ "$RUN_PREDICTOR" == "true" ]]; then
 
     if ! sudo docker image inspect flow_predictor_cnsm >/dev/null 2>&1; then
         echo "[i] Building Flow Predictor image..."
-        sudo docker build -t flow_predictor_cnsm -f Dockerfile.flow_predictor .
+        sudo docker build -t flow_predictor_cnsm -f "$PROJECT_ROOT/Dockerfile.flow_predictor" "$PROJECT_ROOT"
     fi
 
     echo "[i] Deploying Flow Predictor..."
