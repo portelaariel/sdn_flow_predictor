@@ -265,6 +265,11 @@ global é opcional via chave ETCD `flowpredictor/state/<cid>` (mesmo
 prefixo-pattern das domain tables). Escalar de 2 para 20 domínios é
 executar `sudo bash deploy_flow_predictor.sh 20`.
 
+O emitter de cada `ryu-core-i` anuncia `flow-blocker-i` como endpoint do
+seu domínio. Como todos os FlowBlockers também participam da rede Docker
+compartilhada do ETCD, esse nome é resolvível entre domínios durante a
+propagação de regras DROP.
+
 **Vertical (dentro do domínio)**: o custo por ciclo é dominado pelos
 GETs HTTP ao Ryu (um por dpid por tipo de stat), não pelo processamento.
 Referências de dimensionamento:
