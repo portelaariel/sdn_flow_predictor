@@ -7,8 +7,8 @@ FlowPredictor (CNSM) — Predição de Vazão + Detecção de Anomalias + Mitiga
 
 Arquitetura (consistente com o testbed CNSM):
   - Coleta:    Ryu ofctl_rest (OF 1.0)  -> /stats/switches, /stats/port/{dpid}, /stats/flow/{dpid}
-  - Predição:  Holt (suavização exponencial dupla: nível + tendência) por série temporal
-  - Anomalia:  z-score robusto (MAD) sobre resíduos (observado - predito) + heurística de surto de fluxos
+  - Predição:  Holt calibrado offline (nível + tendência) por série temporal
+  - Anomalia:  z-score robusto usando resíduos calibrados offline + heurística de surto de fluxos
   - Mitigação: FlowBlocker  -> POST /flowblocker/service  {"src_ip": ..., "dst_ip": ...}
   - Estado:    ETCD (opcional) -> flowpredictor/state/<cid>  (visibilidade multi-domínio)
   - Feedback:  POST /predictor/feedback ajusta sensibilidade (threshold adaptativo)
@@ -30,7 +30,10 @@ ENV (mesmo padrão dos demais serviços):
   DRY_RUN               true|false (loga a mitigação sem executar)
   MITIGATION_COOLDOWN_S 60
   WHITELIST_IPS         10.0.0.254,...  (nunca bloquear)
-  WARMUP_SAMPLES        15         # amostras mínimas antes de detectar
+  WARMUP_SAMPLES        15         # fallback adaptativo quando não há modelo offline
+  OFFLINE_MODEL_PATH               # artefato JSON criado por train_offline_model.py
+  OFFLINE_MODEL_REQUIRED false      # falha startup se o artefato não puder ser carregado
+  ONLINE_MODEL_ADAPTATION false     # permite adaptar a calibração offline por série
 
   # Persistência do histórico (dataset offline p/ LSTM/GRU, RMSE/MAE, gráficos):
   EXPORT_ENABLED        true|false (default true)
@@ -54,6 +57,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from flask import Flask, jsonify, request
 
+from offline_model import (
+    OfflineModel,
+    inverse_transform_value,
+    load_offline_model,
+    transform_value,
+)
+
 # ---------------- Configuração via ENV ----------------
 RYU_BASE_URL      = os.environ.get("RYU_BASE_URL", "http://127.0.0.1:8080").rstrip("/")
 FLOWBLOCKER_URL   = os.environ.get("FLOWBLOCKER_URL", "http://127.0.0.1:7070").rstrip("/")
@@ -69,7 +79,11 @@ DRY_RUN           = os.environ.get("DRY_RUN", "false").lower() == "true"
 COOLDOWN_S        = float(os.environ.get("MITIGATION_COOLDOWN_S", "60"))
 WHITELIST_IPS     = {ip.strip() for ip in os.environ.get("WHITELIST_IPS", "").split(",") if ip.strip()}
 WARMUP_SAMPLES    = int(os.environ.get("WARMUP_SAMPLES", "15"))
+FLOW_SURGE_WARMUP = int(os.environ.get("FLOW_SURGE_WARMUP_SAMPLES", str(WARMUP_SAMPLES)))
 REQUEST_TIMEOUT_S = float(os.environ.get("REQUEST_TIMEOUT_S", "5.0"))
+OFFLINE_MODEL_PATH = os.environ.get("OFFLINE_MODEL_PATH", "").strip()
+OFFLINE_MODEL_REQUIRED = os.environ.get("OFFLINE_MODEL_REQUIRED", "false").lower() == "true"
+ONLINE_MODEL_ADAPTATION = os.environ.get("ONLINE_MODEL_ADAPTATION", "false").lower() == "true"
 
 # --- Persistência do histórico de predição (aditivo; não afeta a lógica online) ---
 EXPORT_ENABLED     = os.environ.get("EXPORT_ENABLED", "true").lower() == "true"
@@ -82,6 +96,44 @@ EXPORT_FLUSH_EVERY = int(os.environ.get("EXPORT_FLUSH_EVERY", "10"))  # flush a 
 logging.basicConfig(level=logging.INFO,
                     format="%(levelname)s:FlowPredictor:%(asctime)s - %(message)s")
 logger = logging.getLogger("FlowPredictor")
+
+
+def _load_runtime_model() -> Tuple[Optional[OfflineModel], Optional[str]]:
+    if not OFFLINE_MODEL_PATH:
+        if OFFLINE_MODEL_REQUIRED:
+            raise RuntimeError("OFFLINE_MODEL_REQUIRED=true, mas OFFLINE_MODEL_PATH está vazio")
+        logger.warning("Modelo offline não configurado; usando detector adaptativo com warmup")
+        return None, None
+    try:
+        model = load_offline_model(OFFLINE_MODEL_PATH)
+        logger.info(
+            "Modelo offline carregado: path=%s alpha=%s beta=%s threshold=%s",
+            OFFLINE_MODEL_PATH, model.alpha, model.beta, model.z_threshold,
+        )
+        input_config = model.training.get("input", {})
+        trained_interval = (input_config.get("sample_interval_s")
+                            if isinstance(input_config, dict) else None)
+        if trained_interval is not None:
+            try:
+                relative_error = (abs(float(trained_interval) - POLL_INTERVAL_S)
+                                  / max(POLL_INTERVAL_S, 1e-9))
+                if relative_error > 0.25:
+                    logger.warning(
+                        "Intervalo do modelo (%ss) difere do polling online (%ss); "
+                        "reampostre o dataset ou ajuste POLL_INTERVAL_S",
+                        trained_interval, POLL_INTERVAL_S,
+                    )
+            except (TypeError, ValueError):
+                logger.warning("sample_interval_s inválido na proveniência do modelo")
+        return model, None
+    except ValueError as exc:
+        if OFFLINE_MODEL_REQUIRED:
+            raise RuntimeError(f"modelo offline obrigatório inválido: {exc}") from exc
+        logger.error("Falha ao carregar modelo offline: %s. Usando fallback adaptativo.", exc)
+        return None, str(exc)
+
+
+_offline_model, _offline_model_error = _load_runtime_model()
 
 
 def now_ns() -> int:
@@ -128,27 +180,47 @@ class HoltPredictor:
     sem alterar o restante do módulo.
     """
 
-    def __init__(self, alpha: float = 0.35, beta: float = 0.10):
+    def __init__(self, alpha: float = 0.35, beta: float = 0.10,
+                 transform: str = "identity"):
         self.alpha = alpha
         self.beta = beta
+        self.transform = transform
         self.level: Optional[float] = None
         self.trend: float = 0.0
         self.n = 0
 
     def update(self, value: float) -> None:
+        transformed = transform_value(value, self.transform)
         if self.level is None:
-            self.level = value
+            self.level = transformed
             self.trend = 0.0
         else:
             prev_level = self.level
-            self.level = self.alpha * value + (1 - self.alpha) * (self.level + self.trend)
+            self.level = (self.alpha * transformed
+                          + (1 - self.alpha) * (self.level + self.trend))
             self.trend = self.beta * (self.level - prev_level) + (1 - self.beta) * self.trend
         self.n += 1
+
+    def predict_transformed(self, horizon: int = 1) -> float:
+        if self.level is None:
+            return transform_value(0.0, self.transform)
+        return self.level + horizon * self.trend
 
     def predict(self, horizon: int = 1) -> float:
         if self.level is None:
             return 0.0
-        return max(0.0, self.level + horizon * self.trend)
+        return inverse_transform_value(self.predict_transformed(horizon), self.transform)
+
+    def residual(self, observed: float, predicted: float) -> float:
+        """Resíduo no espaço em que o modelo offline foi calibrado."""
+        return (transform_value(observed, self.transform)
+                - transform_value(predicted, self.transform))
+
+    @property
+    def trend_bps(self) -> float:
+        if self.level is None:
+            return 0.0
+        return self.predict(1) - self.predict(0)
 
 
 # =====================================================================
@@ -164,26 +236,49 @@ class ResidualAnomalyDetector:
 
     MAD_K = 1.4826  # fator de consistência para distribuição normal
 
-    def __init__(self, window: int, z_threshold: float, warmup: int):
+    def __init__(self, window: int, z_threshold: float, warmup: int,
+                 fixed_center: Optional[float] = None,
+                 fixed_scale: Optional[float] = None,
+                 online_adaptation: bool = False):
         self.residuals: deque = deque(maxlen=window)
         self.z_threshold = z_threshold
         self.warmup = warmup
+        self.fixed_center = fixed_center
+        self.fixed_scale = fixed_scale
+        self.online_adaptation = online_adaptation
 
-    def score(self, residual: float) -> Tuple[float, bool]:
-        """Retorna (z_score, is_anomaly). Só sinaliza após o warm-up."""
-        if len(self.residuals) < self.warmup:
-            self.residuals.append(residual)
-            return 0.0, False
+    @property
+    def offline_calibrated(self) -> bool:
+        return self.fixed_center is not None and self.fixed_scale is not None
+
+    @property
+    def ready(self) -> bool:
+        return self.offline_calibrated or len(self.residuals) >= self.warmup
+
+    def _center_scale(self) -> Tuple[float, float]:
+        use_offline = (self.offline_calibrated
+                       and (not self.online_adaptation
+                            or len(self.residuals) < max(3, self.warmup)))
+        if use_offline:
+            return float(self.fixed_center), max(float(self.fixed_scale), 1e-6)
 
         data = sorted(self.residuals)
         median = data[len(data) // 2]
         mad = sorted(abs(x - median) for x in data)[len(data) // 2]
-        sigma = max(self.MAD_K * mad, 1e-6)
+        return median, max(self.MAD_K * mad, 1e-6)
+
+    def score(self, residual: float) -> Tuple[float, bool]:
+        """Retorna (z_score, is_anomaly) usando calibração offline ou warmup."""
+        if not self.ready:
+            self.residuals.append(residual)
+            return 0.0, False
+
+        median, sigma = self._center_scale()
         z = (residual - median) / sigma
 
         is_anom = abs(z) > self.z_threshold
         # Resíduos anômalos NÃO entram na janela (evita mascarar ataques prolongados)
-        if not is_anom:
+        if not is_anom and (not self.offline_calibrated or self.online_adaptation):
             self.residuals.append(residual)
         return z, is_anom
 
@@ -321,15 +416,35 @@ if _exporter:
 class SeriesState:
     """Uma série por chave (porta ou fluxo). Converte contadores cumulativos em taxa (bps)."""
 
-    def __init__(self, key: str, meta: Dict[str, Any]):
+    def __init__(self, key: str, meta: Dict[str, Any],
+                 offline_model: Optional[OfflineModel] = None):
         self.key = key
         self.meta = meta                          # {"type": "flow"/"port", "dpid":.., "nw_src":.., ...}
         self.last_bytes: Optional[int] = None
         self.last_ts: Optional[float] = None
         self.rate_bps: float = 0.0
         self.predicted_bps: float = 0.0
-        self.predictor = HoltPredictor()
-        self.detector = ResidualAnomalyDetector(HISTORY_WINDOW, Z_THRESHOLD, WARMUP_SAMPLES)
+        self.model_residual: float = 0.0
+        self.detection_mode = "offline" if offline_model else "adaptive"
+        if offline_model:
+            self.predictor = HoltPredictor(
+                offline_model.alpha,
+                offline_model.beta,
+                offline_model.transform,
+            )
+            self.detector = ResidualAnomalyDetector(
+                HISTORY_WINDOW,
+                offline_model.z_threshold,
+                warmup=WARMUP_SAMPLES,
+                fixed_center=offline_model.residual_center,
+                fixed_scale=offline_model.residual_scale,
+                online_adaptation=ONLINE_MODEL_ADAPTATION,
+            )
+        else:
+            self.predictor = HoltPredictor()
+            self.detector = ResidualAnomalyDetector(
+                HISTORY_WINDOW, Z_THRESHOLD, WARMUP_SAMPLES
+            )
         self.history: deque = deque(maxlen=HISTORY_WINDOW)   # (ts, observado, predito)
 
     def ingest(self, byte_count: int, ts: float) -> Optional[Dict[str, Any]]:
@@ -352,28 +467,49 @@ class SeriesState:
 
         self.rate_bps = (delta * 8.0) / dt
 
+        # No modo offline a primeira taxa observada inicializa apenas o estado
+        # específico da série. A distribuição de resíduos e o threshold já
+        # vieram do treino; portanto a próxima taxa pode ser classificada.
+        if self.detection_mode == "offline" and self.predictor.n == 0:
+            self.predicted_bps = self.rate_bps
+            self.predictor.update(self.rate_bps)
+            self.history.append((ts, self.rate_bps, self.predicted_bps))
+            if _exporter:
+                _exporter.record(
+                    self.key, self.meta, ts,
+                    self.rate_bps, self.predicted_bps, 0.0,
+                    None, False,
+                )
+            return None
+
         # --- Predição feita ANTES do update (predição genuína de 1 passo à frente) ---
         self.predicted_bps = self.predictor.predict(horizon=1)
         residual = self.rate_bps - self.predicted_bps
-        self.predictor.update(self.rate_bps)
+        self.model_residual = self.predictor.residual(self.rate_bps, self.predicted_bps)
         self.history.append((ts, self.rate_bps, self.predicted_bps))
 
         # --- Detecção ---
         # Chamada ÚNICA ao score(): a alimentação da janela é idêntica ao fluxo
         # anterior (a decisão de incluir o resíduo é interna ao detector); o que
         # muda é apenas que o z fica disponível para persistência em todo caso.
-        warmed_up = len(self.detector.residuals) >= self.detector.warmup
-        z, is_anom_stat = self.detector.score(residual)
+        detector_ready = self.detector.ready
+        z, is_anom_stat = self.detector.score(self.model_residual)
 
         # Anomalia só é REPORTADA acima do piso de ruído (comportamento original)
         below_floor = max(self.rate_bps, self.predicted_bps) < MIN_RATE_BPS
         is_anomaly = is_anom_stat and not below_floor
 
+        # Ataques detectados não atualizam Holt no modo offline: isso evita que
+        # um DDoS prolongado seja absorvido como o novo nível normal. O fallback
+        # preserva o comportamento adaptativo anterior.
+        if self.detection_mode == "adaptive" or not is_anomaly:
+            self.predictor.update(self.rate_bps)
+
         # --- Persistência (aditiva; sincronizada com o history.append acima) ---
         if _exporter:
             _exporter.record(self.key, self.meta, ts,
                              self.rate_bps, self.predicted_bps, residual,
-                             (z if warmed_up else None), is_anomaly)
+                             (z if detector_ready else None), is_anomaly)
 
         if not is_anomaly:
             return None
@@ -388,6 +524,8 @@ class SeriesState:
             "predicted_bps": round(self.predicted_bps, 1),
             "z_score": round(z, 2),
             "threshold": self.detector.z_threshold,
+            "model_residual": round(self.model_residual, 8),
+            "detection_mode": self.detection_mode,
             "ts_detect_ns": now_ns(),
             "cid": CONTROLLER_ID,
         }
@@ -467,7 +605,7 @@ class Collector:
 
     def _check_flow_surge(self, dpid: int, n_flows: int):
         hist = self.flow_count_hist.setdefault(dpid, deque(maxlen=HISTORY_WINDOW))
-        if len(hist) >= WARMUP_SAMPLES:
+        if len(hist) >= FLOW_SURGE_WARMUP:
             baseline = sorted(hist)[len(hist) // 2]
             if baseline >= 1 and n_flows > max(baseline * 3, baseline + 20):
                 self.engine.register_anomaly({
@@ -563,11 +701,13 @@ class Mitigator:
 # 6) MOTOR — orquestra séries, anomalias, mitigação, feedback e ETCD
 # =====================================================================
 class PredictorEngine:
-    def __init__(self):
+    def __init__(self, offline_model: Optional[OfflineModel] = None):
         self.series: Dict[str, SeriesState] = {}
         self.anomalies: deque = deque(maxlen=500)
         self.lock = threading.RLock()
         self.mitigator = Mitigator()
+        self.offline_model = offline_model
+        self.detection_mode = "offline" if offline_model else "adaptive"
         self.feedback_stats = {"true_positive": 0, "false_positive": 0}
         self.started_ns = now_ns()
 
@@ -576,7 +716,7 @@ class PredictorEngine:
         with self.lock:
             s = self.series.get(key)
             if s is None:
-                s = SeriesState(key, meta)
+                s = SeriesState(key, meta, self.offline_model)
                 self.series[key] = s
             anomaly = s.ingest(byte_count, ts)
         if anomaly:
@@ -609,7 +749,11 @@ class PredictorEngine:
             key = target["key"]
             s = self.series.get(key)
             if s:
-                s.detector.z_threshold = min(10.0, max(2.5, s.detector.z_threshold * factor))
+                lower, upper = ((1.0, 20.0) if s.detection_mode == "offline"
+                                else (2.5, 10.0))
+                s.detector.z_threshold = min(
+                    upper, max(lower, s.detector.z_threshold * factor)
+                )
                 new_thr = s.detector.z_threshold
             else:
                 new_thr = None
@@ -628,9 +772,11 @@ class PredictorEngine:
                 "observed_bps": round(s.rate_bps, 1),
                 "predicted_next_bps": round(s.predictor.predict(1), 1),
                 "predicted_5step_bps": round(s.predictor.predict(5), 1),
-                "trend_bps": round(s.predictor.trend, 1),
+                "trend_bps": round(s.predictor.trend_bps, 1),
                 "samples": s.predictor.n,
                 "z_threshold": s.detector.z_threshold,
+                "detector_ready": s.detector.ready,
+                "detection_mode": s.detection_mode,
             } for s in self.series.values()]
         rows.sort(key=lambda r: r["observed_bps"], reverse=True)
         return rows[:top]
@@ -643,6 +789,7 @@ class PredictorEngine:
                 "cid": CONTROLLER_ID,
                 "ts_ns": now_ns(),
                 "n_series": len(self.series),
+                "detection_mode": self.detection_mode,
                 "recent_anomalies": list(self.anomalies)[:20],
                 "feedback_stats": self.feedback_stats,
             }
@@ -657,7 +804,7 @@ class PredictorEngine:
 # 7) API REST (Flask) — mesmo padrão dos demais serviços
 # =====================================================================
 app = Flask(__name__)
-engine = PredictorEngine()
+engine = PredictorEngine(_offline_model)
 collector = Collector(engine)
 
 
@@ -675,17 +822,39 @@ def status():
             "series_tracked": len(engine.series),
             "anomalies_recorded": len(engine.anomalies),
             "feedback_stats": engine.feedback_stats,
+            "model": model_status_payload(),
             "config": {
                 "poll_interval_s": POLL_INTERVAL_S,
                 "z_threshold_default": Z_THRESHOLD,
+                "warmup_samples_fallback": WARMUP_SAMPLES,
+                "flow_surge_warmup_samples": FLOW_SURGE_WARMUP,
                 "min_rate_bps": MIN_RATE_BPS,
                 "auto_mitigate": AUTO_MITIGATE,
                 "dry_run": DRY_RUN,
                 "cooldown_s": COOLDOWN_S,
+                "online_model_adaptation": ONLINE_MODEL_ADAPTATION,
                 "whitelist": sorted(WHITELIST_IPS),
                 "etcd_enabled": _etcd is not None,
             },
         }), 200
+
+
+def model_status_payload() -> Dict[str, Any]:
+    if _offline_model:
+        payload = _offline_model.status()
+        payload["online_adaptation"] = ONLINE_MODEL_ADAPTATION
+        return payload
+    return {
+        "loaded": False,
+        "mode": "adaptive",
+        "warmup_samples": WARMUP_SAMPLES,
+        "load_error": _offline_model_error,
+    }
+
+
+@app.route("/predictor/model", methods=["GET"])
+def model_status():
+    return jsonify(model_status_payload()), 200
 
 
 @app.route("/predictor/predictions", methods=["GET"])
@@ -703,6 +872,9 @@ def prediction_detail(key: str):
         return jsonify({
             "key": s.key, "meta": s.meta,
             "observed_bps": s.rate_bps,
+            "detection_mode": s.detection_mode,
+            "detector_ready": s.detector.ready,
+            "model_residual": s.model_residual,
             "forecast": {f"h{h}": round(s.predictor.predict(h), 1) for h in (1, 3, 5, 10)},
             "history": [{"ts": t, "observed": o, "predicted": p} for t, o, p in s.history],
         }), 200
@@ -761,6 +933,7 @@ def update_config():
 # ---------------- Main ----------------
 if __name__ == "__main__":
     logger.info(f"FlowPredictor iniciando (cid={CONTROLLER_ID}, Ryu={RYU_BASE_URL}, "
-                f"FlowBlocker={FLOWBLOCKER_URL}, auto_mitigate={AUTO_MITIGATE}, dry_run={DRY_RUN})")
+                f"FlowBlocker={FLOWBLOCKER_URL}, detection_mode={engine.detection_mode}, "
+                f"auto_mitigate={AUTO_MITIGATE}, dry_run={DRY_RUN})")
     collector.start()
     app.run(host="0.0.0.0", port=PORT, debug=False)

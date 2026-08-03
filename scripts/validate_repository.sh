@@ -25,6 +25,8 @@ required_files=(
   config/runtime.env
   Dockerfile.flow_predictor
   flow_predictor_cnsm.py
+  offline_model.py
+  train_offline_model.py
   ryu_apps/emitter_cnsm.py
   rest_client/Simpleswitch_cnsm.py
   flow_blocker/flow_blocker_cnsm.py
@@ -43,6 +45,8 @@ source config/runtime.env
 [[ "$FB_HTTP_PORT_BASE" == "7070" ]]
 [[ "$PREDICTOR_PORT_BASE" == "6060" ]]
 [[ "$ETCD_ENDPOINTS" == *"192.168.253.11:2379"* ]]
+[[ "$PREDICTOR_OFFLINE_MODEL_REQUIRED" == "false" ]]
+[[ "$PREDICTOR_ONLINE_MODEL_ADAPTATION" == "false" ]]
 
 override_config="$(ETCD_SUBNET=250 ETCD_NODES=2 bash -c '
   source config/runtime.env
