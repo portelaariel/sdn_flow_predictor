@@ -1,42 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-############################
-# Config (edit if needed)  #
-############################
-read -p "Enter the number of controller and switch sets (c): " c
-read -p "Enter the number of switches per controller set (s): " s
-
-# Image names (override with env if you use different tags)
-RYU_IMG=ryu_core_cnsm
-SSW_IMG=simpleswitch_cnsm
-FB_IMG=flow_blocker_cnsm
-ETCD_IMG=bitnami/etcd
-
-# Base addressing/ports per controller set
-SUBNET_BASE=10
-CTRL_OF_PORT_BASE=6633
-CTRL_API_PORT_BASE=8080
-SSW_HTTP_PORT_BASE=9090
-FB_HTTP_PORT_BASE=7070
-
-# ETCD cluster
-ETCD_SUBNET=253
-ETCD_NODES=3
-ETCD_NET="etcd-network"
-ETCD_PREFIX="192.168.${ETCD_SUBNET}"
-INITIAL_CLUSTER="etcd1=http://${ETCD_PREFIX}.11:2380,etcd2=http://${ETCD_PREFIX}.12:2380,etcd3=http://${ETCD_PREFIX}.13:2380"
-ETCD_ENDPOINTS="${ETCD_PREFIX}.11:2379,${ETCD_PREFIX}.12:2379,${ETCD_PREFIX}.13:2379"
-
-# Flow Predictor
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 MININET_SCRIPT="$SCRIPT_DIR/setup_mininet.py"
+CONFIG_FILE="${SDN_RUNTIME_CONFIG:-$PROJECT_ROOT/config/runtime.env}"
+
+if [[ ! -r "$CONFIG_FILE" ]]; then
+  echo "Runtime config not found: $CONFIG_FILE" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+
+############################
+# Runtime input            #
+############################
+c="${1:-${CSETS:-}}"
+s="${2:-${SPER:-}}"
+[[ -n "$c" ]] || read -r -p "Enter the number of controller and switch sets (c): " c
+[[ -n "$s" ]] || read -r -p "Enter the number of switches per controller set (s): " s
+
+if ! [[ "$c" =~ ^[1-9][0-9]*$ && "$s" =~ ^[1-9][0-9]*$ ]]; then
+  echo "c and s must be positive integers" >&2
+  exit 2
+fi
 
 # Captures & test toggle
-RUN_TEST="${RUN_TEST:-false}"               # set to "false" to skip quick test
-RUN_PREDICTOR="${RUN_PREDICTOR:-true}"      # set to "false" to skip FlowPredictor
-CAPTURE_SECONDS="${CAPTURE_SECONDS:-12}"   # basic capture duration
+RUN_TEST="${RUN_TEST:-false}"
+RUN_PREDICTOR="${RUN_PREDICTOR:-true}"
+CAPTURE_SECONDS="${CAPTURE_SECONDS:-12}"
 OUTDIR="${OUTDIR:-$PROJECT_ROOT/logs/run-$(date +%Y%m%d_%H%M%S)}"
 
 ########################################
@@ -125,7 +118,7 @@ log "ETCD cluster should be up."
 #####################################################
 for ((i=0; i<c; i++)); do
   SUBNET=$((SUBNET_BASE + i))
-  NET="ryu-network-$i"
+  NET="${RYU_NETWORK_PREFIX}-$i"
   NET_SUBNET="192.168.${SUBNET}.0/24"
   CTRL_IP="192.168.${SUBNET}.10"
   SSW_IP="192.168.${SUBNET}.20"
@@ -176,7 +169,7 @@ for ((i=0; i<c; i++)); do
     "$FB_IMG" >/dev/null
 
   # Connect FB to ETCD network for cluster access
-  sudo docker network connect "$ETCD_NET" "flow-blocker-$i"
+  sudo docker network connect "$ETCD_NET" "flow-blocker-$i" 2>/dev/null || true
 
   # Basic readiness checks (best-effort)
   log "Waiting Ryu REST on ${CTRL_API_PORT} and SimpleSwitch ${SSW_HTTP_PORT}, FlowBlocker ${FB_HTTP_PORT}"
@@ -287,12 +280,13 @@ log "All done. To launch topology interactively: sudo CSETS=$c SPER=$s python3 $
 
 if [[ "$RUN_PREDICTOR" == "true" ]]; then
 
-    if ! sudo docker image inspect flow_predictor_cnsm >/dev/null 2>&1; then
+    if ! sudo docker image inspect "$PRED_IMG" >/dev/null 2>&1; then
         echo "[i] Building Flow Predictor image..."
-        sudo docker build -t flow_predictor_cnsm \
+        sudo docker build -t "$PRED_IMG" \
           -f "$PROJECT_ROOT/Dockerfile.flow_predictor" "$PROJECT_ROOT"
     fi
 
     echo "[i] Deploying Flow Predictor..."
-    sudo bash "$PROJECT_ROOT/deploy_flow_predictor.sh" "$c" true
+    env SDN_RUNTIME_CONFIG="$CONFIG_FILE" \
+      bash "$PROJECT_ROOT/deploy_flow_predictor.sh" "$c" "$PREDICTOR_DRY_RUN"
 fi
