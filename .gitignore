@@ -1,21 +1,22 @@
 # Python
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
 
-# Logs
+# Runtime and experiment outputs
 logs/
 *.log
-
-# Experiment outputs
+mn.log
+prediction_history/
 prediction_history_domain*/
+eMSN_ENV/run_*/
 *.pcap
 
-# Mininet
-mn.log
-
-# Editor
+# Editors
 .vscode/
 .idea/
 
-# Sistema
+# System
 .DS_Store

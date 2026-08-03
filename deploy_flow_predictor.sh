@@ -11,22 +11,32 @@ set -euo pipefail
 #   FlowPredictor  192.168.(10+i).40   HTTP 6060+i   <── NOVO
 #
 # Uso:
-#   sudo bash ./deploy_flow_predictor.sh <num_dominios> [dry_run:true|false]
+#   bash ./deploy_flow_predictor.sh <num_dominios> [dry_run:true|false]
 # Exemplo:
-#   sudo bash ./deploy_flow_predictor.sh 2 true # 2 domínios, modo DRY_RUN (não bloqueia)
+#   bash ./deploy_flow_predictor.sh 2 true # 2 domínios, modo DRY_RUN (não bloqueia)
 
-C=${1:-2}
-DRY_RUN=${2:-true}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${SDN_RUNTIME_CONFIG:-$SCRIPT_DIR/config/runtime.env}"
+
+if [[ ! -r "$CONFIG_FILE" ]]; then
+  echo "Runtime config not found: $CONFIG_FILE" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+
+C="${1:-${CSETS:-2}}"
+DRY_RUN="${2:-$PREDICTOR_DRY_RUN}"
+if ! [[ "$C" =~ ^[1-9][0-9]*$ ]]; then
+  echo "num_dominios must be a positive integer" >&2
+  exit 2
+fi
+if [[ "$DRY_RUN" != "true" && "$DRY_RUN" != "false" ]]; then
+  echo "dry_run must be true or false" >&2
+  exit 2
+fi
+
 HISTORY_ROOT="${PREDICTION_HISTORY_ROOT:-$SCRIPT_DIR}"
-
-SUBNET_BASE=10
-API_PORT_BASE=8080
-BLOCKER_PORT_BASE=7070
-PREDICTOR_PORT_BASE=6060
-
-ETCD_ENDPOINTS="192.168.253.11:2379,192.168.253.12:2379,192.168.253.13:2379"
-PRED_IMG=flow_predictor_cnsm
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 
@@ -42,15 +52,15 @@ for ((i=0; i<C; i++)); do
   FB_IP="192.168.${SUBNET}.30"
   PRED_IP="192.168.${SUBNET}.40"
 
-  CTRL_API_PORT=$((API_PORT_BASE + i))
-  FB_HTTP_PORT=$((BLOCKER_PORT_BASE + i))
+  CTRL_API_PORT=$((CTRL_API_PORT_BASE + i))
+  FB_HTTP_PORT=$((FB_HTTP_PORT_BASE + i))
   PRED_HTTP_PORT=$((PREDICTOR_PORT_BASE + i))
 
   # Detecta o nome da rede do domínio (ryu-network compartilhada OU ryu-network-$i)
-  if sudo docker network ls --format '{{.Name}}' | grep -qx "ryu-network-$i"; then
-    NET="ryu-network-$i"
+  if sudo docker network ls --format '{{.Name}}' | grep -qx "${RYU_NETWORK_PREFIX}-$i"; then
+    NET="${RYU_NETWORK_PREFIX}-$i"
   else
-    NET="ryu-network"
+    NET="$RYU_NETWORK_PREFIX"
   fi
 
   # Remove instância antiga, se houver
@@ -67,27 +77,27 @@ for ((i=0; i<C; i++)); do
   log "  Dataset em: $HIST_DIR"
   sudo docker run -d --name "flow-predictor-$i" --network "$NET" --ip "$PRED_IP" \
     -v "$HIST_DIR:/app/prediction_history" \
-    -e EXPORT_ENABLED="true" \
+    -e EXPORT_ENABLED="$PREDICTOR_EXPORT_ENABLED" \
     -e EXPORT_DIR="/app/prediction_history" \
-    -e EXPORT_PREFIXES="flow:" \
-    -e EXPORT_FLUSH_EVERY="10" \
+    -e EXPORT_PREFIXES="$PREDICTOR_EXPORT_PREFIXES" \
+    -e EXPORT_FLUSH_EVERY="$PREDICTOR_EXPORT_FLUSH_EVERY" \
     -e RYU_BASE_URL="http://${CTRL_IP}:${CTRL_API_PORT}" \
     -e FLOWBLOCKER_URL="http://${FB_IP}:${FB_HTTP_PORT}" \
     -e CONTROLLER_ID="$CTRL_IP" \
     -e ETCD_ENDPOINTS="$ETCD_ENDPOINTS" \
     -e PORT="$PRED_HTTP_PORT" \
-    -e POLL_INTERVAL_S="2.0" \
-    -e Z_THRESHOLD="4.0" \
-    -e MIN_RATE_BPS="50000" \
-    -e AUTO_MITIGATE="true" \
+    -e POLL_INTERVAL_S="$PREDICTOR_POLL_INTERVAL_S" \
+    -e Z_THRESHOLD="$PREDICTOR_Z_THRESHOLD" \
+    -e MIN_RATE_BPS="$PREDICTOR_MIN_RATE_BPS" \
+    -e AUTO_MITIGATE="$PREDICTOR_AUTO_MITIGATE" \
     -e DRY_RUN="$DRY_RUN" \
-    -e MITIGATION_COOLDOWN_S="60" \
-    -e WHITELIST_IPS="" \
+    -e MITIGATION_COOLDOWN_S="$PREDICTOR_COOLDOWN_S" \
+    -e WHITELIST_IPS="$PREDICTOR_WHITELIST_IPS" \
     -p "$PRED_HTTP_PORT:$PRED_HTTP_PORT" \
     "$PRED_IMG"
 
   # Conecta à rede ETCD (mesmo padrão do FlowBlocker)
-  sudo docker network connect etcd-network "flow-predictor-$i" 2>/dev/null || true
+  sudo docker network connect "$ETCD_NET" "flow-predictor-$i" 2>/dev/null || true
 
   # Readiness check
   for retry in {1..30}; do

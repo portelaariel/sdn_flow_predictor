@@ -44,10 +44,14 @@ coordenação entre domínios.
 | Bootstrap | `eMSN_ENV/setup_env.sh` | cria os serviços por domínio |
 | Topologia | `eMSN_ENV/setup_mininet.py` | cria a rede Mininet |
 | Deploy isolado | `deploy_flow_predictor.sh` | adiciona o preditor a um ambiente existente |
+| Configuração | `config/runtime.env` | defaults compartilhados pelos scripts ativos |
+| Limpeza | `eMSN_ENV/cleanup_setup_env.sh` | remove somente recursos do projeto |
+| Validação | `scripts/validate_repository.sh` | sintaxe, estrutura e testes unitários |
 
-Arquivos com sufixo `_original` e scripts alternativos não fazem parte
-do runtime principal. Eles devem ser tratados apenas como material
-legado enquanto ainda existirem no checkout.
+Os scripts alternativos que duplicavam bootstrap, geração de topologia
+e execução de testes foram removidos. Os resultados históricos em
+`eMSN_ENV/experiment_01` e `eMSN_ENV/teste_manual` foram preservados
+como evidência experimental, mas não participam do runtime.
 
 ------------------------------------------------------------------------
 
@@ -238,6 +242,9 @@ docker build -t flow_predictor_cnsm -f Dockerfile.flow_predictor .
 # 2. Inicializar a infraestrutura a partir da raiz do repositório
 bash eMSN_ENV/setup_env.sh
 
+# Alternativa não interativa: 2 domínios, 2 switches por domínio
+bash eMSN_ENV/setup_env.sh 2 2
+
 # O setup_env.sh realiza automaticamente o bootstrap de:
 # - ETCD
 # - Ryu-Core
@@ -321,7 +328,38 @@ do ambiente. Dessa forma, não é mais necessário executar manualmente
 ambiente é preparado pelo `setup_env.sh`, simplificando a implantação e
 reduzindo erros de configuração.
 
+### 5.3 Configuração e validação
+
+Os defaults de imagens, endereçamento, portas, ETCD e FlowPredictor ficam
+centralizados em `config/runtime.env`. Qualquer valor pode ser sobrescrito
+por variável de ambiente sem editar os scripts:
+
+``` bash
+PREDICTOR_DRY_RUN=false PREDICTOR_Z_THRESHOLD=5.0 \
+  bash eMSN_ENV/setup_env.sh 2 2
+```
+
+Também é possível manter uma configuração separada e apontá-la com
+`SDN_RUNTIME_CONFIG=/caminho/runtime.env`.
+
+Antes de publicar mudanças, execute a validação independente de Docker:
+
+``` bash
+bash scripts/validate_repository.sh
+```
+
+Para desmontar o ambiente, o cleanup padrão remove apenas containers e
+redes pertencentes a esta ferramenta:
+
+``` bash
+bash eMSN_ENV/cleanup_setup_env.sh
+```
+
+O modo `--all` mantém o comportamento legado de remover todos os
+containers e redes customizadas do host e deve ser usado apenas em uma
+máquina dedicada.
+
 ------------------------------------------------------------------------
 
-**Versão**: 1.2 · **Data**: 2026-08-03 · **Status**: estrutura ativa
-consolidada e integrada ao `setup_env.sh`
+**Versão**: 1.3 · **Data**: 2026-08-03 · **Status**: runtime consolidado,
+configuração centralizada e validação automatizada
