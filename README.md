@@ -42,6 +42,8 @@ coordenação entre domínios.
 | FlowPredictor | `flow_predictor_cnsm.py` | `Dockerfile.flow_predictor` |
 | Contrato do modelo | `offline_model.py` | valida o artefato JSON no treino e no runtime |
 | Treinamento offline | `train_offline_model.py` | converte CSVs rotulados em um modelo versionável |
+| Preparação CIC-DDoS2019 | `prepare_cicddos2019.py` | agrega CSVs grandes em janelas temporais compactas |
+| Avaliação offline | `evaluate_offline_model.py` | mede o modelo em uma captura independente |
 | Ryu controller | `ryu_apps/emitter_cnsm.py` + `ryu_apps/ofctl_rest.py` | `ryu_apps/Dockerfile` |
 | SimpleSwitch | `rest_client/Simpleswitch_cnsm.py` | `rest_client/Dockerfile` |
 | FlowBlocker | `flow_blocker/flow_blocker_cnsm.py` | `flow_blocker/Dockerfile` |
@@ -278,38 +280,73 @@ não um ground truth, e não deve ser usada como rótulo de treino sem
 revisão. Para experimentos com ataques, adicione uma coluna rotulada a
 partir do roteiro do experimento e use-a em `--label-column`.
 
-### 5.2 Dataset DDoS externo
+### 5.2 CIC-DDoS2019 sem copiar os arquivos grandes para o servidor
 
-Datasets como CIC-DDoS podem ser usados se houver uma coluna de vazão,
-ordem temporal, rótulo e observações repetidas para a mesma série. Por
-exemplo, quando o CSV contém `Flow Bytes/s`, `Source IP`,
-`Destination IP`, `Timestamp` e `Label`:
+Não passe os CSVs originais diretamente ao treinador: cada linha do
+CICFlowMeter representa um fluxo concluído, enquanto o runtime observa
+`rate_bps` em janelas de polling. Faça a preparação no computador que
+armazena o dataset. O processo lê uma linha por vez e mantém somente as
+janelas agregadas em memória.
+
+Os comandos abaixo usam `DrDoS_UDP.csv` para treino e `UDP.csv` para
+validação independente:
 
 ``` bash
-python3 train_offline_model.py datasets/ddos.csv \
-  --value-column "Flow Bytes/s" \
-  --value-scale 8 \
-  --series-columns "Source IP,Destination IP" \
-  --timestamp-column Timestamp \
-  --sample-interval-s 2 \
-  --label-column Label \
-  --normal-label BENIGN \
-  --output models/ddos-holt.json
+python3 prepare_cicddos2019.py ~/Downloads/01-12/DrDoS_UDP.csv \
+  --attack-label DrDoS_UDP \
+  --attack-inbound-only \
+  --series-key cic2019:drdos_udp \
+  --output datasets/cic2019_drddos_udp_train.csv
+
+python3 prepare_cicddos2019.py ~/Downloads/03-11/UDP.csv \
+  --attack-label UDP \
+  --attack-inbound-only \
+  --series-key cic2019:udp \
+  --output datasets/cic2019_udp_validation.csv
 ```
 
-`--value-scale 8` converte bytes/s para bits/s. Nomes de colunas devem
-ser passados exatamente como aparecem no CSV.
+O filtro de rótulo é deliberado: o arquivo `UDP.csv` também contém
+registros `MSSQL`. `--attack-inbound-only` mantém a direção atacante →
+vítima; a direção de resposta não é tratada como um segundo ataque de
+vazão.
 
-> Um dataset tabular com uma linha independente por conexão e sem ordem
-> temporal não treina Holt corretamente. Nesse caso, agregue primeiro as
-> linhas em janelas temporais por par origem/destino. O modelo precisa de
-> séries, não apenas de exemplos isolados para classificação. O intervalo
-> deve ser compatível com `PREDICTOR_POLL_INTERVAL_S` (2 s por padrão).
+Por padrão, o conversor:
 
-O comando imprime os parâmetros escolhidos e, quando há ataques,
-precision, recall e F1 de calibração. Essas métricas usam o próprio
-dataset de treino; a avaliação científica final deve usar outro arquivo
-ou uma divisão temporal não vista no treinamento.
+1. soma os bytes forward/backward e os converte para bits;
+2. distribui cada fluxo sobre sua duração (`Flow Duration` em µs);
+3. agrega por par `Source IP` → `Destination IP` em janelas de 2 s;
+4. mantém séries benignas observadas e antepõe dez janelas de baseline
+   às séries que no CIC contêm somente ataque.
+
+O último passo reproduz explicitamente o cenário do testbed: tráfego
+baixo entre um par de hosts seguido pelo `iperf3`. O baseline sintético
+usa a mediana das janelas benignas da própria captura e fica identificado
+por `phase_source=synthetic_baseline`; não deve ser apresentado como uma
+sequência de pacotes originalmente capturada.
+
+Os CSVs compactos e seus metadados ficam em `datasets/`, ignorado pelo
+Git. Em seguida, treine e avalie:
+
+``` bash
+python3 train_offline_model.py datasets/cic2019_drddos_udp_train.csv \
+  --label-column label \
+  --normal-label BENIGN \
+  --output models/cic2019-drddos-udp-holt.json
+
+python3 evaluate_offline_model.py \
+  models/cic2019-drddos-udp-holt.json \
+  datasets/cic2019_udp_validation.csv \
+  --normal-label BENIGN \
+  --min-rate-bps 50000 \
+  --output models/cic2019-drddos-udp-validation.json
+```
+
+O treinador registra no modelo o hash do CSV compacto, as opções da
+preparação e as métricas de calibração. A avaliação simula o estado do
+runtime: a primeira amostra inicializa cada série e somente observações
+classificadas como normais atualizam Holt. O relatório separa qualquer
+anomalia de vazão da métrica `ddos_throughput_spike`, pois quedas são
+alertadas pelo runtime, mas não representam DDoS e não são mitigadas.
 
 ### 5.3 Executar o modelo no testbed
 
@@ -317,7 +354,7 @@ O caminho informado é montado como somente leitura em todos os
 containers FlowPredictor:
 
 ``` bash
-PREDICTOR_OFFLINE_MODEL="$PWD/models/ddos-holt.json" \
+PREDICTOR_OFFLINE_MODEL="$PWD/models/cic2019-drddos-udp-holt.json" \
 PREDICTOR_OFFLINE_MODEL_REQUIRED=true \
 PREDICTOR_DRY_RUN=true \
   bash deploy_flow_predictor.sh 2 true
@@ -374,8 +411,8 @@ curl http://127.0.0.1:6060/predictor/predictions | jq .
 
 # 6. Provocar uma anomalia (no Mininet)
 mininet> h4 iperf3 -s -D
-mininet> h1 ping -c 6 10.0.0.4 -i 0.5         # inicializa a série
-mininet> h1 iperf3 -c 10.0.0.4 -t 20           # SPIKE súbito
+mininet> h1 ping -c 6 10.0.0.4 -i 0.5         # inicializa o mesmo par src/dst
+mininet> h1 iperf3 -c 10.0.0.4 -u -b 100M -t 20  # SPIKE UDP súbito
 
 # 7. Observar detecção + dry-run da mitigação
 curl http://127.0.0.1:6060/predictor/anomalies | jq '.anomalies[0]'
@@ -478,5 +515,5 @@ requer secrets ou acesso ao servidor do testbed.
 
 ------------------------------------------------------------------------
 
-**Versão**: 1.3 · **Data**: 2026-08-03 · **Status**: runtime consolidado,
-configuração centralizada e validação automatizada
+**Versão**: 1.4 · **Data**: 2026-08-03 · **Status**: treinamento offline com
+preparação e validação independente do CIC-DDoS2019

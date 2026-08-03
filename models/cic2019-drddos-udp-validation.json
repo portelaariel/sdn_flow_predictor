@@ -1,0 +1,84 @@
+{
+  "metrics": {
+    "all_throughput_anomalies": {
+      "f1": 0.509154,
+      "false_negatives": 0,
+      "false_positive_rate": 0.076745,
+      "false_positives": 563,
+      "precision": 0.34152,
+      "recall": 1.0,
+      "true_negatives": 6773,
+      "true_positives": 292
+    },
+    "ddos_throughput_spike": {
+      "f1": 0.918239,
+      "false_negatives": 0,
+      "false_positive_rate": 0.007088,
+      "false_positives": 52,
+      "precision": 0.848837,
+      "recall": 1.0,
+      "true_negatives": 7284,
+      "true_positives": 292
+    },
+    "drop_detections": 511,
+    "initial_rows_unscored": 236,
+    "min_rate_bps": 50000.0,
+    "rows_scored": 7628,
+    "rows_total": 7864,
+    "series": 236,
+    "spike_detections": 344
+  },
+  "model": "models/cic2019-drddos-udp-holt.json",
+  "validation_files": [
+    "cic2019_udp_validation.csv"
+  ],
+  "validation_preparation": [
+    {
+      "config": {
+        "attack_inbound_only": true,
+        "attack_labels": [
+          "UDP"
+        ],
+        "baseline_prefix_windows": 10,
+        "date_order": "day-first",
+        "label_mode": "separate-phases",
+        "min_series_windows": 2,
+        "min_window_bps": 1.0,
+        "normal_labels": [
+          "BENIGN"
+        ],
+        "series_key": "cic2019:udp",
+        "series_mode": "endpoint-pair",
+        "window_s": 2.0
+      },
+      "created_at": "2026-08-03T15:26:53.539132+00:00",
+      "output_file": "cic2019_udp_validation.csv",
+      "preparation_tool": "prepare_cicddos2019.py",
+      "schema_version": 1,
+      "summary": {
+        "label_counts": {
+          "BENIGN": 3134,
+          "MSSQL": 24392,
+          "UDP": 3754680
+        },
+        "rows_attack": 3754084,
+        "rows_filtered": 24988,
+        "rows_normal": 3134,
+        "rows_skipped": 0,
+        "rows_total": 3782206,
+        "rows_valid": 3757218,
+        "series": 394,
+        "source_bytes": 1792797298,
+        "source_file_sizes": {
+          "UDP.csv": 1792797298
+        },
+        "source_files": [
+          "UDP.csv"
+        ],
+        "window_s": 2.0,
+        "windows": 9709
+      }
+    }
+  ],
+  "validation_sha256": "35c9ca9a43bbd000ed95185f23bbafee8322232e230e75b97df7f3fe1f5eaa69"
+}

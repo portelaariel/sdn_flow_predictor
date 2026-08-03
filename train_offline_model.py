@@ -173,6 +173,22 @@ def load_observations(
         "rows_skipped": skipped,
         "label_counts": label_counts,
     }
+    preparation = []
+    for path in paths:
+        sidecar = Path(f"{path}.metadata.json")
+        if not sidecar.is_file():
+            continue
+        try:
+            payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"metadados de preparação inválidos em {sidecar}: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError(f"metadados de preparação devem ser um objeto: {sidecar}")
+        if payload.get("output_file") not in (None, path.name):
+            raise ValueError(f"metadados de preparação não correspondem a {path.name}")
+        preparation.append(payload)
+    if preparation:
+        metadata["preparation"] = preparation
     return observations, metadata
 
 
@@ -384,6 +400,7 @@ def train_model(
         "dataset_sha256": metadata.get("dataset_sha256"),
         "source_files": metadata.get("files", []),
         "label_counts": metadata.get("label_counts", {}),
+        "preparation": metadata.get("preparation", []),
         "input": input_config,
         "holt_mse_transformed": mse,
         "residual_samples": len(calibration_residuals),

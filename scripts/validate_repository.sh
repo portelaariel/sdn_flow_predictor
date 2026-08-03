@@ -27,6 +27,8 @@ required_files=(
   flow_predictor_cnsm.py
   offline_model.py
   train_offline_model.py
+  prepare_cicddos2019.py
+  evaluate_offline_model.py
   ryu_apps/emitter_cnsm.py
   rest_client/Simpleswitch_cnsm.py
   flow_blocker/flow_blocker_cnsm.py

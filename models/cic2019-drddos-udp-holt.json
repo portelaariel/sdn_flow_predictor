@@ -1,0 +1,105 @@
+{
+  "created_at": "2026-08-03T15:27:01.887263+00:00",
+  "detector": {
+    "residual_center": 0.0,
+    "residual_scale": 0.43766740073350346,
+    "score": "absolute_robust_z",
+    "z_threshold": 5.75
+  },
+  "holt": {
+    "alpha": 0.9,
+    "beta": 0.0,
+    "transform": "log1p"
+  },
+  "model_type": "holt_residual",
+  "schema_version": 1,
+  "training": {
+    "dataset_sha256": "de068b020925a040d001265041fe0601b8baa8408218b4fe16121ec2c1c469fe",
+    "holt_mse_transformed": 1.1625476839868123,
+    "input": {
+      "label_column": "label",
+      "normal_labels": [
+        "BENIGN"
+      ],
+      "sample_interval_s": 2.0,
+      "series_columns": [
+        "flow_key"
+      ],
+      "timestamp_column": "timestamp",
+      "value_column": "observed_bps",
+      "value_scale": 1.0
+    },
+    "label_counts": {
+      "ATTACK": 827,
+      "BENIGN": 3921
+    },
+    "metrics": {
+      "f1": 0.854427,
+      "false_negatives": 108,
+      "false_positive_rate": 0.036157,
+      "false_positives": 137,
+      "precision": 0.839953,
+      "recall": 0.869407,
+      "true_negatives": 3652,
+      "true_positives": 719
+    },
+    "metrics_note": "calibra\u00e7\u00e3o no pr\u00f3prio dataset; use outro dataset para avalia\u00e7\u00e3o final",
+    "normal_runs": 132,
+    "preparation": [
+      {
+        "config": {
+          "attack_inbound_only": true,
+          "attack_labels": [
+            "DrDoS_UDP"
+          ],
+          "baseline_prefix_windows": 10,
+          "date_order": "day-first",
+          "label_mode": "separate-phases",
+          "min_series_windows": 2,
+          "min_window_bps": 1.0,
+          "normal_labels": [
+            "BENIGN"
+          ],
+          "series_key": "cic2019:drdos_udp",
+          "series_mode": "endpoint-pair",
+          "window_s": 2.0
+        },
+        "created_at": "2026-08-03T15:26:45.864972+00:00",
+        "output_file": "cic2019_drddos_udp_train.csv",
+        "preparation_tool": "prepare_cicddos2019.py",
+        "schema_version": 1,
+        "summary": {
+          "label_counts": {
+            "BENIGN": 2157,
+            "DrDoS_UDP": 3134645
+          },
+          "rows_attack": 3132759,
+          "rows_filtered": 1886,
+          "rows_normal": 2157,
+          "rows_skipped": 0,
+          "rows_total": 3136802,
+          "rows_valid": 3134916,
+          "series": 272,
+          "source_bytes": 1506039371,
+          "source_file_sizes": {
+            "DrDoS_UDP.csv": 1506039371
+          },
+          "source_files": [
+            "DrDoS_UDP.csv"
+          ],
+          "window_s": 2.0,
+          "windows": 6824
+        }
+      }
+    ],
+    "residual_samples": 3789,
+    "rows_attack": 827,
+    "rows_normal": 3921,
+    "rows_skipped": 0,
+    "rows_total": 4748,
+    "series": 132,
+    "source_files": [
+      "cic2019_drddos_udp_train.csv"
+    ]
+  }
+}
