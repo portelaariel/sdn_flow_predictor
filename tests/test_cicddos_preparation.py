@@ -6,7 +6,7 @@ from pathlib import Path
 from evaluate_offline_model import evaluate
 from offline_model import OfflineModel
 from prepare_cicddos2019 import aggregate_cic_files, write_compact_csv
-from train_offline_model import load_observations
+from train_offline_model import Observation, load_observations
 
 
 class CicDdosPreparationTests(unittest.TestCase):
@@ -154,6 +154,27 @@ class CicDdosPreparationTests(unittest.TestCase):
             self.assertEqual(ddos["true_positives"], 1)
             self.assertEqual(ddos["false_positives"], 0)
             self.assertEqual(metrics["initial_rows_unscored"], 1)
+
+    def test_held_out_evaluation_uses_independent_drop_threshold(self):
+        observations = [
+            # A queda de 1000 para 500 gera aproximadamente z=-13, abaixo do
+            # limiar de pico, mas ainda dentro do limiar específico de queda.
+            Observation("flow", (0, index, index), value, False)
+            for index, value in enumerate((1000.0, 1000.0, 500.0))
+        ]
+        model = OfflineModel(
+            alpha=0.35,
+            beta=0.1,
+            transform="log1p",
+            residual_center=0.0,
+            residual_scale=0.05,
+            z_threshold=4.0,
+            drop_z_threshold=20.0,
+            created_at="test",
+        )
+        metrics = evaluate(model, observations)
+        self.assertEqual(metrics["drop_detections"], 0)
+        self.assertEqual(metrics["drop_z_threshold"], 20.0)
 
 
 if __name__ == "__main__":

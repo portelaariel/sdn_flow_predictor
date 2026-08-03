@@ -296,10 +296,21 @@ def _simulate_residuals(
     return scored
 
 
-def _classification_metrics(scores: Sequence[Tuple[float, bool]], threshold: float) -> Dict[str, float]:
+def _classification_metrics(
+    scores: Sequence[Tuple[float, bool]],
+    threshold: float,
+    direction: str = "absolute",
+) -> Dict[str, float]:
     tp = fp = tn = fn = 0
     for z_score, is_attack in scores:
-        predicted = abs(z_score) > threshold
+        if direction == "spike":
+            predicted = z_score > threshold
+        elif direction == "drop":
+            predicted = z_score < -threshold
+        elif direction == "absolute":
+            predicted = abs(z_score) > threshold
+        else:
+            raise ValueError(f"direção de threshold inválida: {direction}")
         if predicted and is_attack:
             tp += 1
         elif predicted:
@@ -328,19 +339,20 @@ def choose_threshold(
     normalized_scores: Sequence[Tuple[float, bool]],
     explicit_threshold: Optional[float],
     normal_quantile: float,
+    direction: str = "spike",
 ) -> Tuple[float, Dict[str, float]]:
     if explicit_threshold is not None:
         if not math.isfinite(explicit_threshold) or not 1.0 <= explicit_threshold <= 20.0:
-            raise ValueError("--z-threshold deve estar no intervalo [1, 20]")
+            raise ValueError("threshold deve estar no intervalo [1, 20]")
         threshold = float(explicit_threshold)
-        return threshold, _classification_metrics(normalized_scores, threshold)
+        return threshold, _classification_metrics(normalized_scores, threshold, direction)
 
     attack_count = sum(1 for _, is_attack in normalized_scores if is_attack)
     if attack_count:
         best: Optional[Tuple[Tuple[float, float, float, float], float, Dict[str, float]]] = None
         for step in range(8, 41):  # 2.00 .. 10.00
             threshold = step / 4.0
-            metrics = _classification_metrics(normalized_scores, threshold)
+            metrics = _classification_metrics(normalized_scores, threshold, direction)
             rank = (
                 metrics["f1"],
                 metrics["precision"],
@@ -352,9 +364,42 @@ def choose_threshold(
         assert best is not None
         return best[1], best[2]
 
-    normal_scores = [abs(score) for score, _ in normalized_scores]
+    if direction == "spike":
+        normal_scores = [score for score, is_attack in normalized_scores
+                         if not is_attack and score > 0.0]
+    else:
+        normal_scores = [-score for score, is_attack in normalized_scores
+                         if not is_attack and score < 0.0]
+    if not normal_scores:
+        normal_scores = [0.0]
     threshold = max(2.5, min(10.0, percentile(normal_scores, normal_quantile)))
-    return threshold, _classification_metrics(normalized_scores, threshold)
+    return threshold, _classification_metrics(normalized_scores, threshold, direction)
+
+
+def choose_drop_threshold(
+    normalized_scores: Sequence[Tuple[float, bool]],
+    explicit_threshold: Optional[float],
+    normal_quantile: float,
+) -> Tuple[float, Dict[str, float]]:
+    normal_scores = [score for score, is_attack in normalized_scores if not is_attack]
+    negative_magnitudes = [-score for score in normal_scores if score < 0.0]
+    if explicit_threshold is not None:
+        if not math.isfinite(explicit_threshold) or not 1.0 <= explicit_threshold <= 20.0:
+            raise ValueError("--drop-z-threshold deve estar no intervalo [1, 20]")
+        threshold = float(explicit_threshold)
+    elif negative_magnitudes:
+        threshold = max(2.5, min(20.0, percentile(negative_magnitudes, normal_quantile)))
+    else:
+        threshold = 20.0
+
+    alerts = sum(1 for score in normal_scores if score < -threshold)
+    normal_count = len(normal_scores)
+    return threshold, {
+        "normal_samples": normal_count,
+        "drop_alerts": alerts,
+        "false_positive_rate": round(alerts / normal_count if normal_count else 0.0, 6),
+        "normal_quantile": normal_quantile,
+    }
 
 
 def train_model(
@@ -367,6 +412,8 @@ def train_model(
     explicit_threshold: Optional[float],
     normal_quantile: float,
     input_config: Dict[str, object],
+    explicit_drop_threshold: Optional[float] = None,
+    drop_normal_quantile: float = 0.999,
 ) -> OfflineModel:
     grouped = _group_observations(observations)
     normal_count = sum(1 for row in observations if not row.is_attack)
@@ -388,7 +435,12 @@ def train_model(
     simulated = _simulate_residuals(grouped, alpha, beta, transform)
     normalized = [((residual - center) / scale, is_attack)
                   for residual, is_attack in simulated]
-    threshold, metrics = choose_threshold(normalized, explicit_threshold, normal_quantile)
+    spike_threshold, spike_metrics = choose_threshold(
+        normalized, explicit_threshold, normal_quantile, direction="spike"
+    )
+    drop_threshold, drop_metrics = choose_drop_threshold(
+        normalized, explicit_drop_threshold, drop_normal_quantile
+    )
 
     training = {
         "rows_total": len(observations),
@@ -404,7 +456,11 @@ def train_model(
         "input": input_config,
         "holt_mse_transformed": mse,
         "residual_samples": len(calibration_residuals),
-        "metrics": metrics,
+        "metrics": spike_metrics,
+        "metrics_by_kind": {
+            "THROUGHPUT_SPIKE": spike_metrics,
+            "THROUGHPUT_DROP": drop_metrics,
+        },
         "metrics_note": "calibração no próprio dataset; use outro dataset para avaliação final",
     }
     return OfflineModel(
@@ -413,8 +469,9 @@ def train_model(
         transform=transform,
         residual_center=center,
         residual_scale=scale,
-        z_threshold=threshold,
+        z_threshold=spike_threshold,
         created_at=datetime.now(timezone.utc).isoformat(),
+        drop_z_threshold=drop_threshold,
         training=training,
     )
 
@@ -446,8 +503,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="piso robusto para a escala do resíduo transformado")
     parser.add_argument("--normal-quantile", type=float, default=0.995,
                         help="quantil usado sem rótulos de ataque")
-    parser.add_argument("--z-threshold", type=float, default=None,
-                        help="threshold fixo; por padrão é calibrado automaticamente")
+    parser.add_argument("--spike-z-threshold", "--z-threshold",
+                        dest="spike_z_threshold", type=float, default=None,
+                        help="threshold positivo fixo; por padrão é calibrado por F1")
+    parser.add_argument("--drop-z-threshold", type=float, default=None,
+                        help="threshold negativo fixo; por padrão usa quantil benigno")
+    parser.add_argument("--drop-normal-quantile", type=float, default=0.999,
+                        help="quantil benigno para calibrar quedas (padrão: 0.999)")
     return parser
 
 
@@ -463,6 +525,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         betas = _parse_grid(args.beta_grid, "--beta-grid", allow_zero=True)
         if not math.isfinite(args.normal_quantile) or not 0.5 <= args.normal_quantile < 1.0:
             raise ValueError("--normal-quantile deve estar no intervalo [0.5, 1)")
+        if (not math.isfinite(args.drop_normal_quantile)
+                or not 0.5 <= args.drop_normal_quantile < 1.0):
+            raise ValueError("--drop-normal-quantile deve estar no intervalo [0.5, 1)")
         if not math.isfinite(args.minimum_scale) or args.minimum_scale <= 0.0:
             raise ValueError("--minimum-scale deve ser positivo")
         if not math.isfinite(args.sample_interval_s) or args.sample_interval_s <= 0.0:
@@ -483,7 +548,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             alphas,
             betas,
             args.minimum_scale,
-            args.z_threshold,
+            args.spike_z_threshold,
             args.normal_quantile,
             {
                 "value_column": args.value_column,
@@ -493,7 +558,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "sample_interval_s": args.sample_interval_s,
                 "label_column": args.label_column,
                 "normal_labels": normal_labels,
+                "drop_normal_quantile": args.drop_normal_quantile,
             },
+            explicit_drop_threshold=args.drop_z_threshold,
+            drop_normal_quantile=args.drop_normal_quantile,
         )
         output = Path(args.output).expanduser()
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -508,7 +576,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
           f"(normal={model.training['rows_normal']}, attack={model.training['rows_attack']})")
     print(f"holt: alpha={model.alpha} beta={model.beta} transform={model.transform}")
     print(f"detector: center={model.residual_center:.6f} "
-          f"scale={model.residual_scale:.6f} z_threshold={model.z_threshold:.2f}")
+          f"scale={model.residual_scale:.6f} "
+          f"spike_z_threshold={model.spike_z_threshold:.2f} "
+          f"drop_z_threshold={model.effective_drop_z_threshold:.2f}")
     if model.training["rows_attack"]:
         print(f"calibration: precision={metrics.get('precision', 0):.3f} "
               f"recall={metrics.get('recall', 0):.3f} f1={metrics.get('f1', 0):.3f}")

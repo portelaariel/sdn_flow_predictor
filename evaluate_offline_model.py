@@ -56,14 +56,17 @@ def evaluate(
             residual = transformed - prediction
             z_score = (residual - model.residual_center) / model.residual_scale
             predicted_bps = inverse_transform_value(prediction, model.transform)
-            predicted_anomaly = (
-                abs(z_score) > model.z_threshold
-                and max(row.value_bps, predicted_bps) >= min_rate_bps
+            above_floor = max(row.value_bps, predicted_bps) >= min_rate_bps
+            predicted_spike = (
+                z_score > model.spike_z_threshold and above_floor
             )
-            predicted_spike = predicted_anomaly and residual > 0.0
+            predicted_drop = (
+                z_score < -model.effective_drop_z_threshold and above_floor
+            )
+            predicted_anomaly = predicted_spike or predicted_drop
 
             if predicted_anomaly:
-                if residual > 0.0:
+                if predicted_spike:
                     spike_detections += 1
                 else:
                     drop_detections += 1
@@ -113,6 +116,8 @@ def evaluate(
         "all_throughput_anomalies": classification(any_counts),
         "spike_detections": spike_detections,
         "drop_detections": drop_detections,
+        "spike_z_threshold": model.spike_z_threshold,
+        "drop_z_threshold": model.effective_drop_z_threshold,
         "min_rate_bps": min_rate_bps,
     }
 

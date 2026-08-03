@@ -49,6 +49,7 @@ source config/runtime.env
 [[ "$ETCD_ENDPOINTS" == *"192.168.253.11:2379"* ]]
 [[ "$PREDICTOR_OFFLINE_MODEL_REQUIRED" == "false" ]]
 [[ "$PREDICTOR_ONLINE_MODEL_ADAPTATION" == "false" ]]
+[[ "$PREDICTOR_EVENT_COOLDOWN_S" == "60" ]]
 
 override_config="$(ETCD_SUBNET=250 ETCD_NODES=2 bash -c '
   source config/runtime.env
