@@ -13,7 +13,6 @@ import os
 import json
 import time
 import logging
-from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
 import requests
@@ -283,8 +282,6 @@ def update_domain_table():
 
         _store_domain_table_in_etcd(_local_domain_table)
 
-        _metric("ETCD_WRITE",
-                f"cid={CONTROLLER_ID} key=flowblocker/domain_table/{CONTROLLER_ID} ts_write_ns={now_ns()}")
         logger.info("Domain table successfully updated.")
         return jsonify({"message": "Domain table updated"}), 200
 
@@ -382,5 +379,4 @@ def _policy_id(src_ip: str, dst_ip: str) -> str:
 if __name__ == "__main__":
     logger.info(f"FlowBlocker Service is running on Controller {CONTROLLER_ID}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
-
 

@@ -20,8 +20,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy your Ryu apps
 COPY emitter_cnsm.py .
-# If you maintain a local REST app for ofctl, keep it. Otherwise remove this line.
-COPY ofctl_rest.py . 
+COPY ofctl_rest.py .
 
 # Defaults (override in compose)
 ENV SIMPLESWITCH_URL=http://127.0.0.1:8090/packetin \
@@ -35,7 +34,6 @@ EXPOSE 8080 6633 6653
 
 # (Optional) healthcheck on the REST API port
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD curl -fsS http://localhost:${WSGI_PORT}/stats/switches || exit 1
-#HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD curl -fsS http://localhost:${WSGI_PORT}/ || exit 1
 
 # Run ryu-manager with your apps
 ENTRYPOINT ["sh", "-c", "ryu-manager --ofp-tcp-listen-port=$OFP_TCP_PORT --wsapi-port=$WSGI_PORT emitter_cnsm.py ofctl_rest.py"]

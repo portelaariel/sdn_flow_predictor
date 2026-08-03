@@ -28,6 +28,5 @@ EXPOSE 7070
 
 # (Optional) basic healthcheck hits the index route
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD sh -c 'curl -fsS http://localhost:${PORT}/ || exit 1'
-#HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD curl -fsS http://localhost:7070/ || exit 1
 
 CMD ["python", "flow_blocker_cnsm.py"]
