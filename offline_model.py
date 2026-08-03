@@ -7,10 +7,11 @@ import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = {1, 2}
 MODEL_TYPE = "holt_residual"
 SUPPORTED_TRANSFORMS = {"identity", "log1p"}
 
@@ -57,6 +58,7 @@ class OfflineModel:
     residual_scale: float
     z_threshold: float
     created_at: str
+    drop_z_threshold: Optional[float] = None
     training: Dict[str, Any] = field(default_factory=dict)
     schema_version: int = SCHEMA_VERSION
     model_type: str = MODEL_TYPE
@@ -65,10 +67,11 @@ class OfflineModel:
     def from_dict(cls, payload: Dict[str, Any]) -> "OfflineModel":
         if not isinstance(payload, dict):
             raise ValueError("o artefato deve conter um objeto JSON")
-        if payload.get("schema_version") != SCHEMA_VERSION:
+        schema_version = payload.get("schema_version")
+        if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
             raise ValueError(
-                f"schema_version incompatível: esperado {SCHEMA_VERSION}, "
-                f"recebido {payload.get('schema_version')!r}"
+                f"schema_version incompatível: suportados "
+                f"{sorted(SUPPORTED_SCHEMA_VERSIONS)}, recebido {schema_version!r}"
             )
         if payload.get("model_type") != MODEL_TYPE:
             raise ValueError(f"model_type incompatível: {payload.get('model_type')!r}")
@@ -93,12 +96,21 @@ class OfflineModel:
                                "detector.residual_center")
         scale = _finite_float(detector.get("residual_scale"),
                               "detector.residual_scale")
-        threshold = _finite_float(detector.get("z_threshold"),
-                                  "detector.z_threshold")
+        legacy_threshold = detector.get("z_threshold")
+        spike_threshold = _finite_float(
+            detector.get("spike_z_threshold", legacy_threshold),
+            "detector.spike_z_threshold",
+        )
+        drop_threshold = _finite_float(
+            detector.get("drop_z_threshold", legacy_threshold),
+            "detector.drop_z_threshold",
+        )
         if scale <= 0.0:
             raise ValueError("detector.residual_scale deve ser positivo")
-        if not 1.0 <= threshold <= 20.0:
-            raise ValueError("detector.z_threshold deve estar no intervalo [1, 20]")
+        if not 1.0 <= spike_threshold <= 20.0:
+            raise ValueError("detector.spike_z_threshold deve estar no intervalo [1, 20]")
+        if not 1.0 <= drop_threshold <= 20.0:
+            raise ValueError("detector.drop_z_threshold deve estar no intervalo [1, 20]")
 
         training = payload.get("training", {})
         if not isinstance(training, dict):
@@ -110,10 +122,23 @@ class OfflineModel:
             transform=transform,
             residual_center=center,
             residual_scale=scale,
-            z_threshold=threshold,
+            z_threshold=spike_threshold,
             created_at=str(payload.get("created_at", "unknown")),
+            drop_z_threshold=drop_threshold,
             training=training,
+            schema_version=int(schema_version),
         )
+
+    @property
+    def spike_z_threshold(self) -> float:
+        """Threshold positivo; ``z_threshold`` permanece como alias compatível."""
+        return self.z_threshold
+
+    @property
+    def effective_drop_z_threshold(self) -> float:
+        """Threshold negativo, simétrico para modelos legados sem campo próprio."""
+        return (self.z_threshold if self.drop_z_threshold is None
+                else self.drop_z_threshold)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -129,13 +154,16 @@ class OfflineModel:
                 "residual_center": self.residual_center,
                 "residual_scale": self.residual_scale,
                 "z_threshold": self.z_threshold,
-                "score": "absolute_robust_z",
+                "spike_z_threshold": self.spike_z_threshold,
+                "drop_z_threshold": self.effective_drop_z_threshold,
+                "score": "asymmetric_robust_z",
             },
             "training": self.training,
         }
 
     def status(self) -> Dict[str, Any]:
         metrics = self.training.get("metrics", {})
+        metrics_by_kind = self.training.get("metrics_by_kind", {})
         input_config = self.training.get("input", {})
         return {
             "loaded": True,
@@ -147,12 +175,15 @@ class OfflineModel:
             "alpha": self.alpha,
             "beta": self.beta,
             "z_threshold": self.z_threshold,
+            "spike_z_threshold": self.spike_z_threshold,
+            "drop_z_threshold": self.effective_drop_z_threshold,
             "training_rows": self.training.get("rows_total"),
             "training_series": self.training.get("series"),
             "sample_interval_s": (input_config.get("sample_interval_s")
                                   if isinstance(input_config, dict) else None),
             "dataset_sha256": self.training.get("dataset_sha256"),
             "metrics": metrics,
+            "metrics_by_kind": metrics_by_kind,
         }
 
 

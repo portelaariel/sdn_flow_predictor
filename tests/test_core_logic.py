@@ -3,7 +3,7 @@ import unittest
 import uuid
 from collections import deque
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from offline_model import OfflineModel, inverse_transform_value, transform_value
 
@@ -85,6 +85,19 @@ class PredictorTests(unittest.TestCase):
         self.assertTrue(is_anomaly)
         self.assertGreater(z_score, detector.z_threshold)
 
+    def test_detector_uses_independent_spike_and_drop_thresholds(self):
+        detector = self.symbols["ResidualAnomalyDetector"](
+            window=10,
+            z_threshold=4.0,
+            drop_z_threshold=8.0,
+            warmup=0,
+            fixed_center=0.0,
+            fixed_scale=1.0,
+        )
+        self.assertEqual(detector.score(5.0), (5.0, True))
+        self.assertEqual(detector.score(-5.0), (-5.0, False))
+        self.assertEqual(detector.score(-9.0), (-9.0, True))
+
     def test_series_uses_offline_model_and_does_not_absorb_attack(self):
         model = OfflineModel(
             alpha=0.35,
@@ -111,6 +124,60 @@ class PredictorTests(unittest.TestCase):
         self.assertEqual(anomaly["kind"], "THROUGHPUT_SPIKE")
         self.assertEqual(anomaly["detection_mode"], "offline")
         self.assertEqual(series.predictor.n, samples_before_attack)
+
+    def test_repeated_anomalies_are_aggregated_during_cooldown(self):
+        class FakeMitigator:
+            def __init__(self):
+                self.calls = 0
+
+            def maybe_mitigate(self, anomaly):
+                self.calls += 1
+                return {"attempted": True, "executed": False, "reason": "test"}
+
+        symbols = load_definitions(
+            "flow_predictor_cnsm.py",
+            {"PredictorEngine"},
+            {
+                "Any": Any,
+                "Dict": Dict,
+                "List": List,
+                "Optional": Optional,
+                "Tuple": Tuple,
+                "OfflineModel": OfflineModel,
+                "deque": deque,
+                "threading": __import__("threading"),
+                "Mitigator": FakeMitigator,
+                "now_ns": lambda: 1,
+                "EVENT_COOLDOWN_S": 60.0,
+                "CONTROLLER_ID": "test-controller",
+                "_metric": lambda *_args: None,
+                "_etcd": None,
+            },
+        )
+        engine = symbols["PredictorEngine"]()
+
+        def anomaly(anomaly_id, timestamp_ns, observed_bps):
+            return {
+                "anomaly_id": anomaly_id,
+                "kind": "THROUGHPUT_SPIKE",
+                "key": "flow:1:10.0.0.1->10.0.0.4",
+                "meta": {"type": "flow"},
+                "observed_bps": observed_bps,
+                "z_score": observed_bps / 100.0,
+                "ts_detect_ns": timestamp_ns,
+            }
+
+        self.assertTrue(engine.register_anomaly(anomaly("first", 1_000_000_000, 100.0), True))
+        self.assertFalse(engine.register_anomaly(anomaly("duplicate", 2_000_000_000, 200.0), True))
+        self.assertEqual(len(engine.anomalies), 1)
+        self.assertEqual(engine.anomalies[0]["suppressed_count"], 1)
+        self.assertEqual(engine.anomalies[0]["peak_observed_bps"], 200.0)
+        self.assertEqual(engine.anomalies_suppressed, 1)
+        self.assertEqual(engine.mitigator.calls, 1)
+
+        self.assertTrue(engine.register_anomaly(anomaly("next", 63_000_000_000, 150.0), True))
+        self.assertEqual(len(engine.anomalies), 2)
+        self.assertEqual(engine.mitigator.calls, 2)
 
 
 class FlowRuleTests(unittest.TestCase):

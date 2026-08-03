@@ -42,6 +42,7 @@ grep -q -- '--ip 192.168.10.40' "$COMMAND_LOG"
 grep -q -- '-e Z_THRESHOLD=5.5' "$COMMAND_LOG"
 grep -q -- '-e OFFLINE_MODEL_REQUIRED=false' "$COMMAND_LOG"
 grep -q -- '-e WARMUP_SAMPLES=15' "$COMMAND_LOG"
+grep -q -- '-e ANOMALY_EVENT_COOLDOWN_S=60' "$COMMAND_LOG"
 grep -q -- '-e DRY_RUN=true' "$COMMAND_LOG"
 grep -q -- '-p 6060:6060' "$COMMAND_LOG"
 

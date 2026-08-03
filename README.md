@@ -78,7 +78,7 @@ como evidência experimental, mas não participam do runtime.
        │  (ofctl)    │                │  API humana/ │  registro    │ FlowBlocker│
        └─────────────┘                │  externa     │              │ POST       │
                                       └──────┬───────┘              └────────────┘
-                                             │ ajusta z_threshold da série
+                                             │ ajusta o threshold do lado afetado
                                              ▼
                                       (ciclo se refina continuamente)
 
@@ -110,8 +110,10 @@ amostras rotuladas como ataque. Ele executa quatro passos:
 2. escolhe `alpha` e `beta` do Holt por busca em grade, usando somente
    trechos normais consecutivos;
 3. calcula mediana e escala robusta (MAD) dos resíduos em `log1p(bps)`;
-4. quando há rótulos de ataque, calibra o threshold para a melhor F1;
-   sem ataques, usa o quantil 99,5% dos resíduos normais.
+4. calibra separadamente os dois lados do detector: picos positivos
+   (`spike_z_threshold`) maximizam a F1 dos ataques rotulados; quedas
+   (`drop_z_threshold`) usam por padrão o quantil 99,9% dos resíduos benignos
+   negativos. Sem ataques, picos usam o quantil 99,5% benigno.
 
 O `log1p` é importante para transferir o modelo entre datasets e o
 Mininet: a decisão passa a refletir uma mudança proporcional de vazão,
@@ -124,6 +126,11 @@ específico daquela série. A taxa seguinte já é classificada com a
 distribuição aprendida offline; não há o warmup de 15 amostras. Um ataque
 detectado não atualiza Holt, evitando que um DDoS prolongado seja
 absorvido como o novo comportamento normal.
+
+O artefato atual usa `schema_version: 2` e mantém `z_threshold` como alias
+compatível do limiar de pico. Artefatos da versão 1 continuam válidos: ao
+carregá-los, o runtime aplica seu único threshold simetricamente aos dois
+lados.
 
 Holt continua adequado ao processamento online por ter custo O(1) e
 capturar nível e tendência. A predição de um passo é sempre feita antes
@@ -139,13 +146,24 @@ Três classes de anomalia são emitidas:
 
 | Tipo | Gatilho | Interpretação típica | Mitigável? |
 | --- | --- | --- | --- |
-| `THROUGHPUT_SPIKE` | resíduo > +k·σ em série de fluxo/porta | DDoS volumétrico, exfiltração, *elephant flow* inesperado | ✅ (se série de fluxo) |
-| `THROUGHPUT_DROP` | resíduo < −k·σ | Falha de link, *blackhole*, regra DROP indevida | ❌ (alerta apenas) |
+| `THROUGHPUT_SPIKE` | resíduo > +k_spike·σ em série de fluxo/porta | DDoS volumétrico, exfiltração, *elephant flow* inesperado | ✅ (se série de fluxo) |
+| `THROUGHPUT_DROP` | resíduo < −k_drop·σ | Falha de link, *blackhole*, regra DROP indevida | ❌ (alerta apenas) |
 | `NEW_FLOW_SURGE` | nº de fluxos no DPID > 3× baseline | Port scan, SYN flood distribuído | ❌ (alerta apenas) |
 
 O warmup de `NEW_FLOW_SURGE` é independente e configurado por
 `FLOW_SURGE_WARMUP_SAMPLES`, pois essa heurística conta fluxos e não usa
 o modelo Holt de vazão.
+
+Repetições do mesmo `(tipo, série)` dentro de
+`ANOMALY_EVENT_COOLDOWN_S` são agregadas ao primeiro evento, sem repetir
+log de detecção nem tentativa de mitigação. O registro conserva
+`first_seen_ns`, atualiza `last_seen_ns`, pico observado e
+`suppressed_count`. A classificação continua ocorrendo em cada amostra e
+as amostras anômalas continuam fora do estado Holt; a deduplicação afeta
+somente a emissão do evento. O total agregado fica em
+`anomalies_suppressed` no endpoint de status. O log
+`[METRICS][ANOMALY_SUPPRESS]` é emitido na primeira repetição e depois a
+cada dez, reduzindo também escrita repetitiva no ETCD.
 
 ### 2.5 Mitigação autônoma - guard-rails antes de agir
 
@@ -174,8 +192,10 @@ topologia inter-domínio.
 ### 2.6 Ciclo de feedback
 
 `POST /predictor/feedback` com
-`{"anomaly_id": "...", "verdict": "false_positive"}` ajusta o threshold
-**da série específica** (×1.25 por FP e ×0.95 por TP). O modo offline
+`{"anomaly_id": "...", "verdict": "false_positive"}` ajusta somente o
+threshold correspondente ao tipo do evento **na série específica**
+(×1.25 por FP e ×0.95 por TP). Assim, feedback de uma queda não reduz nem
+aumenta a sensibilidade a DDoS. O modo offline
 respeita a faixa validada do artefato \[1, 20\]; o fallback preserva os
 limites anteriores \[2.5, 10\]. O efeito é que séries naturalmente "nervosas" (tráfego bursty
 legítimo) ficam progressivamente menos sensíveis, enquanto séries
@@ -198,7 +218,7 @@ precision/recall ao longo do experimento.
 | GET | `/predictor/model` | Modo efetivo, parâmetros e proveniência do modelo offline |
 | GET | `/predictor/export/status` | Estado e contadores da exportação CSV |
 | POST | `/predictor/feedback` | `{"anomaly_id", "verdict"}` — refina *thresholds* |
-| POST | `/predictor/config` | Ajuste em tempo de execução: `auto_mitigate`, `dry_run`, `min_rate_bps`, `cooldown_s` |
+| POST | `/predictor/config` | Ajuste em tempo de execução: `auto_mitigate`, `dry_run`, `min_rate_bps`, `cooldown_s`, `event_cooldown_s` |
 
 **Exemplo de anomalia retornada:**
 
@@ -211,10 +231,16 @@ precision/recall ao longo do experimento.
   "observed_bps": 94500000.0,
   "predicted_bps": 1200000.0,
   "z_score": 18.7,
-  "threshold": 4.0,
+  "threshold": 3.75,
+  "spike_z_threshold": 3.75,
+  "drop_z_threshold": 20.0,
   "model_residual": 4.35518628,
   "detection_mode": "offline",
   "ts_detect_ns": 1752230000123456789,
+  "first_seen_ns": 1752230000123456789,
+  "last_seen_ns": 1752230018123456789,
+  "suppressed_count": 8,
+  "peak_observed_bps": 101300000.0,
   "cid": "192.168.10.10",
   "mitigation": {
     "attempted": true,
@@ -347,6 +373,9 @@ runtime: a primeira amostra inicializa cada série e somente observações
 classificadas como normais atualizam Holt. O relatório separa qualquer
 anomalia de vazão da métrica `ddos_throughput_spike`, pois quedas são
 alertadas pelo runtime, mas não representam DDoS e não são mitigadas.
+Os dois thresholds também são gravados no relatório para tornar cada
+resultado reproduzível. Para experimentos específicos, eles podem ser
+fixados com `--spike-z-threshold` e `--drop-z-threshold`.
 
 ### 5.3 Executar o modelo no testbed
 
@@ -515,5 +544,5 @@ requer secrets ou acesso ao servidor do testbed.
 
 ------------------------------------------------------------------------
 
-**Versão**: 1.4 · **Data**: 2026-08-03 · **Status**: treinamento offline com
-preparação e validação independente do CIC-DDoS2019
+**Versão**: 1.5 · **Data**: 2026-08-03 · **Status**: thresholds assimétricos,
+deduplicação de eventos e validação independente no CIC-DDoS2019

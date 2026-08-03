@@ -29,6 +29,7 @@ ENV (mesmo padrão dos demais serviços):
   AUTO_MITIGATE         true|false
   DRY_RUN               true|false (loga a mitigação sem executar)
   MITIGATION_COOLDOWN_S 60
+  ANOMALY_EVENT_COOLDOWN_S 60      # agrupa alertas repetidos da mesma série/tipo
   WHITELIST_IPS         10.0.0.254,...  (nunca bloquear)
   WARMUP_SAMPLES        15         # fallback adaptativo quando não há modelo offline
   OFFLINE_MODEL_PATH               # artefato JSON criado por train_offline_model.py
@@ -44,6 +45,7 @@ ENV (mesmo padrão dos demais serviços):
 
 import os
 import json
+import math
 import time
 import uuid
 import glob
@@ -77,6 +79,7 @@ MIN_RATE_BPS      = float(os.environ.get("MIN_RATE_BPS", "50000"))
 AUTO_MITIGATE     = os.environ.get("AUTO_MITIGATE", "true").lower() == "true"
 DRY_RUN           = os.environ.get("DRY_RUN", "false").lower() == "true"
 COOLDOWN_S        = float(os.environ.get("MITIGATION_COOLDOWN_S", "60"))
+EVENT_COOLDOWN_S  = float(os.environ.get("ANOMALY_EVENT_COOLDOWN_S", "60"))
 WHITELIST_IPS     = {ip.strip() for ip in os.environ.get("WHITELIST_IPS", "").split(",") if ip.strip()}
 WARMUP_SAMPLES    = int(os.environ.get("WARMUP_SAMPLES", "15"))
 FLOW_SURGE_WARMUP = int(os.environ.get("FLOW_SURGE_WARMUP_SAMPLES", str(WARMUP_SAMPLES)))
@@ -84,6 +87,9 @@ REQUEST_TIMEOUT_S = float(os.environ.get("REQUEST_TIMEOUT_S", "5.0"))
 OFFLINE_MODEL_PATH = os.environ.get("OFFLINE_MODEL_PATH", "").strip()
 OFFLINE_MODEL_REQUIRED = os.environ.get("OFFLINE_MODEL_REQUIRED", "false").lower() == "true"
 ONLINE_MODEL_ADAPTATION = os.environ.get("ONLINE_MODEL_ADAPTATION", "false").lower() == "true"
+
+if not math.isfinite(EVENT_COOLDOWN_S) or EVENT_COOLDOWN_S < 0.0:
+    raise ValueError("ANOMALY_EVENT_COOLDOWN_S deve ser não negativo e finito")
 
 # --- Persistência do histórico de predição (aditivo; não afeta a lógica online) ---
 EXPORT_ENABLED     = os.environ.get("EXPORT_ENABLED", "true").lower() == "true"
@@ -107,8 +113,10 @@ def _load_runtime_model() -> Tuple[Optional[OfflineModel], Optional[str]]:
     try:
         model = load_offline_model(OFFLINE_MODEL_PATH)
         logger.info(
-            "Modelo offline carregado: path=%s alpha=%s beta=%s threshold=%s",
-            OFFLINE_MODEL_PATH, model.alpha, model.beta, model.z_threshold,
+            "Modelo offline carregado: path=%s alpha=%s beta=%s "
+            "spike_threshold=%s drop_threshold=%s",
+            OFFLINE_MODEL_PATH, model.alpha, model.beta,
+            model.spike_z_threshold, model.effective_drop_z_threshold,
         )
         input_config = model.training.get("input", {})
         trained_interval = (input_config.get("sample_interval_s")
@@ -239,9 +247,14 @@ class ResidualAnomalyDetector:
     def __init__(self, window: int, z_threshold: float, warmup: int,
                  fixed_center: Optional[float] = None,
                  fixed_scale: Optional[float] = None,
-                 online_adaptation: bool = False):
+                 online_adaptation: bool = False,
+                 drop_z_threshold: Optional[float] = None):
         self.residuals: deque = deque(maxlen=window)
+        # z_threshold permanece como alias do lado positivo para não quebrar
+        # clientes e modelos legados que usavam um único valor simétrico.
         self.z_threshold = z_threshold
+        self.drop_z_threshold = (z_threshold if drop_z_threshold is None
+                                 else drop_z_threshold)
         self.warmup = warmup
         self.fixed_center = fixed_center
         self.fixed_scale = fixed_scale
@@ -276,11 +289,14 @@ class ResidualAnomalyDetector:
         median, sigma = self._center_scale()
         z = (residual - median) / sigma
 
-        is_anom = abs(z) > self.z_threshold
+        is_anom = z > self.z_threshold or z < -self.drop_z_threshold
         # Resíduos anômalos NÃO entram na janela (evita mascarar ataques prolongados)
         if not is_anom and (not self.offline_calibrated or self.online_adaptation):
             self.residuals.append(residual)
         return z, is_anom
+
+    def threshold_for(self, z_score: float) -> float:
+        return self.z_threshold if z_score >= 0.0 else self.drop_z_threshold
 
 
 # =====================================================================
@@ -439,6 +455,7 @@ class SeriesState:
                 fixed_center=offline_model.residual_center,
                 fixed_scale=offline_model.residual_scale,
                 online_adaptation=ONLINE_MODEL_ADAPTATION,
+                drop_z_threshold=offline_model.effective_drop_z_threshold,
             )
         else:
             self.predictor = HoltPredictor()
@@ -514,7 +531,7 @@ class SeriesState:
         if not is_anomaly:
             return None
 
-        kind = "THROUGHPUT_SPIKE" if residual > 0 else "THROUGHPUT_DROP"
+        kind = "THROUGHPUT_SPIKE" if z > 0 else "THROUGHPUT_DROP"
         return {
             "anomaly_id": uuid.uuid4().hex[:12],
             "kind": kind,
@@ -523,7 +540,9 @@ class SeriesState:
             "observed_bps": round(self.rate_bps, 1),
             "predicted_bps": round(self.predicted_bps, 1),
             "z_score": round(z, 2),
-            "threshold": self.detector.z_threshold,
+            "threshold": self.detector.threshold_for(z),
+            "spike_z_threshold": self.detector.z_threshold,
+            "drop_z_threshold": self.detector.drop_z_threshold,
             "model_residual": round(self.model_residual, 8),
             "detection_mode": self.detection_mode,
             "ts_detect_ns": now_ns(),
@@ -709,6 +728,8 @@ class PredictorEngine:
         self.offline_model = offline_model
         self.detection_mode = "offline" if offline_model else "adaptive"
         self.feedback_stats = {"true_positive": 0, "false_positive": 0}
+        self.active_anomaly_events: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self.anomalies_suppressed = 0
         self.started_ns = now_ns()
 
     # ---- ingestão (chamada pelo Collector) ----
@@ -723,7 +744,71 @@ class PredictorEngine:
             self.register_anomaly(anomaly, mitigable=True)
 
     # ---- registro + resposta autônoma ----
-    def register_anomaly(self, anomaly: Dict[str, Any], mitigable: bool):
+    def register_anomaly(self, anomaly: Dict[str, Any], mitigable: bool) -> bool:
+        """Registra um evento novo ou agrega uma repetição ao evento ativo.
+
+        A decisão estatística continua sendo executada em toda amostra. Apenas o
+        evento, o log e a mitigação são deduplicados, evitando uma tempestade de
+        alertas durante um ataque sustentado.
+        """
+        event_key = (str(anomaly["kind"]), str(anomaly["key"]))
+        event_ts = int(anomaly["ts_detect_ns"])
+        with self.lock:
+            previous = self.active_anomaly_events.get(event_key)
+            event_age_ns = (None if previous is None else
+                            event_ts - int(previous["last_seen_ns"]))
+            if (previous is not None
+                    and 0 <= event_age_ns <= EVENT_COOLDOWN_S * 1e9):
+                previous["last_seen_ns"] = event_ts
+                previous["suppressed_count"] += 1
+                self.anomalies_suppressed += 1
+
+                if "observed_bps" in anomaly:
+                    observed = anomaly["observed_bps"]
+                    previous["latest_observed_bps"] = observed
+                    peak = previous.get("peak_observed_bps", observed)
+                    previous["peak_observed_bps"] = (
+                        max(peak, observed) if anomaly["kind"] == "THROUGHPUT_SPIKE"
+                        else min(peak, observed)
+                    )
+                if "observed_flows" in anomaly:
+                    observed_flows = anomaly["observed_flows"]
+                    previous["latest_observed_flows"] = observed_flows
+                    previous["peak_observed_flows"] = max(
+                        previous.get("peak_observed_flows", observed_flows),
+                        observed_flows,
+                    )
+                if "z_score" in anomaly:
+                    z_score = anomaly["z_score"]
+                    previous["latest_z_score"] = z_score
+                    if abs(z_score) > abs(previous.get("peak_z_score", z_score)):
+                        previous["peak_z_score"] = z_score
+
+                suppressed_count = previous["suppressed_count"]
+                original_id = previous["anomaly_id"]
+            else:
+                anomaly["first_seen_ns"] = event_ts
+                anomaly["last_seen_ns"] = event_ts
+                anomaly["suppressed_count"] = 0
+                if "observed_bps" in anomaly:
+                    anomaly["peak_observed_bps"] = anomaly["observed_bps"]
+                if "observed_flows" in anomaly:
+                    anomaly["peak_observed_flows"] = anomaly["observed_flows"]
+                if "z_score" in anomaly:
+                    anomaly["peak_z_score"] = anomaly["z_score"]
+                self.active_anomaly_events[event_key] = anomaly
+                previous = None
+
+        if previous is not None:
+            # Confirma a primeira agregação e depois em lotes de dez; o contador
+            # e o evento da API são atualizados em toda amostra sem poluir logs/ETCD.
+            if suppressed_count == 1 or suppressed_count % 10 == 0:
+                _metric("ANOMALY_SUPPRESS", f"kind={event_key[0]} key={event_key[1]} "
+                                            f"original_id={original_id} "
+                                            f"count={suppressed_count} ts_ns={event_ts}")
+                self._publish_etcd()
+            return False
+
         _metric("ANOMALY_DETECT", f"id={anomaly['anomaly_id']} kind={anomaly['kind']} "
                                   f"key={anomaly['key']} ts_ns={anomaly['ts_detect_ns']}")
         anomaly["mitigation"] = (self.mitigator.maybe_mitigate(anomaly)
@@ -731,13 +816,14 @@ class PredictorEngine:
         with self.lock:
             self.anomalies.appendleft(anomaly)
         self._publish_etcd()
+        return True
 
-    # ---- feedback loop: ajusta sensibilidade global ----
+    # ---- feedback loop: ajusta a sensibilidade da série afetada ----
     def apply_feedback(self, anomaly_id: str, verdict: str) -> Dict[str, Any]:
         """
-        false_positive -> aumenta threshold (menos sensível) da série afetada e +5% global
+        false_positive -> aumenta o threshold do lado afetado (menos sensível)
         true_positive  -> reduz levemente o threshold da série (mais sensível)
-        Ajuste multiplicativo com limites [2.5, 10.0] para estabilidade.
+        Ajuste multiplicativo com limites próprios do modo de detecção.
         """
         with self.lock:
             target = next((a for a in self.anomalies if a["anomaly_id"] == anomaly_id), None)
@@ -751,18 +837,22 @@ class PredictorEngine:
             if s:
                 lower, upper = ((1.0, 20.0) if s.detection_mode == "offline"
                                 else (2.5, 10.0))
-                s.detector.z_threshold = min(
-                    upper, max(lower, s.detector.z_threshold * factor)
-                )
-                new_thr = s.detector.z_threshold
+                threshold_attr = ("drop_z_threshold"
+                                  if target.get("kind") == "THROUGHPUT_DROP"
+                                  else "z_threshold")
+                current = getattr(s.detector, threshold_attr)
+                new_thr = min(upper, max(lower, current * factor))
+                setattr(s.detector, threshold_attr, new_thr)
             else:
                 new_thr = None
+                threshold_attr = None
             target["feedback"] = verdict
 
         _metric("FEEDBACK", f"anomaly={anomaly_id} verdict={verdict} "
-                            f"new_threshold={new_thr} ts_ns={now_ns()}")
+                            f"threshold_kind={threshold_attr} new_threshold={new_thr} "
+                            f"ts_ns={now_ns()}")
         return {"ok": True, "anomaly_id": anomaly_id, "verdict": verdict,
-                "new_threshold": new_thr}
+                "threshold_kind": threshold_attr, "new_threshold": new_thr}
 
     # ---- snapshots para API / ETCD ----
     def snapshot_predictions(self, top: int = 50) -> List[Dict[str, Any]]:
@@ -775,6 +865,8 @@ class PredictorEngine:
                 "trend_bps": round(s.predictor.trend_bps, 1),
                 "samples": s.predictor.n,
                 "z_threshold": s.detector.z_threshold,
+                "spike_z_threshold": s.detector.z_threshold,
+                "drop_z_threshold": s.detector.drop_z_threshold,
                 "detector_ready": s.detector.ready,
                 "detection_mode": s.detection_mode,
             } for s in self.series.values()]
@@ -791,6 +883,7 @@ class PredictorEngine:
                 "n_series": len(self.series),
                 "detection_mode": self.detection_mode,
                 "recent_anomalies": list(self.anomalies)[:20],
+                "anomalies_suppressed": self.anomalies_suppressed,
                 "feedback_stats": self.feedback_stats,
             }
             _etcd.put(f"flowpredictor/state/{CONTROLLER_ID}", json.dumps(state, default=str))
@@ -821,17 +914,20 @@ def status():
             "uptime_s": round((now_ns() - engine.started_ns) / 1e9, 1),
             "series_tracked": len(engine.series),
             "anomalies_recorded": len(engine.anomalies),
+            "anomalies_suppressed": engine.anomalies_suppressed,
             "feedback_stats": engine.feedback_stats,
             "model": model_status_payload(),
             "config": {
                 "poll_interval_s": POLL_INTERVAL_S,
                 "z_threshold_default": Z_THRESHOLD,
+                "spike_z_threshold_default": Z_THRESHOLD,
                 "warmup_samples_fallback": WARMUP_SAMPLES,
                 "flow_surge_warmup_samples": FLOW_SURGE_WARMUP,
                 "min_rate_bps": MIN_RATE_BPS,
                 "auto_mitigate": AUTO_MITIGATE,
                 "dry_run": DRY_RUN,
                 "cooldown_s": COOLDOWN_S,
+                "event_cooldown_s": EVENT_COOLDOWN_S,
                 "online_model_adaptation": ONLINE_MODEL_ADAPTATION,
                 "whitelist": sorted(WHITELIST_IPS),
                 "etcd_enabled": _etcd is not None,
@@ -915,8 +1011,17 @@ def feedback():
 @app.route("/predictor/config", methods=["POST"])
 def update_config():
     """Ajuste em runtime de parâmetros seguros (sem restart)."""
-    global AUTO_MITIGATE, DRY_RUN, MIN_RATE_BPS, COOLDOWN_S
+    global AUTO_MITIGATE, DRY_RUN, MIN_RATE_BPS, COOLDOWN_S, EVENT_COOLDOWN_S
     payload = request.get_json(force=True, silent=True) or {}
+    try:
+        requested_event_cooldown = (float(payload["event_cooldown_s"])
+                                    if "event_cooldown_s" in payload else None)
+    except (TypeError, ValueError):
+        return jsonify({"error": "event_cooldown_s deve ser numérico"}), 400
+    if (requested_event_cooldown is not None
+            and (not math.isfinite(requested_event_cooldown)
+                 or requested_event_cooldown < 0.0)):
+        return jsonify({"error": "event_cooldown_s deve ser não negativo e finito"}), 400
     changed = {}
     if "auto_mitigate" in payload:
         AUTO_MITIGATE = bool(payload["auto_mitigate"]); changed["auto_mitigate"] = AUTO_MITIGATE
@@ -926,6 +1031,9 @@ def update_config():
         MIN_RATE_BPS = float(payload["min_rate_bps"]); changed["min_rate_bps"] = MIN_RATE_BPS
     if "cooldown_s" in payload:
         COOLDOWN_S = float(payload["cooldown_s"]); changed["cooldown_s"] = COOLDOWN_S
+    if requested_event_cooldown is not None:
+        EVENT_COOLDOWN_S = requested_event_cooldown
+        changed["event_cooldown_s"] = EVENT_COOLDOWN_S
     _metric("CONFIG_UPDATE", f"cid={CONTROLLER_ID} changed={changed} ts_ns={now_ns()}")
     return jsonify({"ok": True, "changed": changed}), 200
 

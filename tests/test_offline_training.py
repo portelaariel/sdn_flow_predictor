@@ -12,6 +12,23 @@ from train_offline_model import (
 
 
 class OfflineModelTests(unittest.TestCase):
+    def test_legacy_model_uses_symmetric_thresholds(self):
+        payload = {
+            "schema_version": 1,
+            "model_type": "holt_residual",
+            "created_at": "test",
+            "holt": {"alpha": 0.35, "beta": 0.1, "transform": "log1p"},
+            "detector": {
+                "residual_center": 0.0,
+                "residual_scale": 0.1,
+                "z_threshold": 4.0,
+            },
+            "training": {},
+        }
+        model = OfflineModel.from_dict(payload)
+        self.assertEqual(model.spike_z_threshold, 4.0)
+        self.assertEqual(model.effective_drop_z_threshold, 4.0)
+
     def test_rejects_invalid_scale(self):
         payload = {
             "schema_version": 1,
@@ -91,6 +108,9 @@ class OfflineModelTests(unittest.TestCase):
             )
             self.assertGreaterEqual(model.training["metrics"]["recall"], 0.9)
             self.assertGreaterEqual(model.training["metrics"]["precision"], 0.9)
+            self.assertEqual(model.schema_version, 2)
+            self.assertIn("THROUGHPUT_DROP", model.training["metrics_by_kind"])
+            self.assertGreaterEqual(model.effective_drop_z_threshold, 1.0)
 
             artifact = Path(directory) / "model.json"
             artifact.write_text(json.dumps(model.to_dict()), encoding="utf-8")

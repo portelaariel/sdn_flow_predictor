@@ -1,32 +1,34 @@
 {
   "metrics": {
     "all_throughput_anomalies": {
-      "f1": 0.509154,
+      "f1": 0.897081,
       "false_negatives": 0,
-      "false_positive_rate": 0.076745,
-      "false_positives": 563,
-      "precision": 0.34152,
+      "false_positive_rate": 0.009133,
+      "false_positives": 67,
+      "precision": 0.81337,
       "recall": 1.0,
-      "true_negatives": 6773,
+      "true_negatives": 7269,
       "true_positives": 292
     },
     "ddos_throughput_spike": {
-      "f1": 0.918239,
+      "f1": 0.906832,
       "false_negatives": 0,
-      "false_positive_rate": 0.007088,
-      "false_positives": 52,
-      "precision": 0.848837,
+      "false_positive_rate": 0.008179,
+      "false_positives": 60,
+      "precision": 0.829545,
       "recall": 1.0,
-      "true_negatives": 7284,
+      "true_negatives": 7276,
       "true_positives": 292
     },
-    "drop_detections": 511,
+    "drop_detections": 7,
+    "drop_z_threshold": 20.0,
     "initial_rows_unscored": 236,
     "min_rate_bps": 50000.0,
     "rows_scored": 7628,
     "rows_total": 7864,
     "series": 236,
-    "spike_detections": 344
+    "spike_detections": 352,
+    "spike_z_threshold": 3.75
   },
   "model": "models/cic2019-drddos-udp-holt.json",
   "validation_files": [
