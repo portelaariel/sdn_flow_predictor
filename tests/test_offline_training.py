@@ -56,6 +56,11 @@ class OfflineModelTests(unittest.TestCase):
                             "observed_bps": base * 80.0,
                             "label": "DDoS",
                         })
+            Path(f"{dataset}.metadata.json").write_text(json.dumps({
+                "schema_version": 1,
+                "preparation_tool": "prepare_cicddos2019.py",
+                "config": {"window_s": 2.0},
+            }), encoding="utf-8")
 
             observations, metadata = load_observations(
                 [str(dataset)],
@@ -80,6 +85,10 @@ class OfflineModelTests(unittest.TestCase):
 
             self.assertEqual(model.training["rows_normal"], 120)
             self.assertEqual(model.training["rows_attack"], 16)
+            self.assertEqual(
+                model.training["preparation"][0]["preparation_tool"],
+                "prepare_cicddos2019.py",
+            )
             self.assertGreaterEqual(model.training["metrics"]["recall"], 0.9)
             self.assertGreaterEqual(model.training["metrics"]["precision"], 0.9)
 

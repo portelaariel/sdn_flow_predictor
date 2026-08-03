@@ -7,3 +7,7 @@ Do not edit the parameters manually. Every artifact records its schema,
 dataset SHA-256, input mapping, training counts, Holt parameters, robust
 residual calibration and calibration metrics. The runtime validates that
 contract before starting in offline mode.
+
+Keep an independent `*-validation.json` report beside a model when a
+held-out dataset was evaluated. Validation reports are evidence only and
+are not loaded by the runtime.
