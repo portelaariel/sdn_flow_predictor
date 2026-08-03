@@ -1,5 +1,7 @@
 # FLOWPREDICTOR - MÓDULO DE PREDIÇÃO DE VAZÃO E DETECÇÃO DE ANOMALIAS
 
+[![Repository validation](https://github.com/portelaariel/sdn_flow_predictor/actions/workflows/validate.yml/badge.svg)](https://github.com/portelaariel/sdn_flow_predictor/actions/workflows/validate.yml)
+
 ## 1. VISÃO GERAL
 
 O **FlowPredictor** é o quarto microserviço por domínio. Ele consome as
@@ -358,6 +360,13 @@ bash eMSN_ENV/cleanup_setup_env.sh
 O modo `--all` mantém o comportamento legado de remover todos os
 containers e redes customizadas do host e deve ser usado apenas em uma
 máquina dedicada.
+
+### 5.4 Integração contínua
+
+O workflow `.github/workflows/validate.yml` executa o mesmo validador em
+todo Pull Request, em pushes para `main` e sob demanda na aba Actions. O
+job usa apenas permissão de leitura do conteúdo do repositório e não
+requer secrets ou acesso ao servidor do testbed.
 
 ------------------------------------------------------------------------
 
