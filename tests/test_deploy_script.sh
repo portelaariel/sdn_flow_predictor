@@ -40,7 +40,21 @@ PREDICTOR_Z_THRESHOLD=5.5 \
 grep -q -- '--network ryu-network-0' "$COMMAND_LOG"
 grep -q -- '--ip 192.168.10.40' "$COMMAND_LOG"
 grep -q -- '-e Z_THRESHOLD=5.5' "$COMMAND_LOG"
+grep -q -- '-e OFFLINE_MODEL_REQUIRED=false' "$COMMAND_LOG"
+grep -q -- '-e WARMUP_SAMPLES=15' "$COMMAND_LOG"
 grep -q -- '-e DRY_RUN=true' "$COMMAND_LOG"
 grep -q -- '-p 6060:6060' "$COMMAND_LOG"
+
+MODEL_PATH="$TEST_TMP/ddos-holt.json"
+touch "$MODEL_PATH"
+MODEL_PATH="$(cd "$(dirname "$MODEL_PATH")" && pwd)/$(basename "$MODEL_PATH")"
+PREDICTION_HISTORY_ROOT="$TEST_TMP/history-offline" \
+PREDICTOR_OFFLINE_MODEL="$MODEL_PATH" \
+PREDICTOR_OFFLINE_MODEL_REQUIRED=true \
+  bash "$PROJECT_ROOT/deploy_flow_predictor.sh" 1 true >/dev/null
+
+grep -q -- "-v $MODEL_PATH:/app/models/offline_model.json:ro" "$COMMAND_LOG"
+grep -q -- '-e OFFLINE_MODEL_PATH=/app/models/offline_model.json' "$COMMAND_LOG"
+grep -q -- '-e OFFLINE_MODEL_REQUIRED=true' "$COMMAND_LOG"
 
 echo "deploy_smoke: ok"

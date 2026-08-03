@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir \
     protobuf==3.20.3
 
 WORKDIR /app
-COPY flow_predictor_cnsm.py /app/
+COPY flow_predictor_cnsm.py offline_model.py /app/
 
 # Porta HTTP padrão do serviço (sobrescrita via -e PORT no run)
 EXPOSE 6060

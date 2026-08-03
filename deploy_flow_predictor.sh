@@ -35,6 +35,38 @@ if [[ "$DRY_RUN" != "true" && "$DRY_RUN" != "false" ]]; then
   echo "dry_run must be true or false" >&2
   exit 2
 fi
+for value in "$PREDICTOR_OFFLINE_MODEL_REQUIRED" "$PREDICTOR_ONLINE_MODEL_ADAPTATION"; do
+  if [[ "$value" != "true" && "$value" != "false" ]]; then
+    echo "offline model boolean settings must be true or false" >&2
+    exit 2
+  fi
+done
+
+MODEL_DOCKER_ARGS=(
+  -e "OFFLINE_MODEL_REQUIRED=$PREDICTOR_OFFLINE_MODEL_REQUIRED"
+  -e "ONLINE_MODEL_ADAPTATION=$PREDICTOR_ONLINE_MODEL_ADAPTATION"
+)
+MODEL_DESCRIPTION="adaptive fallback (warmup=$PREDICTOR_WARMUP_SAMPLES)"
+if [[ -n "$PREDICTOR_OFFLINE_MODEL" ]]; then
+  MODEL_HOST_PATH="$PREDICTOR_OFFLINE_MODEL"
+  if [[ "$MODEL_HOST_PATH" != /* ]]; then
+    MODEL_HOST_PATH="$SCRIPT_DIR/$MODEL_HOST_PATH"
+  fi
+  if [[ ! -r "$MODEL_HOST_PATH" ]]; then
+    echo "offline model not readable: $MODEL_HOST_PATH" >&2
+    exit 2
+  fi
+  MODEL_HOST_DIR="$(cd "$(dirname "$MODEL_HOST_PATH")" && pwd)"
+  MODEL_HOST_PATH="$MODEL_HOST_DIR/$(basename "$MODEL_HOST_PATH")"
+  MODEL_DOCKER_ARGS+=(
+    -v "$MODEL_HOST_PATH:/app/models/offline_model.json:ro"
+    -e "OFFLINE_MODEL_PATH=/app/models/offline_model.json"
+  )
+  MODEL_DESCRIPTION="offline model $MODEL_HOST_PATH"
+elif [[ "$PREDICTOR_OFFLINE_MODEL_REQUIRED" == "true" ]]; then
+  echo "PREDICTOR_OFFLINE_MODEL_REQUIRED=true requires PREDICTOR_OFFLINE_MODEL" >&2
+  exit 2
+fi
 
 HISTORY_ROOT="${PREDICTION_HISTORY_ROOT:-$SCRIPT_DIR}"
 
@@ -75,8 +107,10 @@ for ((i=0; i<C; i++)); do
 
   log "Iniciando flow-predictor-$i em $PRED_IP:$PRED_HTTP_PORT (rede: $NET, dry_run=$DRY_RUN)"
   log "  Dataset em: $HIST_DIR"
+  log "  Detecção: $MODEL_DESCRIPTION"
   sudo docker run -d --name "flow-predictor-$i" --network "$NET" --ip "$PRED_IP" \
     -v "$HIST_DIR:/app/prediction_history" \
+    "${MODEL_DOCKER_ARGS[@]}" \
     -e EXPORT_ENABLED="$PREDICTOR_EXPORT_ENABLED" \
     -e EXPORT_DIR="/app/prediction_history" \
     -e EXPORT_PREFIXES="$PREDICTOR_EXPORT_PREFIXES" \
@@ -88,6 +122,8 @@ for ((i=0; i<C; i++)); do
     -e PORT="$PRED_HTTP_PORT" \
     -e POLL_INTERVAL_S="$PREDICTOR_POLL_INTERVAL_S" \
     -e Z_THRESHOLD="$PREDICTOR_Z_THRESHOLD" \
+    -e WARMUP_SAMPLES="$PREDICTOR_WARMUP_SAMPLES" \
+    -e FLOW_SURGE_WARMUP_SAMPLES="$PREDICTOR_FLOW_SURGE_WARMUP_SAMPLES" \
     -e MIN_RATE_BPS="$PREDICTOR_MIN_RATE_BPS" \
     -e AUTO_MITIGATE="$PREDICTOR_AUTO_MITIGATE" \
     -e DRY_RUN="$DRY_RUN" \

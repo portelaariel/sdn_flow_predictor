@@ -40,6 +40,8 @@ coordenação entre domínios.
 | Componente | Arquivo ativo | Construção/execução |
 | --- | --- | --- |
 | FlowPredictor | `flow_predictor_cnsm.py` | `Dockerfile.flow_predictor` |
+| Contrato do modelo | `offline_model.py` | valida o artefato JSON no treino e no runtime |
+| Treinamento offline | `train_offline_model.py` | converte CSVs rotulados em um modelo versionável |
 | Ryu controller | `ryu_apps/emitter_cnsm.py` + `ryu_apps/ofctl_rest.py` | `ryu_apps/Dockerfile` |
 | SimpleSwitch | `rest_client/Simpleswitch_cnsm.py` | `rest_client/Dockerfile` |
 | FlowBlocker | `flow_blocker/flow_blocker_cnsm.py` | `flow_blocker/Dockerfile` |
@@ -59,11 +61,14 @@ como evidência experimental, mas não participam do runtime.
 
 ## 2. PIPELINE DE DADOS (Ingestão → Predição → Detecção → Mitigação → Feedback)
 
-       ┌─────────────┐   Δbytes/Δt    ┌──────────────┐  resíduo   ┌──────────────┐
-       │  COLETOR    │──────────────► │  PREDITOR    │──────────► │  DETECTOR    │
-       │ /stats/port │  (taxa bps)    │  Holt        │ obs - pred │  z-score MAD │
-       │ /stats/flow │                │ (nível+trend)│            │  adaptativo  │
-       └─────────────┘                └──────────────┘            └──────┬───────┘
+ CSV normal + ataque ──► train_offline_model.py ──► modelo JSON validado
+                                                        │ parâmetros + calibração
+                                                        ▼
+       ┌─────────────┐   Δbytes/Δt    ┌──────────────┐  resíduo log  ┌──────────────┐
+       │  COLETOR    │──────────────► │  PREDITOR    │─────────────► │  DETECTOR    │
+       │ /stats/port │  (taxa bps)    │ Holt offline │               │ robust z     │
+       │ /stats/flow │                │ (nível+trend)│               │ sem warmup   │
+       └─────────────┘                └──────────────┘               └──────┬───────┘
             ▲ poll 2s                                                    │ anomalia
             │                                                            ▼
        ┌────┴────────┐                ┌──────────────┐  guard-rails ┌────────────┐
@@ -94,29 +99,39 @@ flow foi reinstalado ou o switch reiniciou, comum com os timeouts de
 `MIN_RATE_BPS` alimentam o modelo mas não geram alertas, filtrando o
 ruído de ARP/LLDP.
 
-### 2.3 Predição - Holt (suavização exponencial dupla)
+### 2.3 Treinamento offline e Holt online
 
-**Por que Holt e não LSTM/ARIMA?** Três razões alinhadas aos seus
-requisitos de escalabilidade:
+O treinamento recebe séries temporais de vazão normais e, opcionalmente,
+amostras rotuladas como ataque. Ele executa quatro passos:
 
-1.  **Custo O(1) por amostra e \~100 bytes de estado por série.** Uma
-    topologia com 50 switches × 40 fluxos ativos = 2.000 séries custam
-    menos de 1 MB de RAM e microssegundos de CPU por ciclo. Modelos de
-    deep learning exigiriam GPU/batching e quebrariam a promessa de
-    "qualquer topologia sem perda de desempenho".
-2.  **Captura nível E tendência** - melhor que EWMA puro para rampas
-    de tráfego (ex.: início de um iperf), reduzindo falsos positivos
-    durante crescimento legítimo.
-3.  **Interface pluggável**: a classe `HoltPredictor` expõe apenas
-    `update(value)` e `predict(horizon)`. Trocar por ARIMA, Prophet ou
-    um modelo treinado offline exige alterar uma única classe, sem tocar
-    no coletor, detector ou mitigador.
+1. converte a unidade para `rate_bps` e agrupa as linhas por série;
+2. escolhe `alpha` e `beta` do Holt por busca em grade, usando somente
+   trechos normais consecutivos;
+3. calcula mediana e escala robusta (MAD) dos resíduos em `log1p(bps)`;
+4. quando há rótulos de ataque, calibra o threshold para a melhor F1;
+   sem ataques, usa o quantil 99,5% dos resíduos normais.
 
-A predição de 1 passo é feita **antes** do `update()`,  garantindo que
-o resíduo compare a observação contra uma predição genuína
-(out-of-sample), não contra um modelo que já viu o valor.
+O `log1p` é importante para transferir o modelo entre datasets e o
+Mininet: a decisão passa a refletir uma mudança proporcional de vazão,
+em vez de depender de um número absoluto de bits por segundo. O artefato
+JSON registra o hash do dataset, colunas usadas, contagens, parâmetros e
+métricas de calibração.
 
-### 2.4 Detecção de anomalias - z-score robusto sobre resíduos
+No runtime, a primeira taxa de cada fluxo inicializa apenas o nível
+específico daquela série. A taxa seguinte já é classificada com a
+distribuição aprendida offline; não há o warmup de 15 amostras. Um ataque
+detectado não atualiza Holt, evitando que um DDoS prolongado seja
+absorvido como o novo comportamento normal.
+
+Holt continua adequado ao processamento online por ter custo O(1) e
+capturar nível e tendência. A predição de um passo é sempre feita antes
+de observar a nova taxa.
+
+Se nenhum modelo for configurado, a ferramenta mantém o detector
+adaptativo anterior como fallback compatível. Nesse modo, e somente
+nele, `WARMUP_SAMPLES` continua sendo usado.
+
+### 2.4 Detecção de anomalias - z-score robusto calibrado offline
 
 Três classes de anomalia são emitidas:
 
@@ -125,6 +140,10 @@ Três classes de anomalia são emitidas:
 | `THROUGHPUT_SPIKE` | resíduo > +k·σ em série de fluxo/porta | DDoS volumétrico, exfiltração, *elephant flow* inesperado | ✅ (se série de fluxo) |
 | `THROUGHPUT_DROP` | resíduo < −k·σ | Falha de link, *blackhole*, regra DROP indevida | ❌ (alerta apenas) |
 | `NEW_FLOW_SURGE` | nº de fluxos no DPID > 3× baseline | Port scan, SYN flood distribuído | ❌ (alerta apenas) |
+
+O warmup de `NEW_FLOW_SURGE` é independente e configurado por
+`FLOW_SURGE_WARMUP_SAMPLES`, pois essa heurística conta fluxos e não usa
+o modelo Holt de vazão.
 
 ### 2.5 Mitigação autônoma - guard-rails antes de agir
 
@@ -154,8 +173,9 @@ topologia inter-domínio.
 
 `POST /predictor/feedback` com
 `{"anomaly_id": "...", "verdict": "false_positive"}` ajusta o threshold
-**da série específica** (×1.25 por FP, ×0.95 por TP, com limites \[2.5,
-10.0\]). O efeito é que séries naturalmente "nervosas" (tráfego bursty
+**da série específica** (×1.25 por FP e ×0.95 por TP). O modo offline
+respeita a faixa validada do artefato \[1, 20\]; o fallback preserva os
+limites anteriores \[2.5, 10\]. O efeito é que séries naturalmente "nervosas" (tráfego bursty
 legítimo) ficam progressivamente menos sensíveis, enquanto séries
 estáveis ganham sensibilidade, a precisão se refina por série, não
 por um único knob global. Os vereditos ficam registrados na anomalia e
@@ -173,6 +193,7 @@ precision/recall ao longo do experimento.
 | GET | `/predictor/predictions?top=N` | Top-N séries por vazão com *forecast* h=1 e h=5 |
 | GET | `/predictor/predictions/<key>` | Detalhe de uma série: *forecast* multi-horizonte + histórico completo |
 | GET | `/predictor/anomalies?limit=N` | Anomalias recentes com resultado da mitigação |
+| GET | `/predictor/model` | Modo efetivo, parâmetros e proveniência do modelo offline |
 | GET | `/predictor/export/status` | Estado e contadores da exportação CSV |
 | POST | `/predictor/feedback` | `{"anomaly_id", "verdict"}` — refina *thresholds* |
 | POST | `/predictor/config` | Ajuste em tempo de execução: `auto_mitigate`, `dry_run`, `min_rate_bps`, `cooldown_s` |
@@ -189,6 +210,8 @@ precision/recall ao longo do experimento.
   "predicted_bps": 1200000.0,
   "z_score": 18.7,
   "threshold": 4.0,
+  "model_residual": 4.35518628,
+  "detection_mode": "offline",
   "ts_detect_ns": 1752230000123456789,
   "cid": "192.168.10.10",
   "mitigation": {
@@ -232,7 +255,92 @@ usam `idle_timeout=30` e permanecem enquanto houver tráfego.
 
 ------------------------------------------------------------------------
 
-## 5. INTEGRAÇÃO COM O TESTBED - PASSO A PASSO
+## 5. TREINAMENTO OFFLINE
+
+### 5.1 Dataset exportado pelo próprio FlowPredictor
+
+O formato mais confiável é o histórico criado em
+`prediction_history_domain*/`. Para treinar com um ou vários diretórios:
+
+``` bash
+python3 train_offline_model.py prediction_history_domain*/ \
+  --value-column observed_bps \
+  --series-columns flow_key \
+  --timestamp-column timestamp \
+  --sample-interval-s 2 \
+  --output models/mininet-holt.json
+```
+
+Esse exemplo pressupõe que a coleta contém somente o baseline normal;
+o threshold é calibrado pelo quantil dos resíduos benignos. A coluna
+`is_anomaly` exportada pela ferramenta é a decisão do detector anterior,
+não um ground truth, e não deve ser usada como rótulo de treino sem
+revisão. Para experimentos com ataques, adicione uma coluna rotulada a
+partir do roteiro do experimento e use-a em `--label-column`.
+
+### 5.2 Dataset DDoS externo
+
+Datasets como CIC-DDoS podem ser usados se houver uma coluna de vazão,
+ordem temporal, rótulo e observações repetidas para a mesma série. Por
+exemplo, quando o CSV contém `Flow Bytes/s`, `Source IP`,
+`Destination IP`, `Timestamp` e `Label`:
+
+``` bash
+python3 train_offline_model.py datasets/ddos.csv \
+  --value-column "Flow Bytes/s" \
+  --value-scale 8 \
+  --series-columns "Source IP,Destination IP" \
+  --timestamp-column Timestamp \
+  --sample-interval-s 2 \
+  --label-column Label \
+  --normal-label BENIGN \
+  --output models/ddos-holt.json
+```
+
+`--value-scale 8` converte bytes/s para bits/s. Nomes de colunas devem
+ser passados exatamente como aparecem no CSV.
+
+> Um dataset tabular com uma linha independente por conexão e sem ordem
+> temporal não treina Holt corretamente. Nesse caso, agregue primeiro as
+> linhas em janelas temporais por par origem/destino. O modelo precisa de
+> séries, não apenas de exemplos isolados para classificação. O intervalo
+> deve ser compatível com `PREDICTOR_POLL_INTERVAL_S` (2 s por padrão).
+
+O comando imprime os parâmetros escolhidos e, quando há ataques,
+precision, recall e F1 de calibração. Essas métricas usam o próprio
+dataset de treino; a avaliação científica final deve usar outro arquivo
+ou uma divisão temporal não vista no treinamento.
+
+### 5.3 Executar o modelo no testbed
+
+O caminho informado é montado como somente leitura em todos os
+containers FlowPredictor:
+
+``` bash
+PREDICTOR_OFFLINE_MODEL="$PWD/models/ddos-holt.json" \
+PREDICTOR_OFFLINE_MODEL_REQUIRED=true \
+PREDICTOR_DRY_RUN=true \
+  bash deploy_flow_predictor.sh 2 true
+```
+
+Use `PREDICTOR_OFFLINE_MODEL_REQUIRED=true` em experimentos: um arquivo
+ausente ou inválido fará o serviço falhar explicitamente, em vez de cair
+silenciosamente no warmup adaptativo. Mantenha
+`PREDICTOR_ONLINE_MODEL_ADAPTATION=false` para que o teste online use
+exatamente a calibração offline.
+
+Confirme o modo efetivo:
+
+``` bash
+curl http://127.0.0.1:6060/predictor/model | jq .
+curl http://127.0.0.1:6060/predictor/status | jq '.model'
+```
+
+O resultado deve conter `"loaded": true` e `"mode": "offline"`.
+
+------------------------------------------------------------------------
+
+## 6. INTEGRAÇÃO COM O TESTBED - PASSO A PASSO
 
 ``` bash
 # 1. Construir as imagens ativas (uma vez)
@@ -260,13 +368,13 @@ sudo CSETS=2 SPER=2 python3 eMSN_ENV/setup_mininet.py
 # 4. Confirmar que os microserviços estão operacionais
 docker ps
 
-# 5. Verificar coleta (aguarde ~30 s de warm-up = 15 amostras × 2 s)
+# 5. Verificar coleta (no modo offline, a segunda taxa já pode ser classificada)
 curl http://127.0.0.1:6060/predictor/status | jq .
 curl http://127.0.0.1:6060/predictor/predictions | jq .
 
-# 6. Provocar uma anomalia (no Mininet, após tráfego baseline estável)
+# 6. Provocar uma anomalia (no Mininet)
 mininet> h4 iperf3 -s -D
-mininet> h1 ping -c 30 10.0.0.4 -i 0.5        # baseline ~modesto por ~15s
+mininet> h1 ping -c 6 10.0.0.4 -i 0.5         # inicializa a série
 mininet> h1 iperf3 -c 10.0.0.4 -t 20           # SPIKE súbito
 
 # 7. Observar detecção + dry-run da mitigação
@@ -302,7 +410,7 @@ existentes:
 
     Latência de resposta autônoma = T4 − T1
 
-### 5.1 Validação da infraestrutura
+### 6.1 Validação da infraestrutura
 
 Antes de iniciar os experimentos, recomenda-se verificar o estado dos
 microserviços:
@@ -322,7 +430,7 @@ Os Docker Healthchecks utilizam os endpoints e portas corretos de cada
 instância, permitindo validar automaticamente ambientes com múltiplos
 domínios.
 
-### 5.2 Bootstrap automatizado
+### 6.2 Bootstrap automatizado
 
 Nesta versão, o FlowPredictor foi integrado ao processo de inicialização
 do ambiente. Dessa forma, não é mais necessário executar manualmente
@@ -330,7 +438,7 @@ do ambiente. Dessa forma, não é mais necessário executar manualmente
 ambiente é preparado pelo `setup_env.sh`, simplificando a implantação e
 reduzindo erros de configuração.
 
-### 5.3 Configuração e validação
+### 6.3 Configuração e validação
 
 Os defaults de imagens, endereçamento, portas, ETCD e FlowPredictor ficam
 centralizados em `config/runtime.env`. Qualquer valor pode ser sobrescrito
@@ -361,7 +469,7 @@ O modo `--all` mantém o comportamento legado de remover todos os
 containers e redes customizadas do host e deve ser usado apenas em uma
 máquina dedicada.
 
-### 5.4 Integração contínua
+### 6.4 Integração contínua
 
 O workflow `.github/workflows/validate.yml` executa o mesmo validador em
 todo Pull Request, em pushes para `main` e sob demanda na aba Actions. O

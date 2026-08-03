@@ -1,8 +1,11 @@
 import ast
 import unittest
+import uuid
 from collections import deque
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
+
+from offline_model import OfflineModel, inverse_transform_value, transform_value
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,8 +29,26 @@ class PredictorTests(unittest.TestCase):
     def setUpClass(cls):
         cls.symbols = load_definitions(
             "flow_predictor_cnsm.py",
-            {"HoltPredictor", "ResidualAnomalyDetector"},
-            {"Optional": Optional, "Tuple": Tuple, "deque": deque},
+            {"HoltPredictor", "ResidualAnomalyDetector", "SeriesState"},
+            {
+                "Optional": Optional,
+                "Tuple": Tuple,
+                "Dict": Dict,
+                "Any": Any,
+                "deque": deque,
+                "transform_value": transform_value,
+                "inverse_transform_value": inverse_transform_value,
+                "OfflineModel": OfflineModel,
+                "ONLINE_MODEL_ADAPTATION": False,
+                "HISTORY_WINDOW": 120,
+                "Z_THRESHOLD": 4.0,
+                "WARMUP_SAMPLES": 15,
+                "MIN_RATE_BPS": 1.0,
+                "CONTROLLER_ID": "test-controller",
+                "_exporter": None,
+                "uuid": uuid,
+                "now_ns": lambda: 1,
+            },
         )
 
     def test_holt_predictor_tracks_level_and_trend(self):
@@ -49,6 +70,47 @@ class PredictorTests(unittest.TestCase):
         self.assertTrue(is_anomaly)
         self.assertGreater(z_score, detector.z_threshold)
         self.assertEqual(len(detector.residuals), baseline_size)
+
+    def test_offline_detector_is_ready_without_warmup(self):
+        detector = self.symbols["ResidualAnomalyDetector"](
+            window=10,
+            z_threshold=4.0,
+            warmup=0,
+            fixed_center=0.0,
+            fixed_scale=0.1,
+        )
+        self.assertTrue(detector.ready)
+        self.assertEqual(detector.score(0.0), (0.0, False))
+        z_score, is_anomaly = detector.score(1.0)
+        self.assertTrue(is_anomaly)
+        self.assertGreater(z_score, detector.z_threshold)
+
+    def test_series_uses_offline_model_and_does_not_absorb_attack(self):
+        model = OfflineModel(
+            alpha=0.35,
+            beta=0.1,
+            transform="log1p",
+            residual_center=0.0,
+            residual_scale=0.1,
+            z_threshold=4.0,
+            created_at="test",
+        )
+        series = self.symbols["SeriesState"](
+            "flow:1:10.0.0.1->10.0.0.4",
+            {"type": "flow", "dpid": 1, "nw_src": "10.0.0.1", "nw_dst": "10.0.0.4"},
+            model,
+        )
+
+        self.assertIsNone(series.ingest(0, 0.0))
+        self.assertIsNone(series.ingest(12_500, 1.0))       # 100 kbit/s: prime
+        self.assertIsNone(series.ingest(25_000, 2.0))       # baseline estável
+        samples_before_attack = series.predictor.n
+        anomaly = series.ingest(1_275_000, 3.0)             # 10 Mbit/s: spike
+
+        self.assertIsNotNone(anomaly)
+        self.assertEqual(anomaly["kind"], "THROUGHPUT_SPIKE")
+        self.assertEqual(anomaly["detection_mode"], "offline")
+        self.assertEqual(series.predictor.n, samples_before_attack)
 
 
 class FlowRuleTests(unittest.TestCase):

@@ -13,6 +13,7 @@ prediction_history/
 prediction_history_domain*/
 eMSN_ENV/run_*/
 *.pcap
+datasets/
 
 # Editors
 .vscode/
