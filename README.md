@@ -2,12 +2,14 @@
 
 ## 1. VISÃO GERAL
 
-O **FlowPredictor** é o quarto microserviço por domínio, projetado para
-se encaixar na arquitetura existente sem modificar nenhum componente
-atual. Ele consome as **mesmas fontes de dados já disponíveis** (Ryu
-ofctl_rest), reutiliza o **mesmo mecanismo de mitigação** (FlowBlocker
-`/flowblocker/service`) e segue o **mesmo padrão operacional** (Flask,
-ENV vars, logging `[METRICS]`, ETCD opcional).
+O **FlowPredictor** é o quarto microserviço por domínio. Ele consome as
+estatísticas do Ryu `ofctl_rest`, reutiliza o mecanismo de mitigação do
+FlowBlocker (`/flowblocker/service`) e segue o mesmo padrão operacional
+(Flask, variáveis de ambiente, logging `[METRICS]` e ETCD opcional).
+
+Para expor `nw_src` e `nw_dst` nas estatísticas OpenFlow 1.0, o caminho
+ativo usa o SimpleSwitch L3-aware incluído neste repositório. Essa é a
+única adaptação necessária nos componentes de encaminhamento existentes.
 
     ┌──────────────────────── DOMÍNIO i ─────────────────────────────┐
     │                                                                │
@@ -30,6 +32,22 @@ passa pelo FlowBlocker, que já implementa a lógica cross-domain, os
 guard-rails e a instalação OF 1.0. Isso preserva a separação de
 responsabilidades da arquitetura e evita duplicação da lógica de
 coordenação entre domínios.
+
+### 1.1 Estrutura ativa do repositório
+
+| Componente | Arquivo ativo | Construção/execução |
+| --- | --- | --- |
+| FlowPredictor | `flow_predictor_cnsm.py` | `Dockerfile.flow_predictor` |
+| Ryu controller | `ryu_apps/emitter_cnsm.py` + `ryu_apps/ofctl_rest.py` | `ryu_apps/Dockerfile` |
+| SimpleSwitch | `rest_client/Simpleswitch_cnsm.py` | `rest_client/Dockerfile` |
+| FlowBlocker | `flow_blocker/flow_blocker_cnsm.py` | `flow_blocker/Dockerfile` |
+| Bootstrap | `eMSN_ENV/setup_env.sh` | cria os serviços por domínio |
+| Topologia | `eMSN_ENV/setup_mininet.py` | cria a rede Mininet |
+| Deploy isolado | `deploy_flow_predictor.sh` | adiciona o preditor a um ambiente existente |
+
+Arquivos com sufixo `_original` e scripts alternativos não fazem parte
+do runtime principal. Eles devem ser tratados apenas como material
+legado enquanto ainda existirem no checkout.
 
 ------------------------------------------------------------------------
 
@@ -149,6 +167,7 @@ precision/recall ao longo do experimento.
 | GET | `/predictor/predictions?top=N` | Top-N séries por vazão com *forecast* h=1 e h=5 |
 | GET | `/predictor/predictions/<key>` | Detalhe de uma série: *forecast* multi-horizonte + histórico completo |
 | GET | `/predictor/anomalies?limit=N` | Anomalias recentes com resultado da mitigação |
+| GET | `/predictor/export/status` | Estado e contadores da exportação CSV |
 | POST | `/predictor/feedback` | `{"anomaly_id", "verdict"}` — refina *thresholds* |
 | POST | `/predictor/config` | Ajuste em tempo de execução: `auto_mitigate`, `dry_run`, `min_rate_bps`, `cooldown_s` |
 
@@ -187,7 +206,7 @@ compartilhado obrigatório, o padrão exato do FlowBlocker. Cada
 instância monitora apenas os DPIDs do seu controlador; a visibilidade
 global é opcional via chave ETCD `flowpredictor/state/<cid>` (mesmo
 prefixo-pattern das domain tables). Escalar de 2 para 20 domínios é
-executar `deploy_flow_predictor.sh 20`.
+executar `sudo bash deploy_flow_predictor.sh 20`.
 
 **Vertical (dentro do domínio)**: o custo por ciclo é dominado pelos
 GETs HTTP ao Ryu (um por dpid por tipo de stat), não pelo processamento.
@@ -202,17 +221,22 @@ Referências de dimensionamento:
 **Flexibilidade de topologia**: nenhum pressuposto sobre número de
 switches, forma da topologia ou esquema de IPs. Novas séries nascem
 quando o primeiro contador aparece; séries de fluxos expirados
-simplesmente param de ser atualizadas (os flows do SimpleSwitch têm
-timeout de 5s, então fluxos ociosos somem naturalmente do
-`/stats/flow`).
+simplesmente param de ser atualizadas. As regras IPv4 do SimpleSwitch
+usam `idle_timeout=30` e permanecem enquanto houver tráfego.
 
 ------------------------------------------------------------------------
 
 ## 5. INTEGRAÇÃO COM O TESTBED - PASSO A PASSO
 
 ``` bash
-# 1. Inicializar toda a infraestrutura
-./setup_env.sh
+# 1. Construir as imagens ativas (uma vez)
+docker build -t ryu_core_cnsm ryu_apps
+docker build -t simpleswitch_cnsm rest_client
+docker build -t flow_blocker_cnsm flow_blocker
+docker build -t flow_predictor_cnsm -f Dockerfile.flow_predictor .
+
+# 2. Inicializar a infraestrutura a partir da raiz do repositório
+bash eMSN_ENV/setup_env.sh
 
 # O setup_env.sh realiza automaticamente o bootstrap de:
 # - ETCD
@@ -221,37 +245,37 @@ timeout de 5s, então fluxos ociosos somem naturalmente do
 # - FlowBlocker
 # - FlowPredictor
 
-# 2. Criar a topologia Mininet
-sudo CSETS=2 SPER=2 ./setup_mininet.py
+# 3. Criar a topologia Mininet
+sudo CSETS=2 SPER=2 python3 eMSN_ENV/setup_mininet.py
 
-# 3. Confirmar que os microserviços estão operacionais
+# 4. Confirmar que os microserviços estão operacionais
 docker ps
 
-# 4. Verificar coleta (aguarde ~30 s de warm-up = 15 amostras × 2 s)
+# 5. Verificar coleta (aguarde ~30 s de warm-up = 15 amostras × 2 s)
 curl http://127.0.0.1:6060/predictor/status | jq .
 curl http://127.0.0.1:6060/predictor/predictions | jq .
 
-# 4. Provocar uma anomalia (no Mininet, após tráfego baseline estável)
+# 6. Provocar uma anomalia (no Mininet, após tráfego baseline estável)
 mininet> h4 iperf3 -s -D
 mininet> h1 ping -c 30 10.0.0.4 -i 0.5        # baseline ~modesto por ~15s
 mininet> h1 iperf3 -c 10.0.0.4 -t 20           # SPIKE súbito
 
-# 5. Observar detecção + dry-run da mitigação
+# 7. Observar detecção + dry-run da mitigação
 curl http://127.0.0.1:6060/predictor/anomalies | jq '.anomalies[0]'
 docker logs flow-predictor-0 | grep "\[METRICS\]\[MITIGATION_DRYRUN\]"
 
-# 6. Armar mitigação real e repetir o passo 4
+# 8. Armar mitigação real e repetir o passo 6
 curl -X POST http://127.0.0.1:6060/predictor/config \
   -H "Content-Type: application/json" -d '{"dry_run": false}'
 
-# 7. Confirmar o DROP instalado pelo FlowBlocker (cross-domain!)
+# 9. Confirmar o DROP instalado pelo FlowBlocker (cross-domain!)
 # Executar no terminal do host (fora do CLI do Mininet)
 sudo ovs-ofctl -O OpenFlow10 dump-flows s1 | grep nw_src=10.0.0.1
 
 # Validar no Mininet
 mininet> h1 ping -c 3 10.0.0.4                 # deve falhar
 
-# 8. Se foi falso positivo, ensinar o módulo
+# 10. Se foi falso positivo, ensinar o módulo
 curl -X POST http://127.0.0.1:6060/predictor/feedback \
   -H "Content-Type: application/json" \
   -d '{"anomaly_id": "a3f8c92e1b04", "verdict": "false_positive"}'
@@ -299,5 +323,5 @@ reduzindo erros de configuração.
 
 ------------------------------------------------------------------------
 
-**Versão**: 1.1 · **Data**: 2026-07-12 · **Status**: ✅ Integrado ao
-setup_env.sh e validado em ambiente multi-domínio
+**Versão**: 1.2 · **Data**: 2026-08-03 · **Status**: estrutura ativa
+consolidada e integrada ao `setup_env.sh`

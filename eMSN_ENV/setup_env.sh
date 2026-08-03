@@ -31,13 +31,13 @@ ETCD_ENDPOINTS="${ETCD_PREFIX}.11:2379,${ETCD_PREFIX}.12:2379,${ETCD_PREFIX}.13:
 # Flow Predictor
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+MININET_SCRIPT="$SCRIPT_DIR/setup_mininet.py"
 
 # Captures & test toggle
-#RUN_TEST=false
 RUN_TEST="${RUN_TEST:-false}"               # set to "false" to skip quick test
-RUN_PREDICTOR="${RUN_PREDICTOR:-true}"      # set to "false" to skip quick prediction
+RUN_PREDICTOR="${RUN_PREDICTOR:-true}"      # set to "false" to skip FlowPredictor
 CAPTURE_SECONDS="${CAPTURE_SECONDS:-12}"   # basic capture duration
-OUTDIR="${OUTDIR:-./logs/run-$(date +%Y%m%d_%H%M%S)}"
+OUTDIR="${OUTDIR:-$PROJECT_ROOT/logs/run-$(date +%Y%m%d_%H%M%S)}"
 
 ########################################
 # Helpers (idempotent + clean handling)#
@@ -49,21 +49,6 @@ docker_rm_if() {
   if sudo docker ps -a --format '{{.Names}}' | grep -wq "$name"; then
     log "Removing container: $name"
     sudo docker rm -f "$name" >/dev/null 2>&1 || true
-  fi
-}
-
-net_rm_if() {
-  local net="$1"
-  if sudo docker network ls --format '{{.Name}}' | grep -wq "$net"; then
-    log "Removing network: $net"
-    # Disconnect all endpoints before removing
-    set +e
-    for cid in $(sudo docker network inspect "$net" -f '{{range .Containers}}{{.Name}}{{"\n"}}{{end}}'); do
-      [ -z "$cid" ] && continue
-      sudo docker network disconnect -f "$net" "$cid" >/dev/null 2>&1 || true
-    done
-    set -e
-    sudo docker network rm "$net" >/dev/null 2>&1 || true
   fi
 }
 
@@ -167,8 +152,8 @@ for ((i=0; i<c; i++)); do
     -e CONTROLLER_ID="${CTRL_IP}" \
     -e OFP_TCP_PORT="${CTRL_OF_PORT}" \
     -e WSGI_PORT="${CTRL_API_PORT}" \
-    -p "${CTRL_OF_PORT}:6633" \
-    -p "${CTRL_API_PORT}:8080" \
+    -p "${CTRL_OF_PORT}:${CTRL_OF_PORT}" \
+    -p "${CTRL_API_PORT}:${CTRL_API_PORT}" \
     "$RYU_IMG" >/dev/null
 
   # SimpleSwitch REST
@@ -176,7 +161,7 @@ for ((i=0; i<c; i++)); do
   sudo docker run -d --name "simple-switch-$i" --network "$NET" --ip "$SSW_IP" \
     -e RYU_BASE_URL="http://${CTRL_IP}:${CTRL_API_PORT}" \
     -e PORT="${SSW_HTTP_PORT}" \
-    -p "${SSW_HTTP_PORT}:9090" \
+    -p "${SSW_HTTP_PORT}:${SSW_HTTP_PORT}" \
     "$SSW_IMG" >/dev/null
 
   # FlowBlocker
@@ -187,16 +172,8 @@ for ((i=0; i<c; i++)); do
     -e ETCD_ENDPOINTS="${ETCD_ENDPOINTS}" \
     -e CONTROLLER_ID="${CTRL_IP}" \
     -e FB_PEER_ID="flow-blocker-$i" \
-    -p "${FB_HTTP_PORT}:7070" \
+    -p "${FB_HTTP_PORT}:${FB_HTTP_PORT}" \
     "$FB_IMG" >/dev/null
-  
-  # sudo docker run -d --name "flow-blocker-$i" --network "$NET" --ip "$FB_IP" \
-  #   -e RYU_BASE_URL="http://${CTRL_IP}:${CTRL_API_PORT}" \
-  #   -e PORT="${FB_HTTP_PORT}" \
-  #   -e ETCD_ENDPOINTS="${ETCD_ENDPOINTS}" \
-  #   -e CONTROLLER_ID="${CTRL_IP}" \
-  #   -p "${FB_HTTP_PORT}:7070" \
-  #   "$FB_IMG" >/dev/null
 
   # Connect FB to ETCD network for cluster access
   sudo docker network connect "$ETCD_NET" "flow-blocker-$i"
@@ -209,80 +186,13 @@ for ((i=0; i<c; i++)); do
 done
 
 #########################################
-# 3) Generate Mininet topology launcher #
+# 3) Validate Mininet topology launcher #
 #########################################
-cat > setup_mininet.py <<'EOPY'
-#!/usr/bin/python3
-from mininet.net import Mininet
-from mininet.node import RemoteController, OVSSwitch
-from mininet.cli import CLI
-from mininet.link import TCLink
-from mininet.log import setLogLevel, info
-
-# NOTE:
-# - Switch protocol pinned to OpenFlow10 to match ryu ofproto_v1_0
-# - Each domain i uses controller at 192.168.(10+i).10, port (6633+i)
-
-def customTopology(c, s):
-    net = Mininet(controller=RemoteController, link=TCLink, switch=OVSSwitch, build=False)
-
-    # Controllers
-    controllers = []
-    for i in range(c):
-        cid = 'c%d' % i
-        ip = '192.168.%d.10' % (10 + i)
-        port = 6633 + i
-        ctrl = RemoteController(cid, ip=ip, port=port)
-        net.addController(ctrl)
-        controllers.append(ctrl)
-
-    # Switches + hosts
-    switch_idx = 1
-    host_idx = 1
-    switches = []
-    for i in range(c):
-        for j in range(s):
-            sw = net.addSwitch('s%d' % switch_idx, protocols='OpenFlow10')
-            h1 = net.addHost('h%d' % host_idx); host_idx += 1
-            h2 = net.addHost('h%d' % host_idx); host_idx += 1
-            net.addLink(sw, h1)
-            net.addLink(sw, h2)
-            switches.append(sw)
-            switch_idx += 1
-
-    # Chain switches linearly (across all sets) for LLDP discovery
-    for k in range(len(switches) - 1):
-        net.addLink(switches[k], switches[k+1])
-
-    net.build()
-
-    # Start controllers
-    for ctrl in controllers:
-        ctrl.start()
-
-    # Assign switches to their domain controllers
-    idx = 0
-    for i in range(c):
-        for j in range(s):
-            switches[idx].start([controllers[i]])
-            idx += 1
-
-    # LLDP to controller for topology (mirror of your bash version)
-    for sw in switches:
-        sw.dpctl('add-flow', 'dl_type=0x88cc,actions=CONTROLLER')
-
-    CLI(net)
-    net.stop()
-
-if __name__ == '__main__':
-    setLogLevel('info')
-    import os
-    c = int(os.getenv('CSETS', '1'))
-    s = int(os.getenv('SPER', '1'))
-    customTopology(c, s)
-EOPY
-chmod +x setup_mininet.py
-log "Mininet setup script generated: ./setup_mininet.py"
+if [[ ! -f "$MININET_SCRIPT" ]]; then
+  log "Mininet setup script not found: $MININET_SCRIPT"
+  exit 1
+fi
+log "Mininet setup script: $MININET_SCRIPT"
 
 ############################################
 # 4) (Optional) quick policy + capture run #
@@ -313,7 +223,7 @@ if [[ "$RUN_TEST" == "true" ]]; then
 
   # Launch mininet non-interactively to establish links & IPs
   # We’ll open CLI for a moment to issue a ping and then background
-  sudo CSETS="$c" SPER="$s" ./setup_mininet.py <<'MINICMDS'
+  sudo CSETS="$c" SPER="$s" python3 "$MININET_SCRIPT" <<'MINICMDS'
 py net.hosts[0].cmd("ifconfig")  # touch
 MINICMDS
 
@@ -368,7 +278,7 @@ PY
   log "Basic captures written to: $OUTDIR"
 fi
 
-log "All done. To launch topology interactively: sudo CSETS=$c SPER=$s ./setup_mininet.py"
+log "All done. To launch topology interactively: sudo CSETS=$c SPER=$s python3 $MININET_SCRIPT"
 
 
 #########################################
@@ -379,9 +289,10 @@ if [[ "$RUN_PREDICTOR" == "true" ]]; then
 
     if ! sudo docker image inspect flow_predictor_cnsm >/dev/null 2>&1; then
         echo "[i] Building Flow Predictor image..."
-        sudo docker build -t flow_predictor_cnsm -f Dockerfile.flow_predictor .
+        sudo docker build -t flow_predictor_cnsm \
+          -f "$PROJECT_ROOT/Dockerfile.flow_predictor" "$PROJECT_ROOT"
     fi
 
     echo "[i] Deploying Flow Predictor..."
-    sudo "$PROJECT_ROOT/deploy_flow_predictor.sh" "$c" true
+    sudo bash "$PROJECT_ROOT/deploy_flow_predictor.sh" "$c" true
 fi

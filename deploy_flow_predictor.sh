@@ -11,12 +11,14 @@ set -euo pipefail
 #   FlowPredictor  192.168.(10+i).40   HTTP 6060+i   <── NOVO
 #
 # Uso:
-#   sudo ./deploy_flow_predictor.sh <num_dominios> [dry_run:true|false]
+#   sudo bash ./deploy_flow_predictor.sh <num_dominios> [dry_run:true|false]
 # Exemplo:
-#   sudo ./deploy_flow_predictor.sh 2 true      # 2 domínios, modo DRY_RUN (não bloqueia)
+#   sudo bash ./deploy_flow_predictor.sh 2 true # 2 domínios, modo DRY_RUN (não bloqueia)
 
 C=${1:-2}
 DRY_RUN=${2:-true}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HISTORY_ROOT="${PREDICTION_HISTORY_ROOT:-$SCRIPT_DIR}"
 
 SUBNET_BASE=10
 API_PORT_BASE=8080
@@ -31,7 +33,7 @@ log() { echo "[$(date +%H:%M:%S)] $*"; }
 # Build da imagem se ausente
 if ! sudo docker images --format '{{.Repository}}' | grep -qx "$PRED_IMG"; then
   log "Imagem $PRED_IMG não encontrada; construindo..."
-  sudo docker build -t "$PRED_IMG" -f Dockerfile.flow_predictor .
+  sudo docker build -t "$PRED_IMG" -f "$SCRIPT_DIR/Dockerfile.flow_predictor" "$SCRIPT_DIR"
 fi
 
 for ((i=0; i<C; i++)); do
@@ -58,7 +60,7 @@ for ((i=0; i<C; i++)); do
   fi
 
   # Diretório do host para o dataset de predição (1 CSV por fluxo)
-  HIST_DIR="$(pwd)/prediction_history_domain${i}"
+  HIST_DIR="$HISTORY_ROOT/prediction_history_domain${i}"
   mkdir -p "$HIST_DIR"
 
   log "Iniciando flow-predictor-$i em $PRED_IP:$PRED_HTTP_PORT (rede: $NET, dry_run=$DRY_RUN)"
@@ -109,7 +111,7 @@ for ((i=0; i<C; i++)); do
   echo "    Dataset:     curl http://127.0.0.1:$p/predictor/export/status | jq ."
 done
 log ""
-log "📊 CSVs do dataset (1 por fluxo) em: ./prediction_history_domain<i>/"
+log "📊 CSVs do dataset (1 por fluxo) em: $HISTORY_ROOT/prediction_history_domain<i>/"
 log ""
 log "⚠️  DRY_RUN=$DRY_RUN — para ativar mitigação real:"
 log "    curl -X POST http://127.0.0.1:6060/predictor/config -H 'Content-Type: application/json' -d '{\"dry_run\": false}'"

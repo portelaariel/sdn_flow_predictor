@@ -6,7 +6,6 @@ from ryu.lib.packet import packet, ethernet, arp, lldp, ipv4, tcp, udp
 from ryu.lib import hub
 from ryu.ofproto import ofproto_v1_0
 import os
-import time  # for ns timestamps if ever needed
 
 simpleswitch = os.getenv("SIMPLESWITCH_URL", "http://127.0.0.1:8090/packetin")
 

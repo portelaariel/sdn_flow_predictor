@@ -42,7 +42,6 @@ ENV (mesmo padrão dos demais serviços):
 import os
 import json
 import time
-import math
 import uuid
 import glob
 import atexit
@@ -454,21 +453,19 @@ class Collector:
             # ---- Fluxos IPv4 (visão fina src->dst; base da mitigação) ----
             fstats = self._get(f"/stats/flow/{dpid}") or {}
             flows = fstats.get(str(dpid), [])
-            ipv4_flow_keys = set()
             for f in flows:
                 m = f.get("match", {})
                 nw_src, nw_dst = m.get("nw_src"), m.get("nw_dst")
                 if not nw_src or not nw_dst:
                     continue
                 key = f"flow:{dpid}:{nw_src}->{nw_dst}"
-                ipv4_flow_keys.add(key)
                 meta = {"type": "flow", "dpid": dpid, "nw_src": nw_src, "nw_dst": nw_dst}
                 self.engine.ingest(key, meta, int(f.get("byte_count", 0)), ts)
 
             # ---- Heurística de surto de fluxos (indício de scan/DDoS) ----
-            self._check_flow_surge(dpid, len(flows), ts)
+            self._check_flow_surge(dpid, len(flows))
 
-    def _check_flow_surge(self, dpid: int, n_flows: int, ts: float):
+    def _check_flow_surge(self, dpid: int, n_flows: int):
         hist = self.flow_count_hist.setdefault(dpid, deque(maxlen=HISTORY_WINDOW))
         if len(hist) >= WARMUP_SAMPLES:
             baseline = sorted(hist)[len(hist) // 2]

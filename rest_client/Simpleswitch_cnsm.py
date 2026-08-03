@@ -56,8 +56,6 @@ api = Flask(__name__)
 
 # TODO import from ofp
 OFPP_FLOOD = 0xfffb
-OFP_DEFAULT_PRIORITY = 32768
-OFPFF_SEND_FLOW_REM = 1 << 0
 OFP_NO_BUFFER = 0xffffffff
 
 ETH_TYPE_IP = 0x0800   # 2048

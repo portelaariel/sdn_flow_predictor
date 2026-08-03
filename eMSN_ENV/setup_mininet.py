@@ -3,7 +3,7 @@ from mininet.net import Mininet
 from mininet.node import RemoteController, OVSSwitch
 from mininet.cli import CLI
 from mininet.link import TCLink
-from mininet.log import setLogLevel, info
+from mininet.log import setLogLevel
 
 # NOTE:
 # - Switch protocol pinned to OpenFlow10 to match ryu ofproto_v1_0
