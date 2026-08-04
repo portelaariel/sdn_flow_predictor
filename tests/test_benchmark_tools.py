@@ -175,6 +175,107 @@ class BenchmarkToolTests(unittest.TestCase):
             self.assertEqual(aggregate_metrics([summary])["f1"], 1.0)
             self.assertIn("collaborative-live", markdown_table([summary]))
 
+    def test_live_drop_may_interrupt_iperf_when_execution_and_loss_are_confirmed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "successful-live-disruption"
+            run_dir.mkdir()
+            (run_dir / "metadata.json").write_text(json.dumps({
+                "mode": "collaborative-live",
+                "scenario": "ddos",
+                "flow": "10.0.0.1->10.0.0.8",
+            }), encoding="utf-8")
+            (run_dir / "attack_start_ns.txt").write_text(
+                "1000000000\n", encoding="utf-8"
+            )
+            (run_dir / "workload_status.json").write_text(json.dumps({
+                "valid": True,
+                "expect_disruption": True,
+                "attack_disrupted": True,
+                "attack_exit_code": 1,
+                "attack_bps": None,
+            }), encoding="utf-8")
+            (run_dir / "ping_before.txt").write_text(
+                "3 packets transmitted, 3 received, 0% packet loss\n",
+                encoding="utf-8",
+            )
+            (run_dir / "ping_after.txt").write_text(
+                "5 packets transmitted, 0 received, 100% packet loss\n",
+                encoding="utf-8",
+            )
+            self.write_iperf(run_dir / "baseline.json", 1_000_000)
+            row = {
+                "sampled_ns": 2_100_000_000,
+                "status": {"cid": "domain-0"},
+                "anomalies": [{
+                    "anomaly_id": "attack",
+                    "kind": "THROUGHPUT_SPIKE",
+                    "ts_detect_ns": 1_500_000_000,
+                    "mitigation": {
+                        "attempted": True,
+                        "executed": True,
+                        "reason": "FlowBlocker HTTP 200",
+                    },
+                }],
+                "collaboration": {"decisions": [{
+                    "flow": "10.0.0.1->10.0.0.8",
+                    "decision": "MITIGATE",
+                    "score": 0.95,
+                    "confirming_domains": ["domain-0", "domain-1"],
+                    "claim": {
+                        "coordinator": "domain-0",
+                        "claimed_ns": 2_000_000_000,
+                        "won": True,
+                    },
+                    "mitigation": {
+                        "attempted": True,
+                        "executed": True,
+                        "reason": "FlowBlocker HTTP 200",
+                    },
+                }]},
+            }
+            (run_dir / "timeline.ndjson").write_text(
+                json.dumps(row) + "\n", encoding="utf-8"
+            )
+
+            summary = summarize_run(run_dir)
+
+            self.assertEqual(summary["classification"], "TP")
+            self.assertTrue(summary["attack_disrupted"])
+            self.assertTrue(summary["mitigation_executed"])
+            self.assertEqual(summary["ping_after_loss_percent"], 100.0)
+            self.assertEqual(summary["invalid_reasons"], [])
+
+            (run_dir / "ping_after.txt").write_text(
+                "5 packets transmitted, 5 received, 0% packet loss\n",
+                encoding="utf-8",
+            )
+            no_loss = summarize_run(run_dir)
+            self.assertEqual(no_loss["classification"], "INVALID")
+            self.assertIn(
+                "FlowBlocker confirmou execução, mas o ping não observou perda",
+                no_loss["invalid_reasons"],
+            )
+
+            (run_dir / "ping_after.txt").write_text(
+                "5 packets transmitted, 0 received, 100% packet loss\n",
+                encoding="utf-8",
+            )
+            row["anomalies"][0]["mitigation"]["executed"] = False
+            row["anomalies"][0]["mitigation"]["reason"] = "FlowBlocker HTTP 500"
+            row["collaboration"]["decisions"][0]["mitigation"]["executed"] = False
+            row["collaboration"]["decisions"][0]["mitigation"]["reason"] = (
+                "FlowBlocker HTTP 500"
+            )
+            (run_dir / "timeline.ndjson").write_text(
+                json.dumps(row) + "\n", encoding="utf-8"
+            )
+            unconfirmed = summarize_run(run_dir)
+            self.assertEqual(unconfirmed["classification"], "INVALID")
+            self.assertIn(
+                "iperf interrompido sem mitigação live confirmada",
+                unconfirmed["invalid_reasons"],
+            )
+
     def test_missing_traffic_is_invalid_instead_of_true_negative(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "failed-benign"

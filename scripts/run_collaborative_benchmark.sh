@@ -306,6 +306,10 @@ python3 "$PROJECT_ROOT/experiments/monitor_predictors.py" \
 MONITOR_PID=$!
 
 echo "[benchmark] executando topologia e tráfego"
+WORKLOAD_MODE_ARGS=()
+if [[ "$MODE" == "collaborative-live" ]]; then
+  WORKLOAD_MODE_ARGS+=(--expect-disruption)
+fi
 set +e
 sudo env CSETS="$CSETS" SPER="$SPER" \
   python3 "$PROJECT_ROOT/experiments/run_mininet_workload.py" \
@@ -321,6 +325,7 @@ sudo env CSETS="$CSETS" SPER="$SPER" \
   --baseline-duration-s "$BASELINE_DURATION_S" \
   --attack-duration-s "$ATTACK_DURATION_S" \
   --settle-s "$SETTLE_S" \
+  "${WORKLOAD_MODE_ARGS[@]}" \
   --output "$OUTDIR" \
   > "$OUTDIR/mininet.log" 2>&1
 WORKLOAD_EXIT=$?

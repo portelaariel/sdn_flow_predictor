@@ -197,6 +197,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="http://127.0.0.1:7070/flowblocker/domain_table",
     )
     parser.add_argument("--domain-table-timeout-s", type=float, default=15.0)
+    parser.add_argument(
+        "--expect-disruption",
+        action="store_true",
+        help="aceita interrupção do iperf de ataque; a mitigação será correlacionada no resumo",
+    )
     parser.add_argument("--output", type=Path, required=True)
     return parser
 
@@ -212,11 +217,13 @@ def main() -> int:
         "reason": None,
         "switches_connected": False,
         "domain_table_ready": False,
+        "expect_disruption": args.expect_disruption,
         "ping_before_loss_percent": None,
         "baseline_exit_code": None,
         "baseline_bps": None,
         "attack_exit_code": None,
         "attack_bps": None,
+        "attack_disrupted": False,
         "ping_after_loss_percent": None,
     }
     net = None
@@ -301,9 +308,15 @@ def main() -> int:
             status["attack_exit_code"] = attack_status
             status["attack_bps"] = attack_bps
             if attack_status != 0 or attack_bps is None:
-                raise WorkloadError(
-                    f"ataque iperf3 inválido (status={attack_status})"
-                )
+                if args.expect_disruption:
+                    # O DROP cobre também o canal TCP de controle do iperf3.
+                    # A correlação posterior só aceitará esta interrupção se o
+                    # FlowBlocker confirmar execução e o ping observar perda.
+                    status["attack_disrupted"] = True
+                else:
+                    raise WorkloadError(
+                        f"ataque iperf3 inválido (status={attack_status})"
+                    )
 
         time.sleep(args.settle_s)
         stdout, stderr, ping_status = run_host(

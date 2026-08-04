@@ -690,7 +690,12 @@ do baseline/ataque, sem os dois hosts na tabela de domínios ou com erro nas
 APIs é `INVALID` e faz o runner terminar com status diferente de zero. Em
 `collaborative-live`, uma decisão `MITIGATE` sem confirmação HTTP 200 do
 FlowBlocker também é inválida e conserva o motivo operacional no relatório.
-Assim, ausência de tráfego ou falha do DROP nunca é apresentada como sucesso.
+O DROP pode encerrar o canal de controle do próprio `iperf3` e fazê-lo retornar
+status 1 antes de produzir o JSON final. Nesse modo, o workload registra
+`attack_disrupted`, continua até o ping final e só aceita a interrupção como
+efeito esperado quando a linha do tempo também confirma a execução HTTP 200 e
+o ping observa perda. Assim, ausência de tráfego, interrupção espontânea ou
+falha do DROP nunca é apresentada como sucesso.
 
 Em cenários DDoS, spikes ou decisões de mitigação anteriores ao timestamp do
 ataque classificam o ensaio como `CONTAMINATED`. Anomalias e ações são

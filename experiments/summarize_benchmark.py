@@ -61,6 +61,8 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
     flow = metadata.get("flow", "")
     expected_attack = metadata.get("scenario") == "ddos"
     collaborative = str(metadata.get("mode", "")).startswith("collaborative-")
+    live_mode = metadata.get("mode") == "collaborative-live"
+    attack_disrupted = workload.get("attack_disrupted") is True
     attack_start_ns = read_timestamp(run_dir / "attack_start_ns.txt")
     detection_ns = None
     decisions = set()
@@ -188,17 +190,26 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
         invalid_reasons.append("ping final sem métrica")
     if baseline_bps is None:
         invalid_reasons.append("baseline sem vazão medida")
-    if expected_attack and attack_bps is None:
+    if (expected_attack and attack_bps is None
+            and not (live_mode and attack_disrupted and mitigation_executed)):
         invalid_reasons.append("ataque sem vazão medida")
     if expected_attack and attack_start_ns is None:
         invalid_reasons.append("início do ataque sem timestamp")
     if endpoint_errors:
         invalid_reasons.append(f"{endpoint_errors} erro(s) nas APIs dos preditores")
-    if (metadata.get("mode") == "collaborative-live"
-            and "MITIGATE" in decisions and not mitigation_executed):
+    if (live_mode and "MITIGATE" in decisions and not mitigation_executed):
         invalid_reasons.append(
             "mitigação live não executada"
             + (f": {mitigation_reason}" if mitigation_reason else "")
+        )
+    if live_mode and attack_disrupted and not mitigation_executed:
+        invalid_reasons.append(
+            "iperf interrompido sem mitigação live confirmada"
+        )
+    if (live_mode and mitigation_executed and ping_after_loss is not None
+            and ping_after_loss <= 0.0):
+        invalid_reasons.append(
+            "FlowBlocker confirmou execução, mas o ping não observou perda"
         )
     measurement_valid = not invalid_reasons
     contamination_reasons = []
@@ -247,6 +258,7 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
         "ping_after_loss_percent": ping_after_loss,
         "baseline_bps": baseline_bps,
         "attack_bps": attack_bps,
+        "attack_disrupted": attack_disrupted,
         "endpoint_errors": endpoint_errors,
         "expected_attack": expected_attack,
         "detected_attack": detected_attack,
