@@ -35,12 +35,27 @@ if [[ "$DRY_RUN" != "true" && "$DRY_RUN" != "false" ]]; then
   echo "dry_run must be true or false" >&2
   exit 2
 fi
-for value in "$PREDICTOR_OFFLINE_MODEL_REQUIRED" "$PREDICTOR_ONLINE_MODEL_ADAPTATION"; do
+for value in "$PREDICTOR_OFFLINE_MODEL_REQUIRED" "$PREDICTOR_ONLINE_MODEL_ADAPTATION" \
+  "$PREDICTOR_COLLABORATION_ENABLED"; do
   if [[ "$value" != "true" && "$value" != "false" ]]; then
-    echo "offline model boolean settings must be true or false" >&2
+    echo "predictor boolean settings must be true or false" >&2
     exit 2
   fi
 done
+
+COLLAB_EXPECTED_DOMAINS="${PREDICTOR_COLLAB_EXPECTED_DOMAINS:-$C}"
+for value in "$COLLAB_EXPECTED_DOMAINS" "$PREDICTOR_COLLAB_MIN_DOMAINS" \
+  "$PREDICTOR_COLLAB_PERSISTENCE_WINDOWS"; do
+  if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
+    echo "collaboration domain/persistence settings must be positive integers" >&2
+    exit 2
+  fi
+done
+if [[ "$PREDICTOR_COLLABORATION_ENABLED" == "true" ]] \
+  && (( PREDICTOR_COLLAB_MIN_DOMAINS > COLLAB_EXPECTED_DOMAINS )); then
+  echo "PREDICTOR_COLLAB_MIN_DOMAINS cannot exceed expected domains" >&2
+  exit 2
+fi
 
 MODEL_DOCKER_ARGS=(
   -e "OFFLINE_MODEL_REQUIRED=$PREDICTOR_OFFLINE_MODEL_REQUIRED"
@@ -108,6 +123,7 @@ for ((i=0; i<C; i++)); do
   log "Iniciando flow-predictor-$i em $PRED_IP:$PRED_HTTP_PORT (rede: $NET, dry_run=$DRY_RUN)"
   log "  Dataset em: $HIST_DIR"
   log "  Detecção: $MODEL_DESCRIPTION"
+  log "  Colaboração: $PREDICTOR_COLLABORATION_ENABLED (quórum=$PREDICTOR_COLLAB_MIN_DOMAINS/$COLLAB_EXPECTED_DOMAINS)"
   sudo docker run -d --name "flow-predictor-$i" --network "$NET" --ip "$PRED_IP" \
     -v "$HIST_DIR:/app/prediction_history" \
     "${MODEL_DOCKER_ARGS[@]}" \
@@ -130,6 +146,19 @@ for ((i=0; i<C; i++)); do
     -e MITIGATION_COOLDOWN_S="$PREDICTOR_COOLDOWN_S" \
     -e ANOMALY_EVENT_COOLDOWN_S="$PREDICTOR_EVENT_COOLDOWN_S" \
     -e WHITELIST_IPS="$PREDICTOR_WHITELIST_IPS" \
+    -e COLLABORATION_ENABLED="$PREDICTOR_COLLABORATION_ENABLED" \
+    -e COLLAB_EXPECTED_DOMAINS="$COLLAB_EXPECTED_DOMAINS" \
+    -e COLLAB_MIN_DOMAINS="$PREDICTOR_COLLAB_MIN_DOMAINS" \
+    -e COLLAB_WINDOW_S="$PREDICTOR_COLLAB_WINDOW_S" \
+    -e COLLAB_EVIDENCE_TTL_S="$PREDICTOR_COLLAB_EVIDENCE_TTL_S" \
+    -e COLLAB_CLAIM_TTL_S="$PREDICTOR_COLLAB_CLAIM_TTL_S" \
+    -e COLLAB_EVALUATION_INTERVAL_S="$PREDICTOR_COLLAB_EVALUATION_INTERVAL_S" \
+    -e COLLAB_PERSISTENCE_WINDOWS="$PREDICTOR_COLLAB_PERSISTENCE_WINDOWS" \
+    -e COLLAB_SUSPECT_THRESHOLD="$PREDICTOR_COLLAB_SUSPECT_THRESHOLD" \
+    -e COLLAB_ALERT_THRESHOLD="$PREDICTOR_COLLAB_ALERT_THRESHOLD" \
+    -e COLLAB_DECISION_THRESHOLD="$PREDICTOR_COLLAB_DECISION_THRESHOLD" \
+    -e COLLAB_RATE_RATIO_MAX="$PREDICTOR_COLLAB_RATE_RATIO_MAX" \
+    -e COLLAB_WEIGHTS_JSON="$PREDICTOR_COLLAB_WEIGHTS_JSON" \
     -p "$PRED_HTTP_PORT:$PRED_HTTP_PORT" \
     "$PRED_IMG"
 
@@ -155,6 +184,7 @@ for ((i=0; i<C; i++)); do
   echo "    Status:      curl http://127.0.0.1:$p/predictor/status | jq ."
   echo "    Predições:   curl http://127.0.0.1:$p/predictor/predictions | jq ."
   echo "    Anomalias:   curl http://127.0.0.1:$p/predictor/anomalies | jq ."
+  echo "    Colaboração: curl http://127.0.0.1:$p/predictor/collaboration | jq ."
   echo "    Dataset:     curl http://127.0.0.1:$p/predictor/export/status | jq ."
 done
 log ""

@@ -40,6 +40,7 @@ coordenação entre domínios.
 | Componente | Arquivo ativo | Construção/execução |
 | --- | --- | --- |
 | FlowPredictor | `flow_predictor_cnsm.py` | `Dockerfile.flow_predictor` |
+| Decisão colaborativa | `collaborative_decision.py` | critérios MCDA puros e reproduzíveis |
 | Contrato do modelo | `offline_model.py` | valida o artefato JSON no treino e no runtime |
 | Treinamento offline | `train_offline_model.py` | converte CSVs rotulados em um modelo versionável |
 | Preparação CIC-DDoS2019 | `prepare_cicddos2019.py` | agrega CSVs grandes em janelas temporais compactas |
@@ -165,7 +166,50 @@ somente a emissão do evento. O total agregado fica em
 `[METRICS][ANOMALY_SUPPRESS]` é emitido na primeira repetição e depois a
 cada dez, reduzindo também escrita repetitiva no ETCD.
 
-### 2.5 Mitigação autônoma - guard-rails antes de agir
+### 2.5 Decisão colaborativa multicritério (MCDA)
+
+Com `PREDICTOR_COLLABORATION_ENABLED=true`, uma detecção local deixa de
+ser uma ordem de bloqueio e passa a ser uma **evidência candidata**. Cada
+FlowPredictor publica no ETCD somente o resumo do fluxo anômalo
+`src->dst`; telemetria normal e séries completas não são replicadas. As
+evidências expiram automaticamente e as visões do mesmo tráfego em
+vários switches locais são agregadas pelo máximo, nunca somadas.
+
+Todos os domínios calculam a mesma soma ponderada, com critérios
+normalizados entre zero e um:
+
+| Critério | Peso padrão | Pergunta respondida |
+| --- | ---: | --- |
+| severidade | 0,25 | Quanto o z-score excedeu o limiar offline? |
+| corroboração | 0,25 | Quantos domínios independentes confirmaram? |
+| razão de vazão | 0,13 | Quanto o observado excedeu a previsão? |
+| persistência | 0,12 | O evento continuou por várias janelas? |
+| confiabilidade do modelo | 0,08 | Qual foi a precisão registrada no artefato? |
+| concordância | 0,07 | Os z-scores dos domínios são coerentes? |
+| atualidade | 0,05 | As evidências ainda são recentes? |
+| especificidade topológica | 0,05 | Existe um par de fluxo inequívoco? |
+
+Os estados padrão são `NORMAL` (< 0,40), `SUSPECT` (0,40–0,60),
+`CORROBORATED` (0,60–0,80) e `MITIGATE` (≥ 0,80). Mesmo acima de 0,80,
+a ação só é liberada se `COLLAB_MIN_DOMAINS` tiver confirmado; caso
+contrário o estado é `WAITING_QUORUM`. Artefatos com hashes diferentes
+produzem `MODEL_MISMATCH` e não podem formar consenso.
+
+As chaves efêmeras são
+`flowpredictor/evidence/<hash>/<janela>/<cid>`. Depois do consenso, uma
+transação atômica disputa
+`flowpredictor/mitigation-claim/<hash>`: um único domínio vence e chama o
+FlowBlocker; os demais registram qual foi o coordenador. Isso elimina as
+duas chamadas independentes observadas anteriormente sem centralizar o
+detector. Se a colaboração estiver desligada, o comportamento local
+anterior é preservado. Se ela for solicitada mas o ETCD estiver
+indisponível na inicialização, o status informa a degradação e a decisão
+local permanece ativa para não interromper instalações existentes. Uma
+queda do ETCD durante o consenso é tratada de forma conservadora: novas
+ações colaborativas aguardam a recuperação, em vez de cada domínio
+bloquear independentemente.
+
+### 2.6 Mitigação autônoma - guard-rails antes de agir
 
 A resposta automatizada só é segura se for **conservadora por
 construção**. O mitigador aplica cinco portões em sequência antes de
@@ -189,7 +233,7 @@ domínios, o FlowBlocker local instala o DROP no seu DPID e propaga ao
 peer via `/receive_flow`, o FlowPredictor não precisa conhecer a
 topologia inter-domínio.
 
-### 2.6 Ciclo de feedback
+### 2.7 Ciclo de feedback
 
 `POST /predictor/feedback` com
 `{"anomaly_id": "...", "verdict": "false_positive"}` ajusta somente o
@@ -216,6 +260,7 @@ precision/recall ao longo do experimento.
 | GET | `/predictor/predictions/<key>` | Detalhe de uma série: *forecast* multi-horizonte + histórico completo |
 | GET | `/predictor/anomalies?limit=N` | Anomalias recentes com resultado da mitigação |
 | GET | `/predictor/model` | Modo efetivo, parâmetros e proveniência do modelo offline |
+| GET | `/predictor/collaboration` | Configuração MCDA, evidências, claims e decisões explicadas |
 | GET | `/predictor/export/status` | Estado e contadores da exportação CSV |
 | POST | `/predictor/feedback` | `{"anomaly_id", "verdict"}` — refina *thresholds* |
 | POST | `/predictor/config` | Ajuste em tempo de execução: `auto_mitigate`, `dry_run`, `min_rate_bps`, `cooldown_s`, `event_cooldown_s` |
@@ -258,12 +303,14 @@ precision/recall ao longo do experimento.
 
 ## 4. ESCALABILIDADE E FLEXIBILIDADE
 
-**Horizontal (multi-domínio)**: um FlowPredictor por domínio, sem estado
-compartilhado obrigatório, o padrão exato do FlowBlocker. Cada
-instância monitora apenas os DPIDs do seu controlador; a visibilidade
-global é opcional via chave ETCD `flowpredictor/state/<cid>` (mesmo
-prefixo-pattern das domain tables). Escalar de 2 para 20 domínios é
-executar `sudo bash deploy_flow_predictor.sh 20`.
+**Horizontal (multi-domínio)**: um FlowPredictor por domínio. Cada
+instância monitora apenas os DPIDs do seu controlador. No modo local, o
+estado compartilhado continua opcional em
+`flowpredictor/state/<cid>`. No modo colaborativo, o ETCD combina
+evidências efêmeras e arbitra a ação, sem receber a telemetria completa.
+`deploy_flow_predictor.sh N` preenche automaticamente
+`COLLAB_EXPECTED_DOMAINS=N`; em uma implantação parcial, esse valor pode
+ser sobrescrito explicitamente.
 
 O emitter de cada `ryu-core-i` anuncia `flow-blocker-i` como endpoint do
 seu domínio. Como todos os FlowBlockers também participam da rede Docker
@@ -390,6 +437,8 @@ containers FlowPredictor:
 ``` bash
 PREDICTOR_OFFLINE_MODEL="$PWD/models/cic2019-drddos-udp-holt.json" \
 PREDICTOR_OFFLINE_MODEL_REQUIRED=true \
+PREDICTOR_COLLABORATION_ENABLED=true \
+PREDICTOR_COLLAB_MIN_DOMAINS=2 \
 PREDICTOR_DRY_RUN=true \
   bash deploy_flow_predictor.sh 2 true
 ```
@@ -405,6 +454,7 @@ Confirme o modo efetivo:
 ``` bash
 curl http://127.0.0.1:6060/predictor/model | jq .
 curl http://127.0.0.1:6060/predictor/status | jq '.model'
+curl http://127.0.0.1:6060/predictor/collaboration | jq .
 ```
 
 O resultado deve conter `"loaded": true` e `"mode": "offline"`.
@@ -448,8 +498,9 @@ mininet> h4 iperf3 -s -D
 mininet> h1 ping -c 6 10.0.0.4 -i 0.5         # inicializa o mesmo par src/dst
 mininet> h1 iperf3 -c 10.0.0.4 -u -b 100M -t 20  # SPIKE UDP súbito
 
-# 7. Observar detecção + dry-run da mitigação
+# 7. Observar detecção, consenso e dry-run da mitigação
 curl http://127.0.0.1:6060/predictor/anomalies | jq '.anomalies[0]'
+curl http://127.0.0.1:6060/predictor/collaboration | jq '.decisions[0]'
 docker logs flow-predictor-0 | grep "\[METRICS\]\[MITIGATION_DRYRUN\]"
 
 # 8. Armar mitigação real e repetir o passo 6

@@ -36,6 +36,14 @@ ENV (mesmo padrão dos demais serviços):
   OFFLINE_MODEL_REQUIRED false      # falha startup se o artefato não puder ser carregado
   ONLINE_MODEL_ADAPTATION false     # permite adaptar a calibração offline por série
 
+  # Consenso multi-domínio (opt-in; requer ETCD compartilhado):
+  COLLABORATION_ENABLED  false
+  COLLAB_EXPECTED_DOMAINS 2
+  COLLAB_MIN_DOMAINS     2
+  COLLAB_WINDOW_S        4
+  COLLAB_EVIDENCE_TTL_S  12
+  COLLAB_CLAIM_TTL_S     60
+
   # Persistência do histórico (dataset offline p/ LSTM/GRU, RMSE/MAE, gráficos):
   EXPORT_ENABLED        true|false (default true)
   EXPORT_DIR            prediction_history
@@ -49,6 +57,7 @@ import math
 import time
 import uuid
 import glob
+import hashlib
 import atexit
 import logging
 import threading
@@ -59,6 +68,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from flask import Flask, jsonify, request
 
+from collaborative_decision import (
+    canonical_flow_key,
+    clip01,
+    load_collaboration_weights,
+    score_collaborative_evidence,
+)
 from offline_model import (
     OfflineModel,
     inverse_transform_value,
@@ -88,8 +103,43 @@ OFFLINE_MODEL_PATH = os.environ.get("OFFLINE_MODEL_PATH", "").strip()
 OFFLINE_MODEL_REQUIRED = os.environ.get("OFFLINE_MODEL_REQUIRED", "false").lower() == "true"
 ONLINE_MODEL_ADAPTATION = os.environ.get("ONLINE_MODEL_ADAPTATION", "false").lower() == "true"
 
+# --- Fusão colaborativa multi-domínio (desativada por padrão) ---
+COLLABORATION_ENABLED = os.environ.get("COLLABORATION_ENABLED", "false").lower() == "true"
+COLLAB_WINDOW_S = float(os.environ.get("COLLAB_WINDOW_S", "4.0"))
+COLLAB_EVIDENCE_TTL_S = float(os.environ.get("COLLAB_EVIDENCE_TTL_S", "12.0"))
+COLLAB_CLAIM_TTL_S = float(os.environ.get("COLLAB_CLAIM_TTL_S", "60.0"))
+COLLAB_EVALUATION_INTERVAL_S = float(
+    os.environ.get("COLLAB_EVALUATION_INTERVAL_S", "0.5")
+)
+COLLAB_EXPECTED_DOMAINS = int(os.environ.get("COLLAB_EXPECTED_DOMAINS", "2"))
+COLLAB_MIN_DOMAINS = int(os.environ.get("COLLAB_MIN_DOMAINS", "2"))
+COLLAB_PERSISTENCE_WINDOWS = int(os.environ.get("COLLAB_PERSISTENCE_WINDOWS", "3"))
+COLLAB_SUSPECT_THRESHOLD = float(os.environ.get("COLLAB_SUSPECT_THRESHOLD", "0.40"))
+COLLAB_ALERT_THRESHOLD = float(os.environ.get("COLLAB_ALERT_THRESHOLD", "0.60"))
+COLLAB_DECISION_THRESHOLD = float(os.environ.get("COLLAB_DECISION_THRESHOLD", "0.80"))
+COLLAB_RATE_RATIO_MAX = float(os.environ.get("COLLAB_RATE_RATIO_MAX", "10.0"))
+
+COLLAB_WEIGHTS = load_collaboration_weights(os.environ.get("COLLAB_WEIGHTS_JSON", ""))
+
 if not math.isfinite(EVENT_COOLDOWN_S) or EVENT_COOLDOWN_S < 0.0:
     raise ValueError("ANOMALY_EVENT_COOLDOWN_S deve ser não negativo e finito")
+if (not math.isfinite(COLLAB_WINDOW_S) or COLLAB_WINDOW_S <= 0.0
+        or not math.isfinite(COLLAB_EVIDENCE_TTL_S)
+        or COLLAB_EVIDENCE_TTL_S < COLLAB_WINDOW_S
+        or not math.isfinite(COLLAB_CLAIM_TTL_S) or COLLAB_CLAIM_TTL_S <= 0.0
+        or not math.isfinite(COLLAB_EVALUATION_INTERVAL_S)
+        or COLLAB_EVALUATION_INTERVAL_S <= 0.0):
+    raise ValueError("janelas/TTLs colaborativos devem ser positivos e o TTL cobrir a janela")
+if (COLLAB_EXPECTED_DOMAINS < 1 or COLLAB_MIN_DOMAINS < 1
+        or COLLAB_PERSISTENCE_WINDOWS < 1
+        or (COLLABORATION_ENABLED
+            and COLLAB_MIN_DOMAINS > COLLAB_EXPECTED_DOMAINS)):
+    raise ValueError("quantidades de domínios/persistência colaborativas são inválidas")
+if not (0.0 <= COLLAB_SUSPECT_THRESHOLD <= COLLAB_ALERT_THRESHOLD
+        <= COLLAB_DECISION_THRESHOLD <= 1.0):
+    raise ValueError("thresholds MCDA devem ser ordenados dentro de [0, 1]")
+if not math.isfinite(COLLAB_RATE_RATIO_MAX) or COLLAB_RATE_RATIO_MAX <= 1.0:
+    raise ValueError("COLLAB_RATE_RATIO_MAX deve ser finito e maior que um")
 
 # --- Persistência do histórico de predição (aditivo; não afeta a lógica online) ---
 EXPORT_ENABLED     = os.environ.get("EXPORT_ENABLED", "true").lower() == "true"
@@ -169,6 +219,9 @@ if ETCD_ENDPOINTS:
 
         _h, _p = _parse_hp(ETCD_ENDPOINTS.split(",")[0])
         _etcd = etcd3.client(host=_h, port=_p, timeout=5)
+        # A construção do cliente é lazy; o status confirma que a colaboração
+        # não ficará ativa sobre um endpoint apenas configurado, porém inacessível.
+        _etcd.status()
         logger.info(f"ETCD client inicializado em {_h}:{_p}")
     except Exception as e:
         logger.error(f"Falha ao iniciar etcd3: {e}. Operando apenas em memória.")
@@ -716,6 +769,323 @@ class Mitigator:
         return result
 
 
+class CollaborativeDecisionManager:
+    """Publica evidências compactas e coordena uma decisão MCDA via ETCD.
+
+    O ETCD transporta somente candidatos anômalos, com TTL. A telemetria bruta
+    continua local. Uma transação por fluxo funciona como *claim* distribuído:
+    somente seu vencedor pode chamar o FlowBlocker.
+    """
+
+    def __init__(self, engine: Any):
+        self.engine = engine
+        self.lock = threading.RLock()
+        self.wake = threading.Event()
+        self.local_candidates: Dict[str, Dict[str, Any]] = {}
+        self.dirty_flows = set()
+        self.decisions: Dict[str, Dict[str, Any]] = {}
+        self.claims: Dict[str, Dict[str, Any]] = {}
+        self.mitigation_results: Dict[str, Dict[str, Any]] = {}
+        self.claim_leases: Dict[str, Any] = {}
+        self.last_logged_state: Dict[str, str] = {}
+        self.errors = 0
+        self.evidence_published = 0
+        self.claims_won = 0
+        self.claims_lost = 0
+        self.started_ns = now_ns()
+        self.thread = threading.Thread(
+            target=self._run,
+            name=f"collaborative-mcda-{CONTROLLER_ID}",
+            daemon=True,
+        )
+        self.thread.start()
+
+    def _model_identity(self) -> Tuple[str, float]:
+        model = self.engine.offline_model
+        if model is None:
+            return "adaptive", 0.5
+        model_id = (model.training.get("dataset_sha256")
+                    or f"{model.model_type}:{model.created_at}")
+        metrics = model.training.get("metrics", {})
+        try:
+            reliability = float(metrics.get("precision", 0.5))
+        except (AttributeError, TypeError, ValueError):
+            reliability = 0.5
+        return str(model_id), clip01(reliability)
+
+    @staticmethod
+    def _flow_hash(flow: str) -> str:
+        return hashlib.sha256(flow.encode("utf-8")).hexdigest()[:24]
+
+    def submit(self, anomaly: Dict[str, Any]) -> bool:
+        """Agrega DPIDs locais sem contar o mesmo pacote várias vezes."""
+        flow = canonical_flow_key(anomaly)
+        if flow is None:
+            return False
+        event_ts = int(anomaly["ts_detect_ns"])
+        window_ns = max(1, int(COLLAB_WINDOW_S * 1e9))
+        window_id = event_ts // window_ns
+        model_id, reliability = self._model_identity()
+        dpid = anomaly.get("meta", {}).get("dpid")
+
+        with self.lock:
+            previous = self.local_candidates.get(flow)
+            if previous is not None and window_id < previous["window_id"]:
+                return False
+            if previous is None or window_id > previous["window_id"]:
+                consecutive = (previous is not None
+                               and window_id == previous["window_id"] + 1)
+                persistence = (previous["evidence"]["persistence_windows"] + 1
+                               if consecutive else 1)
+                evidence = {
+                    "schema_version": 1,
+                    "cid": CONTROLLER_ID,
+                    "flow": flow,
+                    "src_ip": anomaly["meta"]["nw_src"],
+                    "dst_ip": anomaly["meta"]["nw_dst"],
+                    "window_id": window_id,
+                    "ts_ns": event_ts,
+                    "observed_bps": float(anomaly.get("observed_bps", 0.0)),
+                    "predicted_bps": float(anomaly.get("predicted_bps", 0.0)),
+                    "z_score": float(anomaly.get("z_score", 0.0)),
+                    "threshold": float(anomaly.get("threshold", Z_THRESHOLD)),
+                    "persistence_windows": persistence,
+                    "flow_specificity": 1.0,
+                    "dpids": ([] if dpid is None else [dpid]),
+                    "model_id": model_id,
+                    "model_reliability": reliability,
+                    "detection_mode": self.engine.detection_mode,
+                }
+                self.local_candidates[flow] = {
+                    "window_id": window_id,
+                    "evidence": evidence,
+                }
+            else:
+                evidence = previous["evidence"]
+                evidence["ts_ns"] = max(event_ts, int(evidence["ts_ns"]))
+                if dpid is not None and dpid not in evidence["dpids"]:
+                    evidence["dpids"].append(dpid)
+                    evidence["dpids"].sort()
+                # Mantém a visão local mais forte; não soma taxas observadas em
+                # switches diferentes, pois eles podem ver os mesmos pacotes.
+                if float(anomaly.get("z_score", 0.0)) > float(evidence["z_score"]):
+                    evidence["z_score"] = float(anomaly.get("z_score", 0.0))
+                    evidence["threshold"] = float(anomaly.get("threshold", Z_THRESHOLD))
+                    evidence["observed_bps"] = float(anomaly.get("observed_bps", 0.0))
+                    evidence["predicted_bps"] = float(anomaly.get("predicted_bps", 0.0))
+            self.dirty_flows.add(flow)
+        self.wake.set()
+        return True
+
+    def _run(self):
+        while True:
+            self.wake.wait(COLLAB_EVALUATION_INTERVAL_S)
+            self.wake.clear()
+            try:
+                self._flush_evidence()
+                self._evaluate_candidates()
+            except Exception as exc:  # thread deve sobreviver a falhas transitórias
+                self.errors += 1
+                logger.error("Falha no coordenador colaborativo: %s", exc)
+
+    def _flush_evidence(self):
+        with self.lock:
+            flows = list(self.dirty_flows)
+            self.dirty_flows.clear()
+            rows = []
+            for flow in flows:
+                if flow not in self.local_candidates:
+                    continue
+                evidence = dict(self.local_candidates[flow]["evidence"])
+                evidence["dpids"] = list(evidence["dpids"])
+                rows.append((flow, evidence))
+        for index, (flow, evidence) in enumerate(rows):
+            try:
+                lease = _etcd.lease(max(1, int(math.ceil(COLLAB_EVIDENCE_TTL_S))))
+                key = (f"flowpredictor/evidence/{self._flow_hash(flow)}/"
+                       f"{evidence['window_id']}/{CONTROLLER_ID}")
+                _etcd.put(key, json.dumps(evidence, sort_keys=True), lease=lease)
+                self.evidence_published += 1
+                _metric("COLLAB_EVIDENCE", f"cid={CONTROLLER_ID} flow={flow} "
+                                             f"window={evidence['window_id']} "
+                                             f"z={evidence['z_score']:.2f}")
+            except Exception:
+                with self.lock:
+                    self.dirty_flows.update(row[0] for row in rows[index:])
+                raise
+
+    def _read_evidence(self, flow: str) -> List[Dict[str, Any]]:
+        prefix = f"flowpredictor/evidence/{self._flow_hash(flow)}/"
+        rows = []
+        for raw, _metadata in _etcd.get_prefix(prefix):
+            try:
+                item = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+                if item.get("flow") == flow:
+                    rows.append(item)
+            except (AttributeError, TypeError, ValueError):
+                logger.warning("Evidência colaborativa inválida sob %s", prefix)
+        return rows
+
+    def _evaluate_candidates(self):
+        cutoff_ns = now_ns() - int(COLLAB_EVIDENCE_TTL_S * 1e9)
+        with self.lock:
+            stale = [flow for flow, row in self.local_candidates.items()
+                     if int(row["evidence"]["ts_ns"]) < cutoff_ns]
+            for flow in stale:
+                self.local_candidates.pop(flow, None)
+                self.dirty_flows.discard(flow)
+            flows = list(self.local_candidates)
+
+        for flow in flows:
+            evaluated_ns = now_ns()
+            decision = score_collaborative_evidence(
+                self._read_evidence(flow),
+                now_ns_value=evaluated_ns,
+                expected_domains=COLLAB_EXPECTED_DOMAINS,
+                min_domains=COLLAB_MIN_DOMAINS,
+                weights=COLLAB_WEIGHTS,
+                freshness_s=COLLAB_EVIDENCE_TTL_S,
+                persistence_windows=COLLAB_PERSISTENCE_WINDOWS,
+                rate_ratio_max=COLLAB_RATE_RATIO_MAX,
+                suspect_threshold=COLLAB_SUSPECT_THRESHOLD,
+                alert_threshold=COLLAB_ALERT_THRESHOLD,
+                decision_threshold=COLLAB_DECISION_THRESHOLD,
+            )
+            decision.update({"flow": flow, "evaluated_ns": evaluated_ns})
+            if decision["decision"] == "MITIGATE":
+                claim = self._claim_mitigation(flow, decision)
+                decision["claim"] = claim
+                if claim.get("won"):
+                    previous_action = self.mitigation_results.get(flow)
+                    if (previous_action is None
+                            or previous_action.get("claimed_ns") != claim.get("claimed_ns")):
+                        result = self.engine.mitigate_collaborative(flow, decision)
+                        previous_action = {
+                            "claimed_ns": claim.get("claimed_ns"),
+                            "result": result,
+                        }
+                        self.mitigation_results[flow] = previous_action
+                    decision["mitigation"] = previous_action["result"]
+                else:
+                    decision["mitigation"] = {
+                        "attempted": False,
+                        "executed": False,
+                        "reason": ("decisão executada pelo coordenador "
+                                   f"{claim.get('coordinator', 'desconhecido')}"),
+                    }
+
+            with self.lock:
+                previous_state = self.last_logged_state.get(flow)
+                self.decisions[flow] = decision
+                if previous_state != decision["decision"]:
+                    self.last_logged_state[flow] = decision["decision"]
+                    _metric("COLLAB_DECISION", f"flow={flow} decision={decision['decision']} "
+                                                f"score={decision['score']:.3f} "
+                                                f"domains={decision['confirming_domains']}")
+            self.engine.apply_collaborative_decision(flow, decision)
+
+    def _claim_mitigation(self, flow: str, decision: Dict[str, Any]) -> Dict[str, Any]:
+        current = self.claims.get(flow)
+        current_ns = now_ns()
+        if current is not None and current_ns < int(current.get("expires_ns", 0)):
+            return dict(current)
+
+        key = f"flowpredictor/mitigation-claim/{self._flow_hash(flow)}"
+        ttl = max(1, int(math.ceil(COLLAB_CLAIM_TTL_S)))
+        payload = {
+            "flow": flow,
+            "coordinator": CONTROLLER_ID,
+            "claimed_ns": current_ns,
+            "score": decision["score"],
+            "confirming_domains": decision["confirming_domains"],
+        }
+        try:
+            lease = _etcd.lease(ttl)
+            won, _responses = _etcd.transaction(
+                compare=[_etcd.transactions.version(key) == 0],
+                success=[_etcd.transactions.put(
+                    key, json.dumps(payload, sort_keys=True), lease.id
+                )],
+                failure=[],
+            )
+            if won:
+                self.claim_leases[flow] = lease
+                claim = {
+                    "won": True,
+                    "coordinator": CONTROLLER_ID,
+                    "claimed_ns": current_ns,
+                    "key": key,
+                    "expires_ns": current_ns + ttl * 1_000_000_000,
+                    "degraded": False,
+                }
+                self.claims_won += 1
+            else:
+                raw, _metadata = _etcd.get(key)
+                owner = json.loads(raw.decode("utf-8")) if raw else {}
+                claimed_ns = int(owner.get("claimed_ns", current_ns))
+                claim = {
+                    "won": False,
+                    "coordinator": owner.get("coordinator", "unknown"),
+                    "claimed_ns": claimed_ns,
+                    "key": key,
+                    "expires_ns": claimed_ns + ttl * 1_000_000_000,
+                    "degraded": False,
+                }
+                self.claims_lost += 1
+        except Exception as exc:
+            # Se a transação falhar mas a leitura das evidências funcionou, uma
+            # eleição determinística preserva o modo degradado sem ação dupla.
+            coordinator = min(decision["confirming_domains"])
+            claim = {
+                "won": coordinator == CONTROLLER_ID,
+                "coordinator": coordinator,
+                "claimed_ns": current_ns,
+                "key": key,
+                "expires_ns": current_ns + ttl * 1_000_000_000,
+                "degraded": True,
+                "error": str(exc),
+            }
+            logger.error("Claim ETCD falhou para %s; coordenador determinístico=%s: %s",
+                         flow, coordinator, exc)
+
+        self.claims[flow] = claim
+        _metric("COLLAB_CLAIM", f"flow={flow} coordinator={claim['coordinator']} "
+                                 f"won={claim['won']} degraded={claim['degraded']}")
+        return dict(claim)
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self.lock:
+            decisions = sorted(
+                self.decisions.values(),
+                key=lambda row: int(row.get("evaluated_ns", 0)),
+                reverse=True,
+            )[:50]
+            return {
+                "requested": COLLABORATION_ENABLED,
+                "active": True,
+                "cid": CONTROLLER_ID,
+                "uptime_s": round((now_ns() - self.started_ns) / 1e9, 1),
+                "local_candidates": len(self.local_candidates),
+                "evidence_published": self.evidence_published,
+                "claims_won": self.claims_won,
+                "claims_lost": self.claims_lost,
+                "errors": self.errors,
+                "config": {
+                    "expected_domains": COLLAB_EXPECTED_DOMAINS,
+                    "min_domains": COLLAB_MIN_DOMAINS,
+                    "window_s": COLLAB_WINDOW_S,
+                    "evidence_ttl_s": COLLAB_EVIDENCE_TTL_S,
+                    "claim_ttl_s": COLLAB_CLAIM_TTL_S,
+                    "persistence_windows": COLLAB_PERSISTENCE_WINDOWS,
+                    "suspect_threshold": COLLAB_SUSPECT_THRESHOLD,
+                    "alert_threshold": COLLAB_ALERT_THRESHOLD,
+                    "decision_threshold": COLLAB_DECISION_THRESHOLD,
+                    "weights": COLLAB_WEIGHTS,
+                },
+                "decisions": decisions,
+            }
+
+
 # =====================================================================
 # 6) MOTOR — orquestra séries, anomalias, mitigação, feedback e ETCD
 # =====================================================================
@@ -731,6 +1101,10 @@ class PredictorEngine:
         self.active_anomaly_events: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self.anomalies_suppressed = 0
         self.started_ns = now_ns()
+        self.collaboration = (CollaborativeDecisionManager(self)
+                              if COLLABORATION_ENABLED and _etcd is not None else None)
+        if COLLABORATION_ENABLED and self.collaboration is None:
+            logger.error("Colaboração solicitada sem ETCD; mantendo decisão local como fallback")
 
     # ---- ingestão (chamada pelo Collector) ----
     def ingest(self, key: str, meta: Dict[str, Any], byte_count: int, ts: float):
@@ -751,6 +1125,10 @@ class PredictorEngine:
         evento, o log e a mitigação são deduplicados, evitando uma tempestade de
         alertas durante um ataque sustentado.
         """
+        collaborative_candidate = (
+            mitigable and self.collaboration is not None
+            and canonical_flow_key(anomaly) is not None
+        )
         event_key = (str(anomaly["kind"]), str(anomaly["key"]))
         event_ts = int(anomaly["ts_detect_ns"])
         with self.lock:
@@ -800,6 +1178,8 @@ class PredictorEngine:
                 previous = None
 
         if previous is not None:
+            if collaborative_candidate:
+                self.collaboration.submit(anomaly)
             # Confirma a primeira agregação e depois em lotes de dez; o contador
             # e o evento da API são atualizados em toda amostra sem poluir logs/ETCD.
             if suppressed_count == 1 or suppressed_count % 10 == 0:
@@ -811,12 +1191,67 @@ class PredictorEngine:
 
         _metric("ANOMALY_DETECT", f"id={anomaly['anomaly_id']} kind={anomaly['kind']} "
                                   f"key={anomaly['key']} ts_ns={anomaly['ts_detect_ns']}")
-        anomaly["mitigation"] = (self.mitigator.maybe_mitigate(anomaly)
-                                 if mitigable else {"attempted": False, "reason": "não mitigável"})
+        if collaborative_candidate:
+            anomaly["mitigation"] = {
+                "attempted": False,
+                "executed": False,
+                "reason": "aguardando decisão colaborativa",
+            }
+        else:
+            anomaly["mitigation"] = (
+                self.mitigator.maybe_mitigate(anomaly)
+                if mitigable else {"attempted": False, "reason": "não mitigável"}
+            )
         with self.lock:
             self.anomalies.appendleft(anomaly)
+        if collaborative_candidate:
+            self.collaboration.submit(anomaly)
         self._publish_etcd()
         return True
+
+    def mitigate_collaborative(self, flow: str,
+                               decision: Dict[str, Any]) -> Dict[str, Any]:
+        """Executa a ação somente depois de este domínio vencer o claim global."""
+        with self.lock:
+            target = next((item for item in self.anomalies
+                           if canonical_flow_key(item) == flow), None)
+        if target is None:
+            return {
+                "attempted": False,
+                "executed": False,
+                "reason": "evento local não encontrado para o fluxo colaborativo",
+            }
+        result = self.mitigator.maybe_mitigate(target)
+        with self.lock:
+            for item in self.anomalies:
+                if canonical_flow_key(item) == flow:
+                    item["mitigation"] = result
+        _metric("COLLAB_MITIGATION", f"flow={flow} score={decision['score']:.3f} "
+                                      f"attempted={result.get('attempted')} "
+                                      f"executed={result.get('executed')}")
+        return result
+
+    def apply_collaborative_decision(self, flow: str,
+                                     decision: Dict[str, Any]) -> None:
+        """Anexa a justificativa MCDA aos eventos locais correspondentes."""
+        with self.lock:
+            for item in self.anomalies:
+                if canonical_flow_key(item) == flow:
+                    item["collaboration"] = decision
+                    if "mitigation" in decision:
+                        item["mitigation"] = decision["mitigation"]
+
+    def collaboration_snapshot(self) -> Dict[str, Any]:
+        if self.collaboration is not None:
+            return self.collaboration.snapshot()
+        return {
+            "requested": COLLABORATION_ENABLED,
+            "active": False,
+            "reason": ("desativada por configuração" if not COLLABORATION_ENABLED
+                       else "ETCD indisponível; decisão local ativa"),
+            "cid": CONTROLLER_ID,
+            "decisions": [],
+        }
 
     # ---- feedback loop: ajusta a sensibilidade da série afetada ----
     def apply_feedback(self, anomaly_id: str, verdict: str) -> Dict[str, Any]:
@@ -885,6 +1320,10 @@ class PredictorEngine:
                 "recent_anomalies": list(self.anomalies)[:20],
                 "anomalies_suppressed": self.anomalies_suppressed,
                 "feedback_stats": self.feedback_stats,
+                "collaboration": {
+                    "requested": COLLABORATION_ENABLED,
+                    "active": self.collaboration is not None,
+                },
             }
             _etcd.put(f"flowpredictor/state/{CONTROLLER_ID}", json.dumps(state, default=str))
             _metric("ETCD_WRITE", f"cid={CONTROLLER_ID} key=flowpredictor/state/{CONTROLLER_ID} "
@@ -908,6 +1347,7 @@ def index():
 
 @app.route("/predictor/status", methods=["GET"])
 def status():
+    collaboration = engine.collaboration_snapshot()
     with engine.lock:
         return jsonify({
             "cid": CONTROLLER_ID,
@@ -917,6 +1357,15 @@ def status():
             "anomalies_suppressed": engine.anomalies_suppressed,
             "feedback_stats": engine.feedback_stats,
             "model": model_status_payload(),
+            "collaboration": {
+                "requested": collaboration["requested"],
+                "active": collaboration["active"],
+                "reason": collaboration.get("reason"),
+                "local_candidates": collaboration.get("local_candidates", 0),
+                "claims_won": collaboration.get("claims_won", 0),
+                "claims_lost": collaboration.get("claims_lost", 0),
+                "errors": collaboration.get("errors", 0),
+            },
             "config": {
                 "poll_interval_s": POLL_INTERVAL_S,
                 "z_threshold_default": Z_THRESHOLD,
@@ -931,6 +1380,8 @@ def status():
                 "online_model_adaptation": ONLINE_MODEL_ADAPTATION,
                 "whitelist": sorted(WHITELIST_IPS),
                 "etcd_enabled": _etcd is not None,
+                "collaboration_enabled": COLLABORATION_ENABLED,
+                "collaboration_active": engine.collaboration is not None,
             },
         }), 200
 
@@ -982,6 +1433,12 @@ def anomalies():
     with engine.lock:
         return jsonify({"cid": CONTROLLER_ID,
                         "anomalies": list(engine.anomalies)[:limit]}), 200
+
+
+@app.route("/predictor/collaboration", methods=["GET"])
+def collaboration_status():
+    """Estado, critérios e decisões recentes do consenso multi-domínio."""
+    return jsonify(engine.collaboration_snapshot()), 200
 
 
 @app.route("/predictor/export/status", methods=["GET"])
@@ -1042,6 +1499,7 @@ def update_config():
 if __name__ == "__main__":
     logger.info(f"FlowPredictor iniciando (cid={CONTROLLER_ID}, Ryu={RYU_BASE_URL}, "
                 f"FlowBlocker={FLOWBLOCKER_URL}, detection_mode={engine.detection_mode}, "
-                f"auto_mitigate={AUTO_MITIGATE}, dry_run={DRY_RUN})")
+                f"auto_mitigate={AUTO_MITIGATE}, dry_run={DRY_RUN}, "
+                f"collaboration_active={engine.collaboration is not None})")
     collector.start()
     app.run(host="0.0.0.0", port=PORT, debug=False)

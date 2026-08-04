@@ -25,6 +25,7 @@ required_files=(
   config/runtime.env
   Dockerfile.flow_predictor
   flow_predictor_cnsm.py
+  collaborative_decision.py
   offline_model.py
   train_offline_model.py
   prepare_cicddos2019.py
@@ -50,6 +51,9 @@ source config/runtime.env
 [[ "$PREDICTOR_OFFLINE_MODEL_REQUIRED" == "false" ]]
 [[ "$PREDICTOR_ONLINE_MODEL_ADAPTATION" == "false" ]]
 [[ "$PREDICTOR_EVENT_COOLDOWN_S" == "60" ]]
+[[ "$PREDICTOR_COLLABORATION_ENABLED" == "false" ]]
+[[ -z "$PREDICTOR_COLLAB_EXPECTED_DOMAINS" ]]
+[[ "$PREDICTOR_COLLAB_MIN_DOMAINS" == "2" ]]
 
 override_config="$(ETCD_SUBNET=250 ETCD_NODES=2 bash -c '
   source config/runtime.env
@@ -69,6 +73,8 @@ expect_invalid_input() {
 
 expect_invalid_input bash deploy_flow_predictor.sh 0 true
 expect_invalid_input bash deploy_flow_predictor.sh 2 invalid
+expect_invalid_input env PREDICTOR_COLLABORATION_ENABLED=true \
+  PREDICTOR_COLLAB_MIN_DOMAINS=3 bash deploy_flow_predictor.sh 2 true
 expect_invalid_input bash eMSN_ENV/setup_env.sh 0 2
 echo "input_validation: ok"
 
