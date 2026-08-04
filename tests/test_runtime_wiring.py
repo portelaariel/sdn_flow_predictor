@@ -1,3 +1,5 @@
+import ast
+import types
 import unittest
 from pathlib import Path
 
@@ -11,6 +13,15 @@ class RuntimeWiringTests(unittest.TestCase):
         cls.setup_script = (ROOT / "eMSN_ENV/setup_env.sh").read_text(
             encoding="utf-8"
         )
+        cls.emitter_source = (ROOT / "ryu_apps/emitter_cnsm.py").read_text(
+            encoding="utf-8"
+        )
+        cls.benchmark_source = (
+            ROOT / "scripts/run_collaborative_benchmark.sh"
+        ).read_text(encoding="utf-8")
+        cls.workload_source = (
+            ROOT / "experiments/run_mininet_workload.py"
+        ).read_text(encoding="utf-8")
 
     def _block(self, start_marker, end_marker):
         start = self.setup_script.index(start_marker)
@@ -36,6 +47,51 @@ class RuntimeWiringTests(unittest.TestCase):
         first_docker_run = cluster_block.index("sudo docker run")
 
         self.assertLess(removal_loop_end, first_docker_run)
+
+    def test_emitter_learns_arp_requests_and_replies(self):
+        tree = ast.parse(self.emitter_source)
+        function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_arp_source"
+        )
+
+        class FakeArp:
+            def __init__(self, opcode):
+                self.opcode = opcode
+                self.src_ip = "10.0.0.8"
+
+        class FakePacket:
+            def __init__(self, opcode):
+                self.value = FakeArp(opcode)
+
+            def get_protocol(self, _protocol):
+                return self.value
+
+        namespace = {"arp": types.SimpleNamespace(arp=FakeArp)}
+        exec(compile(ast.Module(body=[function], type_ignores=[]),
+                     "emitter_cnsm.py", "exec"), namespace)
+        eth = types.SimpleNamespace(src="00:00:00:00:00:08")
+
+        self.assertEqual(
+            namespace["_arp_source"](eth, FakePacket(1)),
+            ("00:00:00:00:00:08", "10.0.0.8"),
+        )
+        self.assertEqual(
+            namespace["_arp_source"](eth, FakePacket(2)),
+            ("00:00:00:00:00:08", "10.0.0.8"),
+        )
+
+    def test_benchmark_builds_emitter_before_bootstrap_and_checks_hosts(self):
+        build_ryu = self.benchmark_source.index(
+            'sudo docker build -t "$RYU_IMG"'
+        )
+        bootstrap = self.benchmark_source.index(
+            'bash "$PROJECT_ROOT/eMSN_ENV/setup_env.sh"'
+        )
+        self.assertLess(build_ryu, bootstrap)
+        self.assertIn("--domain-table-url", self.benchmark_source)
+        self.assertIn("ping_reverse_discovery.txt", self.workload_source)
+        self.assertIn("wait_for_domain_hosts(", self.workload_source)
 
 
 if __name__ == "__main__":

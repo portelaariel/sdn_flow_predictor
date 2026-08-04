@@ -177,6 +177,18 @@ echo "[benchmark] modo=$MODE cenário=$SCENARIO fluxo=$FLOW saída=$OUTDIR"
 echo "[benchmark] limpando topologia Mininet anterior"
 sudo mn -c >/dev/null 2>&1 || true
 
+if [[ "$BUILD_IMAGE" == "true" ]]; then
+  echo "[benchmark] construindo imagens a partir do commit atual"
+  sudo docker build -t "$PRED_IMG" -f "$PROJECT_ROOT/Dockerfile.flow_predictor" "$PROJECT_ROOT"
+  if [[ "$BOOTSTRAP_ENV" == "true" ]]; then
+    sudo docker build -t "$RYU_IMG" "$PROJECT_ROOT/ryu_apps"
+    sudo docker build -t "$SSW_IMG" "$PROJECT_ROOT/rest_client"
+    sudo docker build -t "$FB_IMG" "$PROJECT_ROOT/flow_blocker"
+  else
+    echo "[benchmark] ambiente reutilizado: imagens de Ryu/Switch/FlowBlocker não afetam containers já ativos"
+  fi
+fi
+
 if [[ "$BOOTSTRAP_ENV" == "true" ]]; then
   echo "[benchmark] reiniciando ambiente SDN para isolar a execução"
   RUN_TEST=false RUN_PREDICTOR=false \
@@ -224,11 +236,6 @@ for ((i=0; i<CSETS; i++)); do
     exit 1
   }
 done
-
-if [[ "$BUILD_IMAGE" == "true" ]]; then
-  echo "[benchmark] construindo $PRED_IMG a partir do commit atual"
-  sudo docker build -t "$PRED_IMG" -f "$PROJECT_ROOT/Dockerfile.flow_predictor" "$PROJECT_ROOT"
-fi
 
 echo "[benchmark] implantando preditores (collaboration=$COLLABORATION dry_run=$DRY_RUN)"
 PREDICTOR_OFFLINE_MODEL="$MODEL_PATH" \
@@ -307,6 +314,7 @@ sudo env CSETS="$CSETS" SPER="$SPER" \
   --source-host "$SOURCE_HOST" \
   --destination-host "$DESTINATION_HOST" \
   --destination-ip "$DESTINATION_IP" \
+  --domain-table-url "http://127.0.0.1:${FB_HTTP_PORT_BASE}/flowblocker/domain_table" \
   --scenario "$SCENARIO" \
   --baseline-rate "$BASELINE_RATE" \
   --attack-rate "$ATTACK_RATE" \

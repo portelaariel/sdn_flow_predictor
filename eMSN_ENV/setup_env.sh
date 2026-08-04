@@ -164,6 +164,7 @@ for ((i=0; i<c; i++)); do
     -e FLOWBLOCKER_URL="http://${FB_IP}:${FB_HTTP_PORT}/flowblocker/domain_table" \
     -e FB_PEER_ID="flow-blocker-$i" \
     -e CONTROLLER_ID="${CTRL_IP}" \
+    -e LLDP_INTERVAL_S="2.0" \
     -e OFP_TCP_PORT="${CTRL_OF_PORT}" \
     -e WSGI_PORT="${CTRL_API_PORT}" \
     -p "${CTRL_OF_PORT}:${CTRL_OF_PORT}" \

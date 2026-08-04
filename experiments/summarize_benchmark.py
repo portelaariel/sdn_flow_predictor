@@ -109,6 +109,8 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
                 if in_attack or not expected_attack:
                     action_domains.add(str(cid))
                     mitigation_attempted = True
+                    if mitigation.get("reason"):
+                        mitigation_reason = mitigation.get("reason")
                 else:
                     baseline_action_domains.add(str(cid))
             if mitigation.get("executed"):
@@ -152,6 +154,8 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
             if mitigation.get("attempted"):
                 mitigation_attempted = True
                 action_domains.add(str(cid))
+                if mitigation.get("reason"):
+                    mitigation_reason = mitigation.get("reason")
             if mitigation.get("executed"):
                 mitigation_executed = True
                 mitigation_reason = mitigation.get("reason")
@@ -190,6 +194,12 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
         invalid_reasons.append("início do ataque sem timestamp")
     if endpoint_errors:
         invalid_reasons.append(f"{endpoint_errors} erro(s) nas APIs dos preditores")
+    if (metadata.get("mode") == "collaborative-live"
+            and "MITIGATE" in decisions and not mitigation_executed):
+        invalid_reasons.append(
+            "mitigação live não executada"
+            + (f": {mitigation_reason}" if mitigation_reason else "")
+        )
     measurement_valid = not invalid_reasons
     contamination_reasons = []
     if expected_attack and baseline_spikes:

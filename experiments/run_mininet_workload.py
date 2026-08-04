@@ -7,6 +7,8 @@ import re
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -14,9 +16,6 @@ from typing import Any, Dict, Optional, Tuple
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
-from eMSN_ENV.setup_mininet import build_network  # noqa: E402
-
 
 LOSS_PATTERN = re.compile(r"([0-9]+(?:\.[0-9]+)?)% packet loss")
 
@@ -79,6 +78,68 @@ def wait_for_data_plane(source: Any, destination_ip: str, output: Path,
     )
 
 
+def wait_for_domain_hosts(url: str, source_ip: str, destination_ip: str,
+                          source_dpid: int, destination_dpid: int,
+                          output: Path, timeout_s: float) -> None:
+    """Wait until mitigation has a complete cross-domain host mapping."""
+    deadline = time.monotonic() + timeout_s
+    last_payload: Dict[str, Any] = {}
+    last_error: Optional[str] = None
+    while time.monotonic() < deadline:
+        try:
+            request = urllib.request.Request(
+                url, headers={"Accept": "application/json"}
+            )
+            with urllib.request.urlopen(request, timeout=2.0) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if isinstance(payload, dict):
+                last_payload = payload
+                if domain_table_has_hosts(
+                    payload,
+                    source_ip,
+                    destination_ip,
+                    source_dpid,
+                    destination_dpid,
+                ):
+                    write_text(
+                        output,
+                        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                    )
+                    return
+        except (OSError, ValueError, urllib.error.URLError) as exc:
+            last_error = str(exc)
+        time.sleep(0.5)
+
+    write_text(output, json.dumps({
+        "last_error": last_error,
+        "last_payload": last_payload,
+        "required_hosts": [source_ip, destination_ip],
+    }, indent=2, sort_keys=True) + "\n")
+    known = sorted((last_payload.get("hosts") or {}).keys())
+    raise WorkloadError(
+        "tabela de domínios incompleta; necessários "
+        f"{source_ip},{destination_ip}, conhecidos={known}"
+    )
+
+
+def domain_table_has_hosts(payload: Dict[str, Any], source_ip: str,
+                           destination_ip: str,
+                           source_dpid: Optional[int] = None,
+                           destination_dpid: Optional[int] = None) -> bool:
+    hosts = payload.get("hosts", {}) if isinstance(payload, dict) else {}
+    if not isinstance(hosts, dict):
+        return False
+    source = hosts.get(source_ip)
+    destination = hosts.get(destination_ip)
+    if not isinstance(source, dict) or not isinstance(destination, dict):
+        return False
+    if source_dpid is not None and source.get("dpid") != source_dpid:
+        return False
+    if destination_dpid is not None and destination.get("dpid") != destination_dpid:
+        return False
+    return True
+
+
 def run_iperf(source: Any, destination_ip: str, rate: str, duration_s: int,
               output_json: Path, output_stderr: Path) -> Tuple[int, Optional[float]]:
     stdout, stderr, status = run_host(source, [
@@ -129,18 +190,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--attack-duration-s", type=int, required=True)
     parser.add_argument("--settle-s", type=int, required=True)
     parser.add_argument("--controller-timeout-s", type=float, default=30.0)
+    parser.add_argument("--topology-discovery-wait-s", type=float, default=3.0)
     parser.add_argument("--connectivity-attempts", type=int, default=8)
+    parser.add_argument(
+        "--domain-table-url",
+        default="http://127.0.0.1:7070/flowblocker/domain_table",
+    )
+    parser.add_argument("--domain-table-timeout-s", type=float, default=15.0)
     parser.add_argument("--output", type=Path, required=True)
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
+    # Import tardio mantém as funções de validação testáveis sem Mininet.
+    from eMSN_ENV.setup_mininet import build_network
+
     args.output.mkdir(parents=True, exist_ok=True)
     status: Dict[str, Any] = {
         "valid": False,
         "reason": None,
         "switches_connected": False,
+        "domain_table_ready": False,
         "ping_before_loss_percent": None,
         "baseline_exit_code": None,
         "baseline_bps": None,
@@ -155,9 +226,14 @@ def main() -> int:
         net = build_network(args.csets, args.sper)
         wait_for_switches(net, args.controller_timeout_s)
         status["switches_connected"] = True
+        # Allow at least one full LLDP cycle before classifying ingress ports
+        # as host-facing. This avoids learning remote hosts on inter-switch links.
+        time.sleep(args.topology_discovery_wait_s)
 
         source = net.get(args.source_host)
         destination = net.get(args.destination_host)
+        source_dpid = (int(args.source_host[1:]) + 1) // 2
+        destination_dpid = (int(args.destination_host[1:]) + 1) // 2
         status["ping_before_loss_percent"] = wait_for_data_plane(
             source,
             args.destination_ip,
@@ -165,6 +241,25 @@ def main() -> int:
             args.connectivity_attempts,
             2.0,
         )
+        # Force both endpoints to originate ARP. This is deterministic even
+        # when the destination only acts as a passive iperf server.
+        wait_for_data_plane(
+            destination,
+            source.IP(),
+            args.output / "ping_reverse_discovery.txt",
+            args.connectivity_attempts,
+            2.0,
+        )
+        wait_for_domain_hosts(
+            args.domain_table_url,
+            source.IP(),
+            args.destination_ip,
+            source_dpid,
+            destination_dpid,
+            args.output / "domain_table_preflight.json",
+            args.domain_table_timeout_s,
+        )
+        status["domain_table_ready"] = True
 
         server_log = (args.output / "iperf-server.log").open("wb")
         server = destination.popen(

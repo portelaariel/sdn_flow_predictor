@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from experiments.monitor_predictors import flow_anomalies
+from experiments.run_mininet_workload import domain_table_has_hosts
 from experiments.summarize_benchmark import (
     aggregate_metrics,
     markdown_table,
@@ -29,6 +30,85 @@ class BenchmarkToolTests(unittest.TestCase):
         }
         selected = flow_anomalies(payload, "10.0.0.1->10.0.0.8")
         self.assertEqual([row["anomaly_id"] for row in selected], ["wanted"])
+
+    def test_domain_table_requires_both_mitigation_endpoints(self):
+        payload = {"hosts": {"10.0.0.1": {"dpid": 1}}}
+        self.assertFalse(domain_table_has_hosts(
+            payload, "10.0.0.1", "10.0.0.8"
+        ))
+        payload["hosts"]["10.0.0.8"] = {"dpid": 4}
+        self.assertTrue(domain_table_has_hosts(
+            payload, "10.0.0.1", "10.0.0.8", 1, 4
+        ))
+        self.assertFalse(domain_table_has_hosts(
+            payload, "10.0.0.1", "10.0.0.8", 1, 3
+        ))
+
+    def test_live_mitigation_failure_is_invalid_with_real_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "failed-live"
+            run_dir.mkdir()
+            (run_dir / "metadata.json").write_text(json.dumps({
+                "mode": "collaborative-live",
+                "scenario": "ddos",
+                "flow": "10.0.0.1->10.0.0.8",
+            }), encoding="utf-8")
+            (run_dir / "attack_start_ns.txt").write_text(
+                "1000000000\n", encoding="utf-8"
+            )
+            (run_dir / "workload_status.json").write_text(
+                json.dumps({"valid": True}), encoding="utf-8"
+            )
+            for name in ("ping_before.txt", "ping_after.txt"):
+                (run_dir / name).write_text(
+                    "3 packets transmitted, 3 received, 0% packet loss\n",
+                    encoding="utf-8",
+                )
+            self.write_iperf(run_dir / "baseline.json", 1_000_000)
+            self.write_iperf(run_dir / "attack.json", 100_000_000)
+            row = {
+                "sampled_ns": 2_100_000_000,
+                "status": {"cid": "domain-0"},
+                "anomalies": [{
+                    "anomaly_id": "a1",
+                    "kind": "THROUGHPUT_SPIKE",
+                    "ts_detect_ns": 1_500_000_000,
+                    "mitigation": {
+                        "attempted": False,
+                        "executed": False,
+                        "reason": "aguardando decisão colaborativa",
+                    },
+                }],
+                "collaboration": {"decisions": [{
+                    "flow": "10.0.0.1->10.0.0.8",
+                    "decision": "MITIGATE",
+                    "score": 0.95,
+                    "confirming_domains": ["domain-0", "domain-1"],
+                    "claim": {
+                        "coordinator": "domain-0",
+                        "claimed_ns": 2_000_000_000,
+                        "won": True,
+                    },
+                    "mitigation": {
+                        "attempted": True,
+                        "executed": False,
+                        "reason": "FlowBlocker HTTP 404",
+                    },
+                }]},
+            }
+            (run_dir / "timeline.ndjson").write_text(
+                json.dumps(row) + "\n", encoding="utf-8"
+            )
+
+            summary = summarize_run(run_dir)
+
+            self.assertEqual(summary["classification"], "INVALID")
+            self.assertTrue(summary["detected_attack"])
+            self.assertEqual(summary["mitigation_reason"], "FlowBlocker HTTP 404")
+            self.assertIn(
+                "mitigação live não executada: FlowBlocker HTTP 404",
+                summary["invalid_reasons"],
+            )
 
     def test_summary_correlates_detection_claim_and_mitigation(self):
         with tempfile.TemporaryDirectory() as tmp:

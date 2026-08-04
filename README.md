@@ -623,10 +623,13 @@ requer secrets ou acesso ao servidor do testbed.
 tráfego e coleta. Ele encerra qualquer Mininet ativo com `mn -c`, cria a
 topologia configurada, acompanha as APIs a cada 500 ms e desmonta a
 topologia ao final. Por padrão, também reinicia Ryu, ETCD, SimpleSwitch e
-FlowBlocker antes de cada execução, eliminando estado residual e verificando
-as conexões OpenFlow antes de gerar tráfego. Portanto, não o execute junto a
-outra experiência ativa. Para reutilizar conscientemente um ambiente já
-validado, defina `BENCHMARK_BOOTSTRAP_ENV=false`.
+FlowBlocker antes de cada execução. As imagens ativas são reconstruídas antes
+desse bootstrap, garantindo que os containers correspondam ao commit gravado
+nos metadados. O runner elimina estado residual, verifica as conexões OpenFlow,
+força descoberta ARP bidirecional e exige que origem e destino estejam na
+tabela agregada dos domínios antes de gerar o baseline. Portanto, não o execute
+junto a outra experiência ativa. Para reutilizar conscientemente um ambiente
+já validado, defina `BENCHMARK_BOOTSTRAP_ENV=false`.
 
 Há três modos:
 
@@ -683,9 +686,11 @@ Cada execução cria um diretório pequeno em
   `TP/TN/FP/FN/CONTAMINATED/INVALID`.
 
 Uma execução sem conexão com os controladores, sem ping mensurável, sem vazão
-do baseline/ataque ou com erro nas APIs é `INVALID` e faz o runner terminar
-com status diferente de zero. Assim, ausência de tráfego nunca é contabilizada
-como verdadeiro negativo.
+do baseline/ataque, sem os dois hosts na tabela de domínios ou com erro nas
+APIs é `INVALID` e faz o runner terminar com status diferente de zero. Em
+`collaborative-live`, uma decisão `MITIGATE` sem confirmação HTTP 200 do
+FlowBlocker também é inválida e conserva o motivo operacional no relatório.
+Assim, ausência de tráfego ou falha do DROP nunca é apresentada como sucesso.
 
 Em cenários DDoS, spikes ou decisões de mitigação anteriores ao timestamp do
 ataque classificam o ensaio como `CONTAMINATED`. Anomalias e ações são
