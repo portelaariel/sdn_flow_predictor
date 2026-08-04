@@ -127,6 +127,35 @@ class PredictorTests(unittest.TestCase):
         self.assertEqual(anomaly["detection_mode"], "offline")
         self.assertEqual(series.predictor.n, samples_before_attack)
 
+    def test_offline_series_ignores_partial_interval_and_resets_on_flow_end(self):
+        model = OfflineModel(
+            alpha=0.9,
+            beta=0.0,
+            transform="log1p",
+            residual_center=0.0,
+            residual_scale=0.4376674,
+            z_threshold=3.75,
+            drop_z_threshold=20.0,
+            created_at="test",
+        )
+        series = self.symbols["SeriesState"](
+            "flow:1:10.0.0.1->10.0.0.8",
+            {"type": "flow", "dpid": 1,
+             "nw_src": "10.0.0.1", "nw_dst": "10.0.0.8"},
+            model,
+        )
+
+        self.assertIsNone(series.ingest(0, 0.0))
+        self.assertIsNone(series.ingest(1, 10.0))          # 0,8 bps: parcial
+        self.assertEqual(series.predictor.n, 0)
+        self.assertIsNone(series.ingest(125_001, 11.0))    # primeiro intervalo cheio
+        self.assertIsNone(series.ingest(250_001, 12.0))    # baseline estável
+        self.assertEqual(series.predictor.n, 2)
+
+        self.assertIsNone(series.ingest(250_001, 13.0))    # fluxo encerrado
+        self.assertEqual(series.predictor.n, 0)
+        self.assertEqual(series.predicted_bps, 0.0)
+
     def test_repeated_anomalies_are_aggregated_during_cooldown(self):
         class FakeMitigator:
             def __init__(self):

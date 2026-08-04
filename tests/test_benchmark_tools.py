@@ -87,6 +87,8 @@ class BenchmarkToolTests(unittest.TestCase):
             self.assertEqual(summary["coordinator"], "domain-1")
             self.assertEqual(summary["detection_latency_ms"], 500.0)
             self.assertEqual(summary["consensus_latency_ms"], 500.0)
+            self.assertEqual(summary["baseline_spike_anomalies"], 0)
+            self.assertEqual(summary["attack_spike_anomalies"], 1)
             self.assertEqual(summary["ping_after_loss_percent"], 100.0)
             self.assertTrue(summary["mitigation_executed"])
             self.assertEqual(summary["classification"], "TP")
@@ -116,6 +118,108 @@ class BenchmarkToolTests(unittest.TestCase):
                           summary["invalid_reasons"])
             self.assertEqual(metrics["INVALID"], 1)
             self.assertEqual(metrics["TN"], 0)
+
+    def test_pre_attack_spike_contaminates_run_without_negative_latency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "contaminated-ddos"
+            run_dir.mkdir()
+            (run_dir / "metadata.json").write_text(json.dumps({
+                "mode": "local-dry-run",
+                "scenario": "ddos",
+                "flow": "10.0.0.1->10.0.0.8",
+            }), encoding="utf-8")
+            (run_dir / "workload_status.json").write_text(
+                json.dumps({"valid": True}), encoding="utf-8"
+            )
+            (run_dir / "attack_start_ns.txt").write_text(
+                "2000000000\n", encoding="utf-8"
+            )
+            for name in ("ping_before.txt", "ping_after.txt"):
+                (run_dir / name).write_text(
+                    "3 packets transmitted, 3 received, 0% packet loss\n",
+                    encoding="utf-8",
+                )
+            self.write_iperf(run_dir / "baseline.json", 1_000_000)
+            self.write_iperf(run_dir / "attack.json", 100_000_000)
+            rows = [
+                {
+                    "sampled_ns": 1_600_000_000,
+                    "port": "6060",
+                    "status": {"cid": "domain-0"},
+                    "anomalies": [{
+                        "anomaly_id": "baseline-fp",
+                        "kind": "THROUGHPUT_SPIKE",
+                        "ts_detect_ns": 1_500_000_000,
+                        "mitigation": {"attempted": True, "executed": False},
+                    }],
+                    "collaboration": {"decisions": []},
+                },
+                {
+                    "sampled_ns": 2_600_000_000,
+                    "port": "6060",
+                    "status": {"cid": "domain-0"},
+                    "anomalies": [{
+                        "anomaly_id": "attack-tp",
+                        "kind": "THROUGHPUT_SPIKE",
+                        "ts_detect_ns": 2_500_000_000,
+                        "mitigation": {"attempted": True, "executed": False},
+                    }],
+                    "collaboration": {"decisions": []},
+                },
+            ]
+            (run_dir / "timeline.ndjson").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+
+            summary = summarize_run(run_dir)
+            metrics = aggregate_metrics([summary])
+
+            self.assertEqual(summary["classification"], "CONTAMINATED")
+            self.assertEqual(summary["baseline_spike_anomalies"], 1)
+            self.assertEqual(summary["attack_spike_anomalies"], 1)
+            self.assertEqual(summary["detection_latency_ms"], 500.0)
+            self.assertEqual(summary["baseline_action_domains"], ["domain-0"])
+            self.assertEqual(summary["action_domains"], ["domain-0"])
+            self.assertEqual(metrics["CONTAMINATED"], 1)
+            self.assertEqual(metrics["TP"], 0)
+
+    def test_collaborative_benign_drop_does_not_become_ddos_false_positive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "benign-drop"
+            run_dir.mkdir()
+            (run_dir / "metadata.json").write_text(json.dumps({
+                "mode": "collaborative-dry-run",
+                "scenario": "benign",
+                "flow": "10.0.0.1->10.0.0.8",
+            }), encoding="utf-8")
+            (run_dir / "workload_status.json").write_text(
+                json.dumps({"valid": True}), encoding="utf-8"
+            )
+            for name in ("ping_before.txt", "ping_after.txt"):
+                (run_dir / name).write_text(
+                    "3 packets transmitted, 3 received, 0% packet loss\n",
+                    encoding="utf-8",
+                )
+            self.write_iperf(run_dir / "baseline.json", 1_000_000)
+            (run_dir / "timeline.ndjson").write_text(json.dumps({
+                "sampled_ns": 2_000_000_000,
+                "port": "6061",
+                "status": {"cid": "domain-1"},
+                "anomalies": [{
+                    "anomaly_id": "normal-flow-end",
+                    "kind": "THROUGHPUT_DROP",
+                    "ts_detect_ns": 1_500_000_000,
+                    "mitigation": {"attempted": False, "executed": False},
+                }],
+                "collaboration": {"decisions": []},
+            }) + "\n", encoding="utf-8")
+
+            summary = summarize_run(run_dir)
+
+            self.assertEqual(summary["classification"], "TN")
+            self.assertEqual(summary["drop_anomalies"], 1)
+            self.assertEqual(summary["spike_anomalies"], 0)
 
 
 if __name__ == "__main__":

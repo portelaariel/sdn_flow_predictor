@@ -555,9 +555,43 @@ class SeriesState:
 
         self.rate_bps = (delta * 8.0) / dt
 
-        # No modo offline a primeira taxa observada inicializa apenas o estado
-        # específico da série. A distribuição de resíduos e o threshold já
-        # vieram do treino; portanto a próxima taxa pode ser classificada.
+        # Um fluxo que deixou de acumular bytes terminou; taxa zero não é uma
+        # queda anômala de throughput. O estado de nível é descartado para que
+        # uma futura recriação da mesma regra seja inicializada novamente.
+        if (self.detection_mode == "offline"
+                and self.meta.get("type") == "flow"
+                and self.rate_bps <= 0.0):
+            self.predictor.level = None
+            self.predictor.trend = 0.0
+            self.predictor.n = 0
+            self.predicted_bps = 0.0
+            self.model_residual = 0.0
+            self.history.append((ts, self.rate_bps, self.predicted_bps))
+            if _exporter:
+                _exporter.record(
+                    self.key, self.meta, ts,
+                    self.rate_bps, self.predicted_bps, 0.0,
+                    None, False,
+                )
+            return None
+
+        # O threshold e a distribuição dos resíduos continuam inteiramente
+        # offline. A primeira taxa acima do piso apenas alinha o nível Holt da
+        # série; um intervalo inicial parcial abaixo do piso não pode definir
+        # esse nível.
+        if (self.detection_mode == "offline" and self.predictor.n == 0
+                and self.rate_bps < MIN_RATE_BPS):
+            self.predicted_bps = 0.0
+            self.model_residual = 0.0
+            self.history.append((ts, self.rate_bps, self.predicted_bps))
+            if _exporter:
+                _exporter.record(
+                    self.key, self.meta, ts,
+                    self.rate_bps, self.predicted_bps, 0.0,
+                    None, False,
+                )
+            return None
+
         if self.detection_mode == "offline" and self.predictor.n == 0:
             self.predicted_bps = self.rate_bps
             self.predictor.update(self.rate_bps)

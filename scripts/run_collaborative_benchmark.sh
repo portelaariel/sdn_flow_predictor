@@ -336,8 +336,9 @@ python3 "$PROJECT_ROOT/experiments/summarize_benchmark.py" \
   "$OUTDIR" --output "$OUTDIR/summary"
 
 CLASSIFICATION="$(jq -r '.runs[0].classification // "INVALID"' "$OUTDIR/summary.json")"
-if [[ "$WORKLOAD_EXIT" -ne 0 || "$CLASSIFICATION" == "INVALID" ]]; then
-  echo "[benchmark] execução inválida; consulte $OUTDIR/workload_status.json e mininet.log" >&2
+if [[ "$WORKLOAD_EXIT" -ne 0 || "$CLASSIFICATION" == "INVALID" \
+      || "$CLASSIFICATION" == "CONTAMINATED" ]]; then
+  echo "[benchmark] execução inválida/contaminada; consulte $OUTDIR/summary.json, workload_status.json e mininet.log" >&2
   exit 1
 fi
 

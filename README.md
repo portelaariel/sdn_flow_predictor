@@ -128,11 +128,12 @@ em vez de depender de um número absoluto de bits por segundo. O artefato
 JSON registra o hash do dataset, colunas usadas, contagens, parâmetros e
 métricas de calibração.
 
-No runtime, a primeira taxa de cada fluxo inicializa apenas o nível
-específico daquela série. A taxa seguinte já é classificada com a
-distribuição aprendida offline; não há o warmup de 15 amostras. Um ataque
-detectado não atualiza Holt, evitando que um DDoS prolongado seja
-absorvido como o novo comportamento normal.
+No runtime, a primeira taxa de cada fluxo acima do piso de ruído inicializa
+apenas o nível específico daquela série. Intervalos parciais abaixo do piso
+são ignorados. A taxa seguinte já é classificada com a distribuição aprendida
+offline; não há o warmup de 15 amostras. Um ataque detectado não atualiza Holt,
+evitando que um DDoS prolongado seja absorvido como o novo comportamento
+normal.
 
 O artefato atual usa `schema_version: 2` e mantém `z_threshold` como alias
 compatível do limiar de pico. Artefatos da versão 1 continuam válidos: ao
@@ -335,9 +336,9 @@ Referências de dimensionamento:
 
 **Flexibilidade de topologia**: nenhum pressuposto sobre número de
 switches, forma da topologia ou esquema de IPs. Novas séries nascem
-quando o primeiro contador aparece; séries de fluxos expirados
-simplesmente param de ser atualizadas. As regras IPv4 do SimpleSwitch
-usam `idle_timeout=30` e permanecem enquanto houver tráfego.
+quando o primeiro contador aparece; taxa zero de um fluxo é tratada como
+término e reinicializa seu nível, não como anomalia de queda. As regras IPv4
+do SimpleSwitch usam `idle_timeout=30` e permanecem enquanto houver tráfego.
 
 ------------------------------------------------------------------------
 
@@ -669,12 +670,19 @@ Cada execução cria um diretório pequeno em
 - snapshots das APIs, flows OVS e logs dos containers;
 - `summary.json` e `summary.md` com score, domínios confirmadores,
   coordenador, quantidade de domínios que agiram, latências e classificação
-  `TP/TN/FP/FN/INVALID`.
+  `TP/TN/FP/FN/CONTAMINATED/INVALID`.
 
 Uma execução sem conexão com os controladores, sem ping mensurável, sem vazão
 do baseline/ataque ou com erro nas APIs é `INVALID` e faz o runner terminar
 com status diferente de zero. Assim, ausência de tráfego nunca é contabilizada
 como verdadeiro negativo.
+
+Em cenários DDoS, spikes ou decisões de mitigação anteriores ao timestamp do
+ataque classificam o ensaio como `CONTAMINATED`. Anomalias e ações são
+separadas entre baseline e ataque, e a latência de detecção considera apenas
+eventos posteriores ao início do ataque; por construção, ela nunca é negativa.
+Execuções `CONTAMINATED` e `INVALID` são contabilizadas separadamente e não
+entram nos denominadores de precision, recall ou F1.
 
 Compare quaisquer execuções em uma única tabela:
 
