@@ -606,5 +606,82 @@ requer secrets ou acesso ao servidor do testbed.
 
 ------------------------------------------------------------------------
 
-**Versão**: 1.5 · **Data**: 2026-08-03 · **Status**: thresholds assimétricos,
-deduplicação de eventos e validação independente no CIC-DDoS2019
+## 7. BENCHMARK REPRODUZÍVEL
+
+`scripts/run_collaborative_benchmark.sh` automatiza deploy, topologia,
+tráfego e coleta. Ele encerra qualquer Mininet ativo com `mn -c`, cria a
+topologia configurada, acompanha as APIs a cada 500 ms e desmonta a
+topologia ao final. Execute-o a partir da raiz do repositório, com Ryu,
+ETCD, SimpleSwitch e FlowBlocker já disponíveis.
+
+Há três modos:
+
+| Modo | Colaboração | Mitigação |
+| --- | --- | --- |
+| `local-dry-run` | não | simulada em cada domínio |
+| `collaborative-dry-run` | MCDA + quórum | simulada apenas pelo coordenador |
+| `collaborative-live` | MCDA + quórum | DROP real; exige `--allow-mitigation` |
+
+E dois cenários: `benign`, que mantém UDP estável, e `ddos`, que executa
+um baseline de 1 Mbit/s seguido por um salto de 100 Mbit/s. Uma bateria
+mínima é:
+
+``` bash
+# Controle negativo: não deve chegar a MITIGATE
+bash scripts/run_collaborative_benchmark.sh collaborative-dry-run benign
+
+# Mede duplicação/latência da decisão local
+bash scripts/run_collaborative_benchmark.sh local-dry-run ddos
+
+# Mede consenso e eleição sem alterar o plano de dados
+bash scripts/run_collaborative_benchmark.sh collaborative-dry-run ddos
+
+# Após o claim anterior expirar, valida o DROP real
+bash scripts/run_collaborative_benchmark.sh \
+  collaborative-live ddos --allow-mitigation
+```
+
+Se ainda existir um claim do mesmo fluxo, o runner para antes de limpar
+a topologia e informa quantos segundos aguardar. Isso evita contaminar
+uma execução com o coordenador da anterior. O histórico CSV fica
+desabilitado no benchmark por padrão para economizar armazenamento; use
+`BENCHMARK_EXPORT_HISTORY=true` se as séries também forem necessárias.
+
+Taxas e durações podem ser alteradas sem editar o script:
+
+``` bash
+BENCHMARK_BASELINE_RATE=5M \
+BENCHMARK_ATTACK_RATE=200M \
+BENCHMARK_ATTACK_DURATION_S=30 \
+  bash scripts/run_collaborative_benchmark.sh collaborative-dry-run ddos
+```
+
+Cada execução cria um diretório pequeno em
+`experiments/results/<timestamp>-<modo>-<cenário>/` contendo:
+
+- metadados, hash do modelo e commit Git;
+- JSON do iperf e ping antes/depois;
+- linha do tempo NDJSON de anomalias e decisões;
+- snapshots das APIs, flows OVS e logs dos containers;
+- `summary.json` e `summary.md` com score, domínios confirmadores,
+  coordenador, quantidade de domínios que agiram, latências e classificação
+  `TP/TN/FP/FN`.
+
+Compare quaisquer execuções em uma única tabela:
+
+``` bash
+python3 experiments/summarize_benchmark.py \
+  experiments/results/<execução-1> \
+  experiments/results/<execução-2> \
+  experiments/results/<execução-3> \
+  --output experiments/results/comparativo
+```
+
+O comparativo também calcula precision, recall e F1 agregadas. Para que
+essas métricas tenham significado, execute várias repetições de `benign`
+e `ddos` sob as mesmas taxas, durações, topologia, modelo e commit.
+
+------------------------------------------------------------------------
+
+**Versão**: 1.6 · **Data**: 2026-08-04 · **Status**: modelo offline,
+consenso MCDA multi-domínio, claim distribuído e benchmark reproduzível

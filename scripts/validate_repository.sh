@@ -36,6 +36,9 @@ required_files=(
   eMSN_ENV/setup_env.sh
   eMSN_ENV/setup_mininet.py
   deploy_flow_predictor.sh
+  experiments/monitor_predictors.py
+  experiments/summarize_benchmark.py
+  scripts/run_collaborative_benchmark.sh
 )
 for path in "${required_files[@]}"; do
   [[ -f "$path" ]] || { echo "missing required file: $path" >&2; exit 1; }
@@ -76,6 +79,8 @@ expect_invalid_input bash deploy_flow_predictor.sh 2 invalid
 expect_invalid_input env PREDICTOR_COLLABORATION_ENABLED=true \
   PREDICTOR_COLLAB_MIN_DOMAINS=3 bash deploy_flow_predictor.sh 2 true
 expect_invalid_input bash eMSN_ENV/setup_env.sh 0 2
+expect_invalid_input bash scripts/run_collaborative_benchmark.sh invalid ddos
+expect_invalid_input bash scripts/run_collaborative_benchmark.sh collaborative-live ddos
 echo "input_validation: ok"
 
 python3 -m unittest discover -s tests -v
