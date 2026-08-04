@@ -202,6 +202,24 @@ def _metric(tag: str, msg: str) -> None:
     logger.info(f"[METRICS][{tag}] {msg}")
 
 
+def blocked_flow_pairs(flows: List[Dict[str, Any]]) -> set:
+    """Identifica pares cobertos por uma regra DROP OpenFlow 1.0.
+
+    O Ryu representa DROP como uma lista de ações vazia. O par inteiro é
+    excluído da coleta para que a própria regra de mitigação não seja tratada
+    como tráfego encaminhado e não realimente o detector.
+    """
+    blocked = set()
+    for flow in flows:
+        if flow.get("actions") != []:
+            continue
+        match = flow.get("match", {})
+        src, dst = match.get("nw_src"), match.get("nw_dst")
+        if src and dst:
+            blocked.add((src, dst))
+    return blocked
+
+
 # ---------------- ETCD opcional (mesma degradação graciosa do FlowBlocker) ----------------
 _etcd = None
 if ETCD_ENDPOINTS:
@@ -663,17 +681,19 @@ class Collector:
             # ---- Fluxos IPv4 (visão fina src->dst; base da mitigação) ----
             fstats = self._get(f"/stats/flow/{dpid}") or {}
             flows = fstats.get(str(dpid), [])
+            blocked_pairs = blocked_flow_pairs(flows)
             for f in flows:
                 m = f.get("match", {})
                 nw_src, nw_dst = m.get("nw_src"), m.get("nw_dst")
-                if not nw_src or not nw_dst:
+                if not nw_src or not nw_dst or (nw_src, nw_dst) in blocked_pairs:
                     continue
                 key = f"flow:{dpid}:{nw_src}->{nw_dst}"
                 meta = {"type": "flow", "dpid": dpid, "nw_src": nw_src, "nw_dst": nw_dst}
                 self.engine.ingest(key, meta, int(f.get("byte_count", 0)), ts)
 
             # ---- Heurística de surto de fluxos (indício de scan/DDoS) ----
-            self._check_flow_surge(dpid, len(flows))
+            forwarding_rules = sum(1 for flow in flows if flow.get("actions") != [])
+            self._check_flow_surge(dpid, forwarding_rules)
 
     def _check_flow_surge(self, dpid: int, n_flows: int):
         hist = self.flow_count_hist.setdefault(dpid, deque(maxlen=HISTORY_WINDOW))

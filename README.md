@@ -102,6 +102,12 @@ flow foi reinstalado ou o switch reiniciou, comum com os timeouts de
 `MIN_RATE_BPS` alimentam o modelo mas não geram alertas, filtrando o
 ruído de ARP/LLDP.
 
+Regras OpenFlow com `actions=[]` são regras DROP e não representam
+tráfego entregue. Quando um DROP cobre `src->dst`, o coletor exclui todas
+as entradas desse par no DPID. Isso impede que o contador da própria
+mitigação realimente o detector ou produza uma falsa queda logo após o
+bloqueio.
+
 ### 2.3 Treinamento offline e Holt online
 
 O treinamento recebe séries temporais de vazão normais e, opcionalmente,

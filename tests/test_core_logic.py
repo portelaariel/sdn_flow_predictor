@@ -342,6 +342,66 @@ class FlowRuleTests(unittest.TestCase):
         self.assertEqual(ipv4_flow["idle_timeout"], 30)
 
 
+class CollectorTests(unittest.TestCase):
+    def test_drop_rule_and_shadowed_forward_rule_are_not_ingested(self):
+        symbols = load_definitions(
+            "flow_predictor_cnsm.py",
+            {"blocked_flow_pairs", "Collector"},
+            {
+                "Any": Any,
+                "Dict": Dict,
+                "List": List,
+                "Optional": Optional,
+                "deque": deque,
+                "threading": __import__("threading"),
+                "time": __import__("time"),
+                "HISTORY_WINDOW": 120,
+                "FLOW_SURGE_WARMUP": 15,
+            },
+        )
+
+        class FakeEngine:
+            def __init__(self):
+                self.ingested = []
+
+            def ingest(self, key, meta, byte_count, timestamp):
+                self.ingested.append((key, byte_count))
+
+        engine = FakeEngine()
+        collector = symbols["Collector"](engine)
+        flow_stats = {
+            "1": [
+                {
+                    "match": {"nw_src": "10.0.0.1", "nw_dst": "10.0.0.8"},
+                    "actions": [],
+                    "byte_count": 200_000_000,
+                },
+                {
+                    "match": {"nw_src": "10.0.0.1", "nw_dst": "10.0.0.8"},
+                    "actions": ["OUTPUT:2"],
+                    "byte_count": 150_000_000,
+                },
+                {
+                    "match": {"nw_src": "10.0.0.2", "nw_dst": "10.0.0.3"},
+                    "actions": ["OUTPUT:3"],
+                    "byte_count": 42,
+                },
+            ]
+        }
+        responses = {
+            "/stats/switches": [1],
+            "/stats/port/1": {"1": []},
+            "/stats/flow/1": flow_stats,
+        }
+        collector._get = responses.get
+        collector._collect_once()
+
+        self.assertEqual(
+            engine.ingested,
+            [("flow:1:10.0.0.2->10.0.0.3", 42)],
+        )
+
+
 class CollaborativeManagerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
