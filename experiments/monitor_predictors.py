@@ -25,6 +25,15 @@ def flow_anomalies(payload: Dict[str, Any], flow: str) -> List[Dict[str, Any]]:
     ]
 
 
+def flow_predictions(payload: Dict[str, Any], flow: str) -> List[Dict[str, Any]]:
+    src, dst = flow.split("->", 1)
+    return [
+        row for row in payload.get("predictions", [])
+        if row.get("meta", {}).get("nw_src") == src
+        and row.get("meta", {}).get("nw_dst") == dst
+    ]
+
+
 def endpoint_port(endpoint: str) -> str:
     return endpoint.rstrip("/").rsplit(":", 1)[-1]
 
@@ -35,6 +44,7 @@ def capture_endpoint(endpoint: str, flow: str) -> Dict[str, Any]:
         status = fetch_json(f"{endpoint}/predictor/status")
         collaboration = fetch_json(f"{endpoint}/predictor/collaboration")
         anomalies = fetch_json(f"{endpoint}/predictor/anomalies?limit=500")
+        predictions = fetch_json(f"{endpoint}/predictor/predictions?top=500")
         return {
             "sampled_ns": sampled_ns,
             "endpoint": endpoint,
@@ -47,6 +57,7 @@ def capture_endpoint(endpoint: str, flow: str) -> Dict[str, Any]:
             },
             "collaboration": collaboration,
             "anomalies": flow_anomalies(anomalies, flow),
+            "predictions": flow_predictions(predictions, flow),
         }
     except (OSError, ValueError, urllib.error.URLError) as exc:
         return {

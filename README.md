@@ -103,6 +103,11 @@ inicial, taxas abaixo de `MIN_RATE_BPS` são ignoradas para não transformar um
 intervalo parcial em baseline. Depois do alinhamento elas podem atualizar o
 nível, mas não geram alertas, filtrando o ruído de ARP/LLDP.
 
+Para séries de fluxo, uma taxa zero isolada é tratada como uma lacuna entre
+rajadas, sem pontuar nem alterar Holt. O nível só é reiniciado após
+`FLOW_IDLE_RESET_SAMPLES` zeros consecutivos (2 por padrão). Isso evita que
+coletores com fases diferentes usem o começo de um ataque como novo baseline.
+
 Regras OpenFlow com `actions=[]` são regras DROP e não representam
 tráfego entregue. Quando um DROP cobre `src->dst`, o coletor exclui todas
 as entradas desse par no DPID. Isso impede que o contador da própria
@@ -346,8 +351,9 @@ Referências de dimensionamento:
 **Flexibilidade de topologia**: nenhum pressuposto sobre número de
 switches, forma da topologia ou esquema de IPs. Novas séries nascem
 quando o primeiro contador aparece; taxa zero de um fluxo é tratada como
-término e reinicializa seu nível, não como anomalia de queda. As regras IPv4
-do SimpleSwitch usam `idle_timeout=30` e permanecem enquanto houver tráfego.
+término apenas após a tolerância configurada e nunca como anomalia de queda.
+As regras IPv4 do SimpleSwitch usam `idle_timeout=30` e permanecem enquanto
+houver tráfego.
 
 ------------------------------------------------------------------------
 
@@ -679,7 +685,7 @@ Cada execução cria um diretório pequeno em
 
 - metadados, hash do modelo e commit Git;
 - JSON do iperf e ping antes/depois;
-- linha do tempo NDJSON de anomalias e decisões;
+- linha do tempo NDJSON de predições do fluxo, anomalias e decisões;
 - snapshots das APIs, flows OVS e logs dos containers;
 - `summary.json` e `summary.md` com score, domínios confirmadores,
   coordenador, quantidade de domínios que agiram, latências e classificação

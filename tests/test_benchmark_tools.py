@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from experiments.monitor_predictors import flow_anomalies
+from experiments.monitor_predictors import flow_anomalies, flow_predictions
 from experiments.run_mininet_workload import domain_table_has_hosts
 from experiments.summarize_benchmark import (
     aggregate_metrics,
@@ -30,6 +30,19 @@ class BenchmarkToolTests(unittest.TestCase):
         }
         selected = flow_anomalies(payload, "10.0.0.1->10.0.0.8")
         self.assertEqual([row["anomaly_id"] for row in selected], ["wanted"])
+
+        prediction_payload = {
+            "predictions": [
+                {"key": "wanted", "meta": {
+                    "nw_src": "10.0.0.1", "nw_dst": "10.0.0.8"}},
+                {"key": "other", "meta": {
+                    "nw_src": "10.0.0.2", "nw_dst": "10.0.0.8"}},
+            ]
+        }
+        predictions = flow_predictions(
+            prediction_payload, "10.0.0.1->10.0.0.8"
+        )
+        self.assertEqual([row["key"] for row in predictions], ["wanted"])
 
     def test_domain_table_requires_both_mitigation_endpoints(self):
         payload = {"hosts": {"10.0.0.1": {"dpid": 1}}}

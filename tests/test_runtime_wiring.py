@@ -91,6 +91,7 @@ class RuntimeWiringTests(unittest.TestCase):
         self.assertLess(build_ryu, bootstrap)
         self.assertIn("--domain-table-url", self.benchmark_source)
         self.assertIn("--expect-disruption", self.benchmark_source)
+        self.assertNotIn("time.sleep(2.0)", self.workload_source)
         self.assertIn("ping_reverse_discovery.txt", self.workload_source)
         self.assertIn("wait_for_domain_hosts(", self.workload_source)
 

@@ -26,6 +26,7 @@ ENV (mesmo padrão dos demais serviços):
   HISTORY_WINDOW        120        # amostras retidas por série
   Z_THRESHOLD           4.0        # sensibilidade inicial (adaptativa via feedback)
   MIN_RATE_BPS          50000      # ignora séries abaixo disso (ruído)
+  FLOW_IDLE_RESET_SAMPLES 2        # zeros consecutivos antes de reiniciar um fluxo
   AUTO_MITIGATE         true|false
   DRY_RUN               true|false (loga a mitigação sem executar)
   MITIGATION_COOLDOWN_S 60
@@ -91,6 +92,7 @@ POLL_INTERVAL_S   = float(os.environ.get("POLL_INTERVAL_S", "2.0"))
 HISTORY_WINDOW    = int(os.environ.get("HISTORY_WINDOW", "120"))
 Z_THRESHOLD       = float(os.environ.get("Z_THRESHOLD", "4.0"))
 MIN_RATE_BPS      = float(os.environ.get("MIN_RATE_BPS", "50000"))
+FLOW_IDLE_RESET_SAMPLES = int(os.environ.get("FLOW_IDLE_RESET_SAMPLES", "2"))
 AUTO_MITIGATE     = os.environ.get("AUTO_MITIGATE", "true").lower() == "true"
 DRY_RUN           = os.environ.get("DRY_RUN", "false").lower() == "true"
 COOLDOWN_S        = float(os.environ.get("MITIGATION_COOLDOWN_S", "60"))
@@ -123,6 +125,8 @@ COLLAB_WEIGHTS = load_collaboration_weights(os.environ.get("COLLAB_WEIGHTS_JSON"
 
 if not math.isfinite(EVENT_COOLDOWN_S) or EVENT_COOLDOWN_S < 0.0:
     raise ValueError("ANOMALY_EVENT_COOLDOWN_S deve ser não negativo e finito")
+if FLOW_IDLE_RESET_SAMPLES < 1:
+    raise ValueError("FLOW_IDLE_RESET_SAMPLES deve ser um inteiro positivo")
 if (not math.isfinite(COLLAB_WINDOW_S) or COLLAB_WINDOW_S <= 0.0
         or not math.isfinite(COLLAB_EVIDENCE_TTL_S)
         or COLLAB_EVIDENCE_TTL_S < COLLAB_WINDOW_S
@@ -513,6 +517,7 @@ class SeriesState:
         self.rate_bps: float = 0.0
         self.predicted_bps: float = 0.0
         self.model_residual: float = 0.0
+        self.idle_samples: int = 0
         self.detection_mode = "offline" if offline_model else "adaptive"
         self.series_priming_samples = (
             offline_model.series_priming_samples if offline_model else 0
@@ -559,15 +564,18 @@ class SeriesState:
 
         self.rate_bps = (delta * 8.0) / dt
 
-        # Um fluxo que deixou de acumular bytes terminou; taxa zero não é uma
-        # queda anômala de throughput. O estado de nível é descartado para que
-        # uma futura recriação da mesma regra seja inicializada novamente.
+        # Taxa zero não é uma queda anômala. Uma única amostra vazia pode ser
+        # apenas a fronteira entre duas rajadas observada em fases diferentes
+        # por coletores multi-domínio; preserva-se o nível durante uma pequena
+        # graça e só então o fluxo é considerado encerrado.
         if (self.detection_mode == "offline"
                 and self.meta.get("type") == "flow"
                 and self.rate_bps <= 0.0):
-            self.predictor.level = None
-            self.predictor.trend = 0.0
-            self.predictor.n = 0
+            self.idle_samples += 1
+            if self.idle_samples >= FLOW_IDLE_RESET_SAMPLES:
+                self.predictor.level = None
+                self.predictor.trend = 0.0
+                self.predictor.n = 0
             self.predicted_bps = 0.0
             self.model_residual = 0.0
             self.history.append((ts, self.rate_bps, self.predicted_bps))
@@ -578,6 +586,7 @@ class SeriesState:
                     None, False,
                 )
             return None
+        self.idle_samples = 0
 
         # O threshold e a distribuição dos resíduos continuam inteiramente
         # offline. As observações declaradas pelo artefato apenas alinham o
@@ -879,6 +888,7 @@ class CollaborativeDecisionManager:
             "spike_z_threshold": model.spike_z_threshold,
             "drop_z_threshold": model.effective_drop_z_threshold,
             "series_priming_samples": model.series_priming_samples,
+            "flow_idle_reset_samples": FLOW_IDLE_RESET_SAMPLES,
         }
         digest = hashlib.sha256(
             json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -1377,6 +1387,7 @@ class PredictorEngine:
                 "predicted_5step_bps": round(s.predictor.predict(5), 1),
                 "trend_bps": round(s.predictor.trend_bps, 1),
                 "samples": s.predictor.n,
+                "idle_samples": s.idle_samples,
                 "z_threshold": s.detector.z_threshold,
                 "spike_z_threshold": s.detector.z_threshold,
                 "drop_z_threshold": s.detector.drop_z_threshold,
@@ -1451,6 +1462,7 @@ def status():
                 "warmup_samples_fallback": WARMUP_SAMPLES,
                 "flow_surge_warmup_samples": FLOW_SURGE_WARMUP,
                 "min_rate_bps": MIN_RATE_BPS,
+                "flow_idle_reset_samples": FLOW_IDLE_RESET_SAMPLES,
                 "auto_mitigate": AUTO_MITIGATE,
                 "dry_run": DRY_RUN,
                 "cooldown_s": COOLDOWN_S,
@@ -1499,6 +1511,7 @@ def prediction_detail(key: str):
             "observed_bps": s.rate_bps,
             "detection_mode": s.detection_mode,
             "detector_ready": s.detector.ready,
+            "idle_samples": s.idle_samples,
             "model_residual": s.model_residual,
             "forecast": {f"h{h}": round(s.predictor.predict(h), 1) for h in (1, 3, 5, 10)},
             "history": [{"ts": t, "observed": o, "predicted": p} for t, o, p in s.history],

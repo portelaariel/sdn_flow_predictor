@@ -46,6 +46,7 @@ class PredictorTests(unittest.TestCase):
                 "Z_THRESHOLD": 4.0,
                 "WARMUP_SAMPLES": 15,
                 "MIN_RATE_BPS": 1.0,
+                "FLOW_IDLE_RESET_SAMPLES": 2,
                 "CONTROLLER_ID": "test-controller",
                 "_exporter": None,
                 "uuid": uuid,
@@ -127,7 +128,7 @@ class PredictorTests(unittest.TestCase):
         self.assertEqual(anomaly["detection_mode"], "offline")
         self.assertEqual(series.predictor.n, samples_before_attack)
 
-    def test_offline_series_ignores_partial_interval_and_resets_on_flow_end(self):
+    def test_offline_series_tolerates_one_idle_sample_then_resets(self):
         model = OfflineModel(
             alpha=0.9,
             beta=0.0,
@@ -154,7 +155,18 @@ class PredictorTests(unittest.TestCase):
         self.assertIsNone(series.ingest(375_001, 13.0))    # baseline já pontuado
         self.assertEqual(series.predictor.n, 3)
 
-        self.assertIsNone(series.ingest(375_001, 14.0))    # fluxo encerrado
+        self.assertIsNone(series.ingest(375_001, 14.0))    # lacuna entre rajadas
+        self.assertEqual(series.predictor.n, 3)
+        self.assertEqual(series.idle_samples, 1)
+
+        anomaly = series.ingest(1_625_001, 15.0)           # ataque após a lacuna
+        self.assertIsNotNone(anomaly)
+        self.assertEqual(anomaly["kind"], "THROUGHPUT_SPIKE")
+        self.assertEqual(series.idle_samples, 0)
+
+        self.assertIsNone(series.ingest(1_625_001, 16.0))  # primeira amostra vazia
+        self.assertEqual(series.predictor.n, 3)
+        self.assertIsNone(series.ingest(1_625_001, 17.0))  # fluxo encerrado
         self.assertEqual(series.predictor.n, 0)
         self.assertEqual(series.predicted_bps, 0.0)
 
@@ -480,6 +492,7 @@ class CollaborativeManagerTests(unittest.TestCase):
             "CONTROLLER_ID": "domain-0",
             "COLLAB_WINDOW_S": 4.0,
             "COLLAB_CLAIM_TTL_S": 60.0,
+            "FLOW_IDLE_RESET_SAMPLES": 2,
             "Z_THRESHOLD": 4.0,
             "clip01": lambda value: max(0.0, min(1.0, float(value))),
             "canonical_flow_key": lambda anomaly: (
@@ -559,6 +572,28 @@ class CollaborativeManagerTests(unittest.TestCase):
 
         self.assertNotEqual(one_sample_id, two_sample_id)
         self.assertEqual(reliability, 0.9)
+
+    def test_model_identity_includes_idle_reset_contract(self):
+        manager = self.bare_manager()
+        manager.engine.offline_model = OfflineModel(
+            alpha=0.9,
+            beta=0.0,
+            transform="log1p",
+            residual_center=0.0,
+            residual_scale=0.3,
+            z_threshold=5.0,
+            drop_z_threshold=20.0,
+            created_at="ignored",
+            series_priming_samples=2,
+            training={"dataset_sha256": "same-dataset"},
+        )
+
+        self.namespace["FLOW_IDLE_RESET_SAMPLES"] = 1
+        immediate_id, _ = manager._model_identity()
+        self.namespace["FLOW_IDLE_RESET_SAMPLES"] = 2
+        tolerant_id, _ = manager._model_identity()
+
+        self.assertNotEqual(immediate_id, tolerant_id)
 
     def test_atomic_claim_has_a_single_winner(self):
         class Version:

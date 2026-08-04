@@ -294,7 +294,8 @@ def main() -> int:
             )
 
         if args.scenario == "ddos":
-            time.sleep(2.0)
+            # Não introduzir um intervalo ocioso: uma transição alinhada ao
+            # polling poderia reinicializar somente parte dos domínios.
             write_text(args.output / "attack_start_ns.txt", f"{time.time_ns()}\n")
             attack_status, attack_bps = run_iperf(
                 source,
