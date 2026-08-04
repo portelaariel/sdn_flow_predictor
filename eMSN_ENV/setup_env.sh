@@ -88,11 +88,18 @@ log "Output directory: $OUTDIR"
 ####################################
 net_create_if_absent "$ETCD_NET" "${ETCD_PREFIX}.0/24"
 
+log "Removing previous ETCD nodes"
+for j in $(seq 1 $ETCD_NODES); do
+  docker_rm_if "etcd${j}"
+done
+
+# Todos os membros antigos precisam desaparecer antes que o primeiro membro
+# novo seja iniciado. Misturar nós de duas formações com o mesmo token pode
+# fazer o primeiro processo encerrar por incompatibilidade de cluster.
 log "Starting ETCD cluster (${ETCD_NODES} nodes)"
 for j in $(seq 1 $ETCD_NODES); do
   etcd_ip="${ETCD_PREFIX}.$((j+10))"
   etcd_name="etcd${j}"
-  docker_rm_if "$etcd_name"
   sudo docker run -d --name "$etcd_name" --network "$ETCD_NET" --ip "$etcd_ip" \
     -p $((2378 + j)):2379 -p $((2378 + j + 100)):2380 \
     -e ETCD_NAME="$etcd_name" \
@@ -110,7 +117,20 @@ done
 
 # Wait for at least one endpoint to answer
 log "Waiting for ETCD client port on ${ETCD_PREFIX}.11:2379"
-wait_tcp "${ETCD_PREFIX}.11" 2379 60 || { log "ETCD not reachable"; exit 1; }
+if ! wait_tcp "${ETCD_PREFIX}.11" 2379 60; then
+  for j in $(seq 1 $ETCD_NODES); do
+    {
+      echo "=== etcd${j} inspect ==="
+      sudo docker inspect --format \
+        'running={{.State.Running}} status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}}' \
+        "etcd${j}" 2>&1 || true
+      echo "=== etcd${j} logs ==="
+      sudo docker logs --tail 80 "etcd${j}" 2>&1 || true
+    } >> "$OUTDIR/etcd-bootstrap-error.log"
+  done
+  log "ETCD not reachable; diagnostics: $OUTDIR/etcd-bootstrap-error.log"
+  exit 1
+fi
 log "ETCD cluster should be up."
 
 #####################################################

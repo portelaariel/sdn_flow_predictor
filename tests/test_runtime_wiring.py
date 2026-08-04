@@ -26,6 +26,17 @@ class RuntimeWiringTests(unittest.TestCase):
         # FlowBlocker process itself.
         self.assertNotIn("FB_PEER_ID", flowblocker_block)
 
+    def test_all_old_etcd_nodes_are_removed_before_first_new_node_starts(self):
+        cluster_block = self._block(
+            'log "Removing previous ETCD nodes"',
+            "# Wait for at least one endpoint",
+        )
+        remove_call = cluster_block.index('docker_rm_if "etcd${j}"')
+        removal_loop_end = cluster_block.index("done", remove_call)
+        first_docker_run = cluster_block.index("sudo docker run")
+
+        self.assertLess(removal_loop_end, first_docker_run)
+
 
 if __name__ == "__main__":
     unittest.main()
