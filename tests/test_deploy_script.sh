@@ -43,6 +43,9 @@ grep -q -- '-e Z_THRESHOLD=5.5' "$COMMAND_LOG"
 grep -q -- '-e OFFLINE_MODEL_REQUIRED=false' "$COMMAND_LOG"
 grep -q -- '-e WARMUP_SAMPLES=15' "$COMMAND_LOG"
 grep -q -- '-e ANOMALY_EVENT_COOLDOWN_S=60' "$COMMAND_LOG"
+grep -q -- '-e COLLABORATION_ENABLED=false' "$COMMAND_LOG"
+grep -q -- '-e COLLAB_EXPECTED_DOMAINS=1' "$COMMAND_LOG"
+grep -q -- '-e COLLAB_MIN_DOMAINS=2' "$COMMAND_LOG"
 grep -q -- '-e DRY_RUN=true' "$COMMAND_LOG"
 grep -q -- '-p 6060:6060' "$COMMAND_LOG"
 
@@ -57,5 +60,14 @@ PREDICTOR_OFFLINE_MODEL_REQUIRED=true \
 grep -q -- "-v $MODEL_PATH:/app/models/offline_model.json:ro" "$COMMAND_LOG"
 grep -q -- '-e OFFLINE_MODEL_PATH=/app/models/offline_model.json' "$COMMAND_LOG"
 grep -q -- '-e OFFLINE_MODEL_REQUIRED=true' "$COMMAND_LOG"
+
+PREDICTION_HISTORY_ROOT="$TEST_TMP/history-collaborative" \
+PREDICTOR_COLLABORATION_ENABLED=true \
+PREDICTOR_COLLAB_MIN_DOMAINS=2 \
+  bash "$PROJECT_ROOT/deploy_flow_predictor.sh" 2 true >/dev/null
+
+grep -q -- '-e COLLABORATION_ENABLED=true' "$COMMAND_LOG"
+grep -q -- '-e COLLAB_EXPECTED_DOMAINS=2' "$COMMAND_LOG"
+grep -q -- '-e COLLAB_MIN_DOMAINS=2' "$COMMAND_LOG"
 
 echo "deploy_smoke: ok"

@@ -1,10 +1,12 @@
 import ast
+import math
 import unittest
 import uuid
 from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from collaborative_decision import score_collaborative_evidence
 from offline_model import OfflineModel, inverse_transform_value, transform_value
 
 
@@ -152,6 +154,7 @@ class PredictorTests(unittest.TestCase):
                 "CONTROLLER_ID": "test-controller",
                 "_metric": lambda *_args: None,
                 "_etcd": None,
+                "COLLABORATION_ENABLED": False,
             },
         )
         engine = symbols["PredictorEngine"]()
@@ -178,6 +181,122 @@ class PredictorTests(unittest.TestCase):
         self.assertTrue(engine.register_anomaly(anomaly("next", 63_000_000_000, 150.0), True))
         self.assertEqual(len(engine.anomalies), 2)
         self.assertEqual(engine.mitigator.calls, 2)
+
+    def test_collaborative_score_requires_quorum_and_compatible_models(self):
+        score = score_collaborative_evidence
+        weights = {
+            "severity": 0.25,
+            "corroboration": 0.25,
+            "rate_ratio": 0.13,
+            "persistence": 0.12,
+            "model_reliability": 0.08,
+            "freshness": 0.05,
+            "topology": 0.05,
+            "agreement": 0.07,
+        }
+
+        def evidence(cid, model="model-a", z_score=20.0):
+            return {
+                "cid": cid,
+                "ts_ns": 10_000_000_000,
+                "z_score": z_score,
+                "threshold": 4.0,
+                "observed_bps": 100_000_000.0,
+                "predicted_bps": 1_000_000.0,
+                "persistence_windows": 3,
+                "model_reliability": 1.0,
+                "flow_specificity": 1.0,
+                "model_id": model,
+            }
+
+        kwargs = {
+            "now_ns_value": 10_000_000_000,
+            "expected_domains": 2,
+            "min_domains": 2,
+            "weights": weights,
+            "freshness_s": 12.0,
+            "persistence_windows": 3,
+            "rate_ratio_max": 10.0,
+            "suspect_threshold": 0.4,
+            "alert_threshold": 0.6,
+            "decision_threshold": 0.8,
+        }
+        waiting = score([evidence("domain-0")], **kwargs)
+        self.assertEqual(waiting["decision"], "WAITING_QUORUM")
+        self.assertEqual(waiting["confirming_domains"], ["domain-0"])
+
+        approved = score([evidence("domain-0"), evidence("domain-1", z_score=18.0)],
+                         **kwargs)
+        self.assertEqual(approved["decision"], "MITIGATE")
+        self.assertGreaterEqual(approved["score"], 0.8)
+        self.assertEqual(len(approved["contributions"]), 8)
+
+        mismatch = score([evidence("domain-0"), evidence("domain-1", model="model-b")],
+                         **kwargs)
+        self.assertEqual(mismatch["decision"], "MODEL_MISMATCH")
+
+    def test_collaborative_engine_defers_local_mitigation(self):
+        class FakeMitigator:
+            def __init__(self):
+                self.calls = 0
+
+            def maybe_mitigate(self, anomaly):
+                self.calls += 1
+                return {"attempted": True}
+
+        class FakeCollaboration:
+            def __init__(self, engine):
+                self.submitted = []
+
+            def submit(self, anomaly):
+                self.submitted.append(anomaly["anomaly_id"])
+
+            def snapshot(self):
+                return {"requested": True, "active": True, "decisions": []}
+
+        class FakeEtcd:
+            def put(self, *_args, **_kwargs):
+                return None
+
+        def canonical(anomaly):
+            meta = anomaly.get("meta", {})
+            if anomaly.get("kind") == "THROUGHPUT_SPIKE" and meta.get("type") == "flow":
+                return f"{meta.get('nw_src')}->{meta.get('nw_dst')}"
+            return None
+
+        symbols = load_definitions(
+            "flow_predictor_cnsm.py",
+            {"PredictorEngine"},
+            {
+                "Any": Any, "Dict": Dict, "List": List, "Optional": Optional,
+                "Tuple": Tuple, "OfflineModel": OfflineModel, "deque": deque,
+                "threading": __import__("threading"), "Mitigator": FakeMitigator,
+                "CollaborativeDecisionManager": FakeCollaboration,
+                "canonical_flow_key": canonical, "now_ns": lambda: 1,
+                "EVENT_COOLDOWN_S": 60.0, "CONTROLLER_ID": "domain-0",
+                "_metric": lambda *_args: None, "_etcd": FakeEtcd(),
+                "json": __import__("json"),
+                "COLLABORATION_ENABLED": True,
+            },
+        )
+        engine = symbols["PredictorEngine"]()
+        event = {
+            "anomaly_id": "first",
+            "kind": "THROUGHPUT_SPIKE",
+            "key": "flow:1:10.0.0.1->10.0.0.8",
+            "meta": {"type": "flow", "dpid": 1,
+                     "nw_src": "10.0.0.1", "nw_dst": "10.0.0.8"},
+            "observed_bps": 100_000_000.0,
+            "predicted_bps": 1_000_000.0,
+            "z_score": 20.0,
+            "threshold": 4.0,
+            "ts_detect_ns": 1_000_000_000,
+        }
+        self.assertTrue(engine.register_anomaly(event, mitigable=True))
+        self.assertEqual(engine.mitigator.calls, 0)
+        self.assertEqual(engine.collaboration.submitted, ["first"])
+        self.assertEqual(event["mitigation"]["reason"],
+                         "aguardando decisão colaborativa")
 
 
 class FlowRuleTests(unittest.TestCase):
@@ -221,6 +340,192 @@ class FlowRuleTests(unittest.TestCase):
         self.assertEqual(arp_flow["match"]["dl_type"], 0x0806)
         self.assertLess(ipv4_flow["priority"], 32768)
         self.assertEqual(ipv4_flow["idle_timeout"], 30)
+
+
+class CollectorTests(unittest.TestCase):
+    def test_drop_rule_and_shadowed_forward_rule_are_not_ingested(self):
+        symbols = load_definitions(
+            "flow_predictor_cnsm.py",
+            {"blocked_flow_pairs", "Collector"},
+            {
+                "Any": Any,
+                "Dict": Dict,
+                "List": List,
+                "Optional": Optional,
+                "deque": deque,
+                "threading": __import__("threading"),
+                "time": __import__("time"),
+                "HISTORY_WINDOW": 120,
+                "FLOW_SURGE_WARMUP": 15,
+            },
+        )
+
+        class FakeEngine:
+            def __init__(self):
+                self.ingested = []
+
+            def ingest(self, key, meta, byte_count, timestamp):
+                self.ingested.append((key, byte_count))
+
+        engine = FakeEngine()
+        collector = symbols["Collector"](engine)
+        flow_stats = {
+            "1": [
+                {
+                    "match": {"nw_src": "10.0.0.1", "nw_dst": "10.0.0.8"},
+                    "actions": [],
+                    "byte_count": 200_000_000,
+                },
+                {
+                    "match": {"nw_src": "10.0.0.1", "nw_dst": "10.0.0.8"},
+                    "actions": ["OUTPUT:2"],
+                    "byte_count": 150_000_000,
+                },
+                {
+                    "match": {"nw_src": "10.0.0.2", "nw_dst": "10.0.0.3"},
+                    "actions": ["OUTPUT:3"],
+                    "byte_count": 42,
+                },
+            ]
+        }
+        responses = {
+            "/stats/switches": [1],
+            "/stats/port/1": {"1": []},
+            "/stats/flow/1": flow_stats,
+        }
+        collector._get = responses.get
+        collector._collect_once()
+
+        self.assertEqual(
+            engine.ingested,
+            [("flow:1:10.0.0.2->10.0.0.3", 42)],
+        )
+
+
+class CollaborativeManagerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.namespace = {
+            "Any": Any,
+            "Dict": Dict,
+            "List": List,
+            "Optional": Optional,
+            "Tuple": Tuple,
+            "threading": __import__("threading"),
+            "hashlib": __import__("hashlib"),
+            "json": __import__("json"),
+            "math": math,
+            "CONTROLLER_ID": "domain-0",
+            "COLLAB_WINDOW_S": 4.0,
+            "COLLAB_CLAIM_TTL_S": 60.0,
+            "Z_THRESHOLD": 4.0,
+            "clip01": lambda value: max(0.0, min(1.0, float(value))),
+            "canonical_flow_key": lambda anomaly: (
+                f"{anomaly['meta']['nw_src']}->{anomaly['meta']['nw_dst']}"
+            ),
+            "now_ns": lambda: 10_000_000_000,
+            "_metric": lambda *_args: None,
+        }
+        load_definitions(
+            "flow_predictor_cnsm.py",
+            {"CollaborativeDecisionManager"},
+            cls.namespace,
+        )
+
+    def bare_manager(self):
+        manager = object.__new__(self.namespace["CollaborativeDecisionManager"])
+        manager.engine = type("Engine", (), {
+            "offline_model": None,
+            "detection_mode": "offline",
+        })()
+        manager.lock = __import__("threading").RLock()
+        manager.wake = __import__("threading").Event()
+        manager.local_candidates = {}
+        manager.dirty_flows = set()
+        manager.claims = {}
+        manager.claim_leases = {}
+        manager.claims_won = 0
+        manager.claims_lost = 0
+        return manager
+
+    def test_local_switch_views_are_aggregated_without_summing_rates(self):
+        manager = self.bare_manager()
+
+        def anomaly(dpid, z_score, observed):
+            return {
+                "kind": "THROUGHPUT_SPIKE",
+                "meta": {"type": "flow", "dpid": dpid,
+                         "nw_src": "10.0.0.1", "nw_dst": "10.0.0.8"},
+                "ts_detect_ns": 5_000_000_000,
+                "z_score": z_score,
+                "threshold": 4.0,
+                "observed_bps": observed,
+                "predicted_bps": 1_000_000.0,
+            }
+
+        manager.submit(anomaly(1, 10.0, 80_000_000.0))
+        manager.submit(anomaly(2, 20.0, 100_000_000.0))
+        evidence = manager.local_candidates["10.0.0.1->10.0.0.8"]["evidence"]
+        self.assertEqual(evidence["dpids"], [1, 2])
+        self.assertEqual(evidence["observed_bps"], 100_000_000.0)
+        self.assertEqual(evidence["z_score"], 20.0)
+
+    def test_atomic_claim_has_a_single_winner(self):
+        class Version:
+            def __init__(self, key):
+                self.key = key
+
+            def __eq__(self, value):
+                return ("version", self.key, value)
+
+        class Transactions:
+            @staticmethod
+            def version(key):
+                return Version(key)
+
+            @staticmethod
+            def put(key, value, lease):
+                return ("put", key, value, lease)
+
+        class Lease:
+            id = 123
+
+        class FakeEtcd:
+            transactions = Transactions()
+
+            def __init__(self):
+                self.values = {}
+
+            def lease(self, _ttl):
+                return Lease()
+
+            def transaction(self, compare, success, failure):
+                _, key, expected = compare[0]
+                if (0 if key not in self.values else 1) != expected:
+                    return False, failure
+                _, _, value, _lease = success[0]
+                self.values[key] = value.encode("utf-8")
+                return True, success
+
+            def get(self, key):
+                return self.values.get(key), None
+
+        self.namespace["_etcd"] = FakeEtcd()
+        decision = {
+            "score": 0.95,
+            "confirming_domains": ["domain-0", "domain-1"],
+        }
+        first = self.bare_manager()
+        second = self.bare_manager()
+
+        self.namespace["CONTROLLER_ID"] = "domain-0"
+        first_claim = first._claim_mitigation("10.0.0.1->10.0.0.8", decision)
+        self.namespace["CONTROLLER_ID"] = "domain-1"
+        second_claim = second._claim_mitigation("10.0.0.1->10.0.0.8", decision)
+
+        self.assertTrue(first_claim["won"])
+        self.assertFalse(second_claim["won"])
+        self.assertEqual(second_claim["coordinator"], "domain-0")
 
 
 if __name__ == "__main__":
