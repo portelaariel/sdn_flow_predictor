@@ -8,10 +8,12 @@ dataset SHA-256, input mapping, training counts, Holt parameters, robust
 residual calibration and calibration metrics. The runtime validates that
 contract before starting in offline mode.
 
-Schema version 2 stores independent `spike_z_threshold` and
-`drop_z_threshold` values. The legacy `z_threshold` field remains as a
-compatible spike alias, and the runtime can still load schema version 1
-artifacts by applying their single threshold symmetrically.
+Schema version 3 adds the explicit `runtime.series_priming_samples` contract.
+The first valid observations only align each online Holt level; they never
+recalibrate the offline residual distribution or thresholds. Version 2 added
+independent `spike_z_threshold` and `drop_z_threshold` values. The legacy
+`z_threshold` field remains as a compatible spike alias, and the runtime can
+still load schema versions 1 and 2 with their original one-sample alignment.
 
 Keep an independent `*-validation.json` report beside a model when a
 held-out dataset was evaluated. Validation reports are evidence only and

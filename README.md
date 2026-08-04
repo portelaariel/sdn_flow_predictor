@@ -98,9 +98,10 @@ Os contadores do OpenFlow são **cumulativos**, então o módulo calcula
 taxa por delta: `rate_bps = (Δbytes × 8) / Δt`. Dois casos degenerados
 são tratados explicitamente: delta negativo (contador resetou porque o
 flow foi reinstalado ou o switch reiniciou, comum com os timeouts de
-5s do SimpleSwitch) e Δt ≤ 0 (amostras fora de ordem). Séries abaixo de
-`MIN_RATE_BPS` alimentam o modelo mas não geram alertas, filtrando o
-ruído de ARP/LLDP.
+5s do SimpleSwitch) e Δt ≤ 0 (amostras fora de ordem). Durante o alinhamento
+inicial, taxas abaixo de `MIN_RATE_BPS` são ignoradas para não transformar um
+intervalo parcial em baseline. Depois do alinhamento elas podem atualizar o
+nível, mas não geram alertas, filtrando o ruído de ARP/LLDP.
 
 Regras OpenFlow com `actions=[]` são regras DROP e não representam
 tráfego entregue. Quando um DROP cobre `src->dst`, o coletor exclui todas
@@ -128,17 +129,25 @@ em vez de depender de um número absoluto de bits por segundo. O artefato
 JSON registra o hash do dataset, colunas usadas, contagens, parâmetros e
 métricas de calibração.
 
-No runtime, a primeira taxa de cada fluxo acima do piso de ruído inicializa
-apenas o nível específico daquela série. Intervalos parciais abaixo do piso
-são ignorados. A taxa seguinte já é classificada com a distribuição aprendida
-offline; não há o warmup de 15 amostras. Um ataque detectado não atualiza Holt,
-evitando que um DDoS prolongado seja absorvido como o novo comportamento
-normal.
+No runtime, o artefato declara `series_priming_samples` (atualmente 2). As duas
+primeiras taxas válidas de cada fluxo acima do piso de ruído ajustam apenas o
+nível específico daquela série; elas não recalibram escala nem thresholds.
+Intervalos parciais abaixo do piso são ignorados. A terceira taxa já é
+classificada com a distribuição aprendida offline. Portanto, não há o warmup
+estatístico de 15 amostras do modo adaptativo, apenas um alinhamento de dois
+intervalos. Um ataque detectado não atualiza Holt, evitando que um DDoS
+prolongado seja absorvido como o novo comportamento normal.
 
-O artefato atual usa `schema_version: 2` e mantém `z_threshold` como alias
-compatível do limiar de pico. Artefatos da versão 1 continuam válidos: ao
+Como o detector é baseado em resíduos por série, um ataque que já esteja ativo
+nas duas primeiras observações válidas pode compor esse alinhamento e não ser
+detectado imediatamente. Para experimentos reprodutíveis, inicie o tráfego
+benigno antes do ataque e registre esse intervalo no relatório do benchmark.
+
+O artefato atual usa `schema_version: 3`; além dos thresholds independentes da
+versão 2, ele registra o contrato de alinhamento em `runtime`. `z_threshold`
+permanece como alias compatível do limiar de pico. Artefatos da versão 1 continuam válidos: ao
 carregá-los, o runtime aplica seu único threshold simetricamente aos dois
-lados.
+lados. Artefatos das versões 1 e 2 preservam uma única amostra de alinhamento.
 
 Holt continua adequado ao processamento online por ter custo O(1) e
 capturar nível e tendência. A predição de um passo é sempre feita antes
@@ -416,6 +425,7 @@ Git. Em seguida, treine e avalie:
 python3 train_offline_model.py datasets/cic2019_drddos_udp_train.csv \
   --label-column label \
   --normal-label BENIGN \
+  --series-priming-samples 2 \
   --output models/cic2019-drddos-udp-holt.json
 
 python3 evaluate_offline_model.py \

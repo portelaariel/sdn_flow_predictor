@@ -149,12 +149,45 @@ class PredictorTests(unittest.TestCase):
         self.assertIsNone(series.ingest(1, 10.0))          # 0,8 bps: parcial
         self.assertEqual(series.predictor.n, 0)
         self.assertIsNone(series.ingest(125_001, 11.0))    # primeiro intervalo cheio
-        self.assertIsNone(series.ingest(250_001, 12.0))    # baseline estável
+        self.assertIsNone(series.ingest(250_001, 12.0))    # segundo priming
         self.assertEqual(series.predictor.n, 2)
+        self.assertIsNone(series.ingest(375_001, 13.0))    # baseline já pontuado
+        self.assertEqual(series.predictor.n, 3)
 
-        self.assertIsNone(series.ingest(250_001, 13.0))    # fluxo encerrado
+        self.assertIsNone(series.ingest(375_001, 14.0))    # fluxo encerrado
         self.assertEqual(series.predictor.n, 0)
         self.assertEqual(series.predicted_bps, 0.0)
+
+    def test_two_sample_priming_does_not_flag_first_full_interval(self):
+        model = OfflineModel(
+            alpha=0.9,
+            beta=0.0,
+            transform="log1p",
+            residual_center=0.0,
+            residual_scale=0.4376674,
+            z_threshold=3.75,
+            drop_z_threshold=20.0,
+            created_at="test",
+            series_priming_samples=2,
+        )
+        series = self.symbols["SeriesState"](
+            "flow:1:10.0.0.1->10.0.0.8",
+            {"type": "flow", "dpid": 1,
+             "nw_src": "10.0.0.1", "nw_dst": "10.0.0.8"},
+            model,
+        )
+
+        self.assertIsNone(series.ingest(0, 0.0))
+        self.assertIsNone(series.ingest(16_679, 1.0))       # 133.432 bps
+        self.assertIsNone(series.ingest(147_274, 2.0))      # 1.044.760 bps
+        self.assertEqual(series.predictor.n, 2)
+        self.assertIsNone(series.ingest(277_869, 3.0))      # baseline estabilizado
+
+        samples_before_attack = series.predictor.n
+        anomaly = series.ingest(12_777_869, 4.0)            # 100 Mbit/s
+        self.assertIsNotNone(anomaly)
+        self.assertEqual(anomaly["kind"], "THROUGHPUT_SPIKE")
+        self.assertEqual(series.predictor.n, samples_before_attack)
 
     def test_repeated_anomalies_are_aggregated_during_cooldown(self):
         class FakeMitigator:
@@ -498,6 +531,34 @@ class CollaborativeManagerTests(unittest.TestCase):
         self.assertEqual(evidence["dpids"], [1, 2])
         self.assertEqual(evidence["observed_bps"], 100_000_000.0)
         self.assertEqual(evidence["z_score"], 20.0)
+
+    def test_model_identity_includes_the_priming_contract(self):
+        manager = self.bare_manager()
+
+        def model(priming_samples):
+            return OfflineModel(
+                alpha=0.9,
+                beta=0.0,
+                transform="log1p",
+                residual_center=0.0,
+                residual_scale=0.3,
+                z_threshold=5.0,
+                drop_z_threshold=20.0,
+                created_at="ignored",
+                series_priming_samples=priming_samples,
+                training={
+                    "dataset_sha256": "same-dataset",
+                    "metrics": {"precision": 0.9},
+                },
+            )
+
+        manager.engine.offline_model = model(1)
+        one_sample_id, reliability = manager._model_identity()
+        manager.engine.offline_model = model(2)
+        two_sample_id, _ = manager._model_identity()
+
+        self.assertNotEqual(one_sample_id, two_sample_id)
+        self.assertEqual(reliability, 0.9)
 
     def test_atomic_claim_has_a_single_winner(self):
         class Version:

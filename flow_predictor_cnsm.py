@@ -164,9 +164,10 @@ def _load_runtime_model() -> Tuple[Optional[OfflineModel], Optional[str]]:
         model = load_offline_model(OFFLINE_MODEL_PATH)
         logger.info(
             "Modelo offline carregado: path=%s alpha=%s beta=%s "
-            "spike_threshold=%s drop_threshold=%s",
+            "spike_threshold=%s drop_threshold=%s priming_samples=%s",
             OFFLINE_MODEL_PATH, model.alpha, model.beta,
             model.spike_z_threshold, model.effective_drop_z_threshold,
+            model.series_priming_samples,
         )
         input_config = model.training.get("input", {})
         trained_interval = (input_config.get("sample_interval_s")
@@ -513,6 +514,9 @@ class SeriesState:
         self.predicted_bps: float = 0.0
         self.model_residual: float = 0.0
         self.detection_mode = "offline" if offline_model else "adaptive"
+        self.series_priming_samples = (
+            offline_model.series_priming_samples if offline_model else 0
+        )
         if offline_model:
             self.predictor = HoltPredictor(
                 offline_model.alpha,
@@ -576,10 +580,11 @@ class SeriesState:
             return None
 
         # O threshold e a distribuição dos resíduos continuam inteiramente
-        # offline. A primeira taxa acima do piso apenas alinha o nível Holt da
-        # série; um intervalo inicial parcial abaixo do piso não pode definir
-        # esse nível.
-        if (self.detection_mode == "offline" and self.predictor.n == 0
+        # offline. As observações declaradas pelo artefato apenas alinham o
+        # nível Holt da série; intervalos parciais abaixo do piso não podem
+        # participar desse alinhamento.
+        if (self.detection_mode == "offline"
+                and self.predictor.n < self.series_priming_samples
                 and self.rate_bps < MIN_RATE_BPS):
             self.predicted_bps = 0.0
             self.model_residual = 0.0
@@ -592,7 +597,8 @@ class SeriesState:
                 )
             return None
 
-        if self.detection_mode == "offline" and self.predictor.n == 0:
+        if (self.detection_mode == "offline"
+                and self.predictor.n < self.series_priming_samples):
             self.predicted_bps = self.rate_bps
             self.predictor.update(self.rate_bps)
             self.history.append((ts, self.rate_bps, self.predicted_bps))
@@ -858,8 +864,26 @@ class CollaborativeDecisionManager:
         model = self.engine.offline_model
         if model is None:
             return "adaptive", 0.5
-        model_id = (model.training.get("dataset_sha256")
-                    or f"{model.model_type}:{model.created_at}")
+        # O mesmo dataset pode originar contratos e calibrações diferentes.
+        # A colaboração só combina evidências com todos os parâmetros de
+        # inferência idênticos, sem depender do timestamp de geração.
+        identity = {
+            "dataset_sha256": model.training.get("dataset_sha256"),
+            "schema_version": model.schema_version,
+            "model_type": model.model_type,
+            "alpha": model.alpha,
+            "beta": model.beta,
+            "transform": model.transform,
+            "residual_center": model.residual_center,
+            "residual_scale": model.residual_scale,
+            "spike_z_threshold": model.spike_z_threshold,
+            "drop_z_threshold": model.effective_drop_z_threshold,
+            "series_priming_samples": model.series_priming_samples,
+        }
+        digest = hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:24]
+        model_id = f"{model.model_type}:{digest}"
         metrics = model.training.get("metrics", {})
         try:
             reliability = float(metrics.get("precision", 0.5))

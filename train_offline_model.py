@@ -201,32 +201,44 @@ def _group_observations(observations: Sequence[Observation]) -> Dict[str, List[O
     return grouped
 
 
-def _normal_runs(grouped: Dict[str, List[Observation]]) -> List[List[float]]:
+def _normal_runs(
+    grouped: Dict[str, List[Observation]], priming_samples: int
+) -> List[List[float]]:
     runs: List[List[float]] = []
     for rows in grouped.values():
         current: List[float] = []
         for row in rows:
             if row.is_attack:
-                if len(current) >= 2:
+                if len(current) > priming_samples:
                     runs.append(current)
                 current = []
             else:
                 current.append(row.value_bps)
-        if len(current) >= 2:
+        if len(current) > priming_samples:
             runs.append(current)
     return runs
 
 
 def holt_residuals(
-    values: Sequence[float], alpha: float, beta: float, transform: str
+    values: Sequence[float], alpha: float, beta: float, transform: str,
+    priming_samples: int = 2,
 ) -> List[float]:
-    if len(values) < 2:
+    if len(values) <= priming_samples:
         return []
-    level = transform_value(values[0], transform)
+    level: Optional[float] = None
     trend = 0.0
     residuals: List[float] = []
-    for value in values[1:]:
+    for index, value in enumerate(values):
         transformed = transform_value(value, transform)
+        if index < priming_samples:
+            if level is None:
+                level = transformed
+            else:
+                previous_level = level
+                level = alpha * transformed + (1.0 - alpha) * (level + trend)
+                trend = beta * (level - previous_level) + (1.0 - beta) * trend
+            continue
+        assert level is not None
         prediction = level + trend
         residuals.append(transformed - prediction)
         previous_level = level
@@ -240,6 +252,7 @@ def fit_holt(
     alphas: Sequence[float],
     betas: Sequence[float],
     transform: str,
+    priming_samples: int = 2,
 ) -> Tuple[float, float, float]:
     best: Optional[Tuple[float, float, float]] = None
     for alpha in alphas:
@@ -247,7 +260,9 @@ def fit_holt(
             residuals = [
                 residual
                 for run in runs
-                for residual in holt_residuals(run, alpha, beta, transform)
+                for residual in holt_residuals(
+                    run, alpha, beta, transform, priming_samples
+                )
             ]
             if not residuals:
                 continue
@@ -273,18 +288,24 @@ def robust_center_scale(residuals: Sequence[float], minimum_scale: float) -> Tup
 
 
 def _simulate_residuals(
-    grouped: Dict[str, List[Observation]], alpha: float, beta: float, transform: str
+    grouped: Dict[str, List[Observation]], alpha: float, beta: float, transform: str,
+    priming_samples: int = 2,
 ) -> List[Tuple[float, bool]]:
     scored: List[Tuple[float, bool]] = []
     for rows in grouped.values():
         level: Optional[float] = None
         trend = 0.0
+        primed = 0
         for row in rows:
             transformed = transform_value(row.value_bps, transform)
-            if level is None:
-                # Ataque antes de qualquer baseline não deve inicializar o modelo.
-                if not row.is_attack:
+            if primed < priming_samples:
+                if level is None:
                     level = transformed
+                else:
+                    previous_level = level
+                    level = alpha * transformed + (1.0 - alpha) * (level + trend)
+                    trend = beta * (level - previous_level) + (1.0 - beta) * trend
+                primed += 1
                 continue
             prediction = level + trend
             scored.append((transformed - prediction, row.is_attack))
@@ -414,25 +435,36 @@ def train_model(
     input_config: Dict[str, object],
     explicit_drop_threshold: Optional[float] = None,
     drop_normal_quantile: float = 0.999,
+    series_priming_samples: int = 2,
 ) -> OfflineModel:
+    if (isinstance(series_priming_samples, bool)
+            or not isinstance(series_priming_samples, int)
+            or not 1 <= series_priming_samples <= 20):
+        raise ValueError("series_priming_samples deve estar no intervalo [1, 20]")
     grouped = _group_observations(observations)
     normal_count = sum(1 for row in observations if not row.is_attack)
     attack_count = len(observations) - normal_count
     if normal_count < 20:
         raise ValueError("o treinamento requer ao menos 20 observações normais")
 
-    runs = _normal_runs(grouped)
-    alpha, beta, mse = fit_holt(runs, alphas, betas, transform)
+    runs = _normal_runs(grouped, series_priming_samples)
+    alpha, beta, mse = fit_holt(
+        runs, alphas, betas, transform, series_priming_samples
+    )
     calibration_residuals = [
         residual
         for run in runs
-        for residual in holt_residuals(run, alpha, beta, transform)
+        for residual in holt_residuals(
+            run, alpha, beta, transform, series_priming_samples
+        )
     ]
     if len(calibration_residuals) < 10:
         raise ValueError("o treinamento requer ao menos 10 resíduos normais consecutivos")
     center, scale = robust_center_scale(calibration_residuals, minimum_scale)
 
-    simulated = _simulate_residuals(grouped, alpha, beta, transform)
+    simulated = _simulate_residuals(
+        grouped, alpha, beta, transform, series_priming_samples
+    )
     normalized = [((residual - center) / scale, is_attack)
                   for residual, is_attack in simulated]
     spike_threshold, spike_metrics = choose_threshold(
@@ -449,6 +481,7 @@ def train_model(
         "rows_skipped": metadata.get("rows_skipped", 0),
         "series": len(grouped),
         "normal_runs": len(runs),
+        "series_priming_samples": series_priming_samples,
         "dataset_sha256": metadata.get("dataset_sha256"),
         "source_files": metadata.get("files", []),
         "label_counts": metadata.get("label_counts", {}),
@@ -473,6 +506,7 @@ def train_model(
         created_at=datetime.now(timezone.utc).isoformat(),
         drop_z_threshold=drop_threshold,
         training=training,
+        series_priming_samples=series_priming_samples,
     )
 
 
@@ -492,6 +526,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="coluna temporal; informe vazio para preservar a ordem do CSV")
     parser.add_argument("--sample-interval-s", type=float, default=2.0,
                         help="intervalo temporal já aplicado ao dataset")
+    parser.add_argument("--series-priming-samples", type=int, default=2,
+                        help="observações válidas por série usadas apenas para alinhar Holt")
     parser.add_argument("--label-column", default=None,
                         help="coluna do rótulo; ausente significa dataset somente normal")
     parser.add_argument("--normal-label", action="append", dest="normal_labels",
@@ -559,9 +595,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "label_column": args.label_column,
                 "normal_labels": normal_labels,
                 "drop_normal_quantile": args.drop_normal_quantile,
+                "series_priming_samples": args.series_priming_samples,
             },
             explicit_drop_threshold=args.drop_z_threshold,
             drop_normal_quantile=args.drop_normal_quantile,
+            series_priming_samples=args.series_priming_samples,
         )
         output = Path(args.output).expanduser()
         output.parent.mkdir(parents=True, exist_ok=True)
