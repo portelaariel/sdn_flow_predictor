@@ -28,6 +28,28 @@ class OfflineModelTests(unittest.TestCase):
         model = OfflineModel.from_dict(payload)
         self.assertEqual(model.spike_z_threshold, 4.0)
         self.assertEqual(model.effective_drop_z_threshold, 4.0)
+        self.assertEqual(model.series_priming_samples, 1)
+
+    def test_schema_three_requires_valid_priming_contract(self):
+        payload = {
+            "schema_version": 3,
+            "model_type": "holt_residual",
+            "created_at": "test",
+            "holt": {"alpha": 0.35, "beta": 0.1, "transform": "log1p"},
+            "detector": {
+                "residual_center": 0.0,
+                "residual_scale": 0.1,
+                "z_threshold": 4.0,
+            },
+            "training": {},
+        }
+        with self.assertRaisesRegex(ValueError, "series_priming_samples"):
+            OfflineModel.from_dict(payload)
+
+        payload["runtime"] = {"series_priming_samples": 2}
+        model = OfflineModel.from_dict(payload)
+        self.assertEqual(model.series_priming_samples, 2)
+        self.assertEqual(model.status()["series_priming_samples"], 2)
 
     def test_rejects_invalid_scale(self):
         payload = {
@@ -108,7 +130,8 @@ class OfflineModelTests(unittest.TestCase):
             )
             self.assertGreaterEqual(model.training["metrics"]["recall"], 0.9)
             self.assertGreaterEqual(model.training["metrics"]["precision"], 0.9)
-            self.assertEqual(model.schema_version, 2)
+            self.assertEqual(model.schema_version, 3)
+            self.assertEqual(model.series_priming_samples, 2)
             self.assertIn("THROUGHPUT_DROP", model.training["metrics_by_kind"])
             self.assertGreaterEqual(model.effective_drop_z_threshold, 1.0)
 
@@ -116,6 +139,7 @@ class OfflineModelTests(unittest.TestCase):
             artifact.write_text(json.dumps(model.to_dict()), encoding="utf-8")
             loaded = load_offline_model(str(artifact))
             self.assertEqual(loaded.alpha, model.alpha)
+            self.assertEqual(loaded.series_priming_samples, 2)
             self.assertEqual(loaded.training["dataset_sha256"], metadata["dataset_sha256"])
 
 

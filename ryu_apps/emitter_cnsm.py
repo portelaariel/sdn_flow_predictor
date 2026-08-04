@@ -8,6 +8,19 @@ from ryu.ofproto import ofproto_v1_0
 import os
 
 simpleswitch = os.getenv("SIMPLESWITCH_URL", "http://127.0.0.1:8090/packetin")
+LLDP_INTERVAL_S = float(os.getenv("LLDP_INTERVAL_S", "2.0"))
+
+
+def _arp_source(eth, pkt):
+    """Return the sender advertised by any ARP request or reply."""
+    arp_pkt = pkt.get_protocol(arp.arp)
+    if not arp_pkt:
+        return None
+    mac = getattr(eth, "src", None)
+    ip = getattr(arp_pkt, "src_ip", None)
+    if not mac or not ip or ip == "0.0.0.0":
+        return None
+    return mac, ip
 
 class OfpEmitterLldpHandler(app_manager.RyuApp):
     """Combined OfpEmitter and LldpHandler to propagate events and discover hosts."""
@@ -153,22 +166,23 @@ class OfpEmitterLldpHandler(app_manager.RyuApp):
 
     def _record_host(self, dpid, eth, pkt, port_no):
         """Record the host connected to a specific port on the switch."""
-        arp_pkt = pkt.get_protocol(arp.arp)
-        if arp_pkt and arp_pkt.opcode == arp.ARP_REQUEST:
-            mac = eth.src
-            ip = arp_pkt.src_ip
+        identity = _arp_source(eth, pkt)
+        if not identity:
+            return
+        mac, ip = identity
 
-            if ip not in self.topology["hosts"]:
-                self.topology["hosts"][ip] = {
-                    'dpid': dpid,
-                    'port': port_no,
-                    'cid': self.cid,
-                    'fbid': self.fbid,
-                    'fb_port': self.fb_port,
-                    'mac': mac
-                }
-                # Print whenever a host is discovered
-                print(f"Host {mac} with IP {ip} discovered on switch {dpid}, port {port_no}")
+        if ip not in self.topology["hosts"]:
+            self.topology["hosts"][ip] = {
+                'dpid': dpid,
+                'port': port_no,
+                'cid': self.cid,
+                'fbid': self.fbid,
+                'fb_port': self.fb_port,
+                'mac': mac
+            }
+            # ARP replies are essential: a passive iperf server may never emit
+            # an ARP request of its own, but it still advertises itself here.
+            print(f"Host {mac} with IP {ip} discovered on switch {dpid}, port {port_no}")
 
     def _forward_packet_to_simpleswitch(self, msg, dpid):
         try:
@@ -206,7 +220,7 @@ class OfpEmitterLldpHandler(app_manager.RyuApp):
         while True:
             for dpid, dp in self.datapaths.items():
                 self._send_lldp_packets(dp)
-            hub.sleep(10)  # Send LLDP packets every 10 seconds
+            hub.sleep(LLDP_INTERVAL_S)
 
     def _send_lldp_packets(self, datapath):
         for port_no in datapath.ports:

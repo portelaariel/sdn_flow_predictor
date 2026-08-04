@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 
-SCHEMA_VERSION = 2
-SUPPORTED_SCHEMA_VERSIONS = {1, 2}
+SCHEMA_VERSION = 3
+SUPPORTED_SCHEMA_VERSIONS = {1, 2, 3}
 MODEL_TYPE = "holt_residual"
 SUPPORTED_TRANSFORMS = {"identity", "log1p"}
 
@@ -47,6 +47,20 @@ def _finite_float(value: Any, name: str) -> float:
     return parsed
 
 
+def _bounded_int(value: Any, name: str, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} deve ser inteiro")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} deve ser inteiro") from exc
+    if parsed != value or not minimum <= parsed <= maximum:
+        raise ValueError(
+            f"{name} deve estar no intervalo [{minimum}, {maximum}]"
+        )
+    return parsed
+
+
 @dataclass(frozen=True)
 class OfflineModel:
     """Parâmetros imutáveis carregados por todas as séries online."""
@@ -60,8 +74,17 @@ class OfflineModel:
     created_at: str
     drop_z_threshold: Optional[float] = None
     training: Dict[str, Any] = field(default_factory=dict)
+    series_priming_samples: int = 2
     schema_version: int = SCHEMA_VERSION
     model_type: str = MODEL_TYPE
+
+    def __post_init__(self) -> None:
+        _bounded_int(
+            self.series_priming_samples,
+            "runtime.series_priming_samples",
+            1,
+            20,
+        )
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "OfflineModel":
@@ -116,6 +139,22 @@ class OfflineModel:
         if not isinstance(training, dict):
             raise ValueError("training deve ser um objeto JSON")
 
+        runtime = payload.get("runtime", {})
+        if not isinstance(runtime, dict):
+            raise ValueError("runtime deve ser um objeto JSON")
+        if schema_version >= 3 and "series_priming_samples" not in runtime:
+            raise ValueError(
+                "runtime.series_priming_samples é obrigatório no schema_version 3"
+            )
+        # Artefatos v1/v2 pontuavam a segunda observação da série. Preservar
+        # esse comportamento ao carregá-los evita uma mudança silenciosa.
+        priming_samples = _bounded_int(
+            runtime.get("series_priming_samples", 1),
+            "runtime.series_priming_samples",
+            1,
+            20,
+        )
+
         return cls(
             alpha=alpha,
             beta=beta,
@@ -126,6 +165,7 @@ class OfflineModel:
             created_at=str(payload.get("created_at", "unknown")),
             drop_z_threshold=drop_threshold,
             training=training,
+            series_priming_samples=priming_samples,
             schema_version=int(schema_version),
         )
 
@@ -158,6 +198,9 @@ class OfflineModel:
                 "drop_z_threshold": self.effective_drop_z_threshold,
                 "score": "asymmetric_robust_z",
             },
+            "runtime": {
+                "series_priming_samples": self.series_priming_samples,
+            },
             "training": self.training,
         }
 
@@ -177,6 +220,7 @@ class OfflineModel:
             "z_threshold": self.z_threshold,
             "spike_z_threshold": self.spike_z_threshold,
             "drop_z_threshold": self.effective_drop_z_threshold,
+            "series_priming_samples": self.series_priming_samples,
             "training_rows": self.training.get("rows_total"),
             "training_series": self.training.get("series"),
             "sample_interval_s": (input_config.get("sample_interval_s")

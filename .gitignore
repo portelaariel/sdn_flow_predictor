@@ -12,6 +12,7 @@ mn.log
 prediction_history/
 prediction_history_domain*/
 eMSN_ENV/run_*/
+experiments/results/
 *.pcap
 datasets/
 

@@ -98,9 +98,15 @@ Os contadores do OpenFlow são **cumulativos**, então o módulo calcula
 taxa por delta: `rate_bps = (Δbytes × 8) / Δt`. Dois casos degenerados
 são tratados explicitamente: delta negativo (contador resetou porque o
 flow foi reinstalado ou o switch reiniciou, comum com os timeouts de
-5s do SimpleSwitch) e Δt ≤ 0 (amostras fora de ordem). Séries abaixo de
-`MIN_RATE_BPS` alimentam o modelo mas não geram alertas, filtrando o
-ruído de ARP/LLDP.
+5s do SimpleSwitch) e Δt ≤ 0 (amostras fora de ordem). Durante o alinhamento
+inicial, taxas abaixo de `MIN_RATE_BPS` são ignoradas para não transformar um
+intervalo parcial em baseline. Depois do alinhamento elas podem atualizar o
+nível, mas não geram alertas, filtrando o ruído de ARP/LLDP.
+
+Para séries de fluxo, uma taxa zero isolada é tratada como uma lacuna entre
+rajadas, sem pontuar nem alterar Holt. O nível só é reiniciado após
+`FLOW_IDLE_RESET_SAMPLES` zeros consecutivos (2 por padrão). Isso evita que
+coletores com fases diferentes usem o começo de um ataque como novo baseline.
 
 Regras OpenFlow com `actions=[]` são regras DROP e não representam
 tráfego entregue. Quando um DROP cobre `src->dst`, o coletor exclui todas
@@ -128,16 +134,25 @@ em vez de depender de um número absoluto de bits por segundo. O artefato
 JSON registra o hash do dataset, colunas usadas, contagens, parâmetros e
 métricas de calibração.
 
-No runtime, a primeira taxa de cada fluxo inicializa apenas o nível
-específico daquela série. A taxa seguinte já é classificada com a
-distribuição aprendida offline; não há o warmup de 15 amostras. Um ataque
-detectado não atualiza Holt, evitando que um DDoS prolongado seja
-absorvido como o novo comportamento normal.
+No runtime, o artefato declara `series_priming_samples` (atualmente 2). As duas
+primeiras taxas válidas de cada fluxo acima do piso de ruído ajustam apenas o
+nível específico daquela série; elas não recalibram escala nem thresholds.
+Intervalos parciais abaixo do piso são ignorados. A terceira taxa já é
+classificada com a distribuição aprendida offline. Portanto, não há o warmup
+estatístico de 15 amostras do modo adaptativo, apenas um alinhamento de dois
+intervalos. Um ataque detectado não atualiza Holt, evitando que um DDoS
+prolongado seja absorvido como o novo comportamento normal.
 
-O artefato atual usa `schema_version: 2` e mantém `z_threshold` como alias
-compatível do limiar de pico. Artefatos da versão 1 continuam válidos: ao
+Como o detector é baseado em resíduos por série, um ataque que já esteja ativo
+nas duas primeiras observações válidas pode compor esse alinhamento e não ser
+detectado imediatamente. Para experimentos reprodutíveis, inicie o tráfego
+benigno antes do ataque e registre esse intervalo no relatório do benchmark.
+
+O artefato atual usa `schema_version: 3`; além dos thresholds independentes da
+versão 2, ele registra o contrato de alinhamento em `runtime`. `z_threshold`
+permanece como alias compatível do limiar de pico. Artefatos da versão 1 continuam válidos: ao
 carregá-los, o runtime aplica seu único threshold simetricamente aos dois
-lados.
+lados. Artefatos das versões 1 e 2 preservam uma única amostra de alinhamento.
 
 Holt continua adequado ao processamento online por ter custo O(1) e
 capturar nível e tendência. A predição de um passo é sempre feita antes
@@ -335,9 +350,10 @@ Referências de dimensionamento:
 
 **Flexibilidade de topologia**: nenhum pressuposto sobre número de
 switches, forma da topologia ou esquema de IPs. Novas séries nascem
-quando o primeiro contador aparece; séries de fluxos expirados
-simplesmente param de ser atualizadas. As regras IPv4 do SimpleSwitch
-usam `idle_timeout=30` e permanecem enquanto houver tráfego.
+quando o primeiro contador aparece; taxa zero de um fluxo é tratada como
+término apenas após a tolerância configurada e nunca como anomalia de queda.
+As regras IPv4 do SimpleSwitch usam `idle_timeout=30` e permanecem enquanto
+houver tráfego.
 
 ------------------------------------------------------------------------
 
@@ -415,6 +431,7 @@ Git. Em seguida, treine e avalie:
 python3 train_offline_model.py datasets/cic2019_drddos_udp_train.csv \
   --label-column label \
   --normal-label BENIGN \
+  --series-priming-samples 2 \
   --output models/cic2019-drddos-udp-holt.json
 
 python3 evaluate_offline_model.py \
@@ -606,5 +623,108 @@ requer secrets ou acesso ao servidor do testbed.
 
 ------------------------------------------------------------------------
 
-**Versão**: 1.5 · **Data**: 2026-08-03 · **Status**: thresholds assimétricos,
-deduplicação de eventos e validação independente no CIC-DDoS2019
+## 7. BENCHMARK REPRODUZÍVEL
+
+`scripts/run_collaborative_benchmark.sh` automatiza deploy, topologia,
+tráfego e coleta. Ele encerra qualquer Mininet ativo com `mn -c`, cria a
+topologia configurada, acompanha as APIs a cada 500 ms e desmonta a
+topologia ao final. Por padrão, também reinicia Ryu, ETCD, SimpleSwitch e
+FlowBlocker antes de cada execução. As imagens ativas são reconstruídas antes
+desse bootstrap, garantindo que os containers correspondam ao commit gravado
+nos metadados. O runner elimina estado residual, verifica as conexões OpenFlow,
+força descoberta ARP bidirecional e exige que origem e destino estejam na
+tabela agregada dos domínios antes de gerar o baseline. Portanto, não o execute
+junto a outra experiência ativa. Para reutilizar conscientemente um ambiente
+já validado, defina `BENCHMARK_BOOTSTRAP_ENV=false`.
+
+Há três modos:
+
+| Modo | Colaboração | Mitigação |
+| --- | --- | --- |
+| `local-dry-run` | não | simulada em cada domínio |
+| `collaborative-dry-run` | MCDA + quórum | simulada apenas pelo coordenador |
+| `collaborative-live` | MCDA + quórum | DROP real; exige `--allow-mitigation` |
+
+E dois cenários: `benign`, que mantém UDP estável, e `ddos`, que executa
+um baseline de 1 Mbit/s seguido por um salto de 100 Mbit/s. Uma bateria
+mínima é:
+
+``` bash
+# Controle negativo: não deve chegar a MITIGATE
+bash scripts/run_collaborative_benchmark.sh collaborative-dry-run benign
+
+# Mede duplicação/latência da decisão local
+bash scripts/run_collaborative_benchmark.sh local-dry-run ddos
+
+# Mede consenso e eleição sem alterar o plano de dados
+bash scripts/run_collaborative_benchmark.sh collaborative-dry-run ddos
+
+# Após o claim anterior expirar, valida o DROP real
+bash scripts/run_collaborative_benchmark.sh \
+  collaborative-live ddos --allow-mitigation
+```
+
+Ao reutilizar o ambiente, se ainda existir um claim do mesmo fluxo, o runner
+para antes de limpar a topologia e informa quantos segundos aguardar. Isso
+evita contaminar uma execução com o coordenador da anterior. No bootstrap
+padrão, o ETCD é recriado para cada ensaio. O histórico CSV fica desabilitado
+no benchmark por padrão para economizar armazenamento; use
+`BENCHMARK_EXPORT_HISTORY=true` se as séries também forem necessárias.
+
+Taxas e durações podem ser alteradas sem editar o script:
+
+``` bash
+BENCHMARK_BASELINE_RATE=5M \
+BENCHMARK_ATTACK_RATE=200M \
+BENCHMARK_ATTACK_DURATION_S=30 \
+  bash scripts/run_collaborative_benchmark.sh collaborative-dry-run ddos
+```
+
+Cada execução cria um diretório pequeno em
+`experiments/results/<timestamp>-<modo>-<cenário>/` contendo:
+
+- metadados, hash do modelo e commit Git;
+- JSON do iperf e ping antes/depois;
+- linha do tempo NDJSON de predições do fluxo, anomalias e decisões;
+- snapshots das APIs, flows OVS e logs dos containers;
+- `summary.json` e `summary.md` com score, domínios confirmadores,
+  coordenador, quantidade de domínios que agiram, latências e classificação
+  `TP/TN/FP/FN/CONTAMINATED/INVALID`.
+
+Uma execução sem conexão com os controladores, sem ping mensurável, sem vazão
+do baseline/ataque, sem os dois hosts na tabela de domínios ou com erro nas
+APIs é `INVALID` e faz o runner terminar com status diferente de zero. Em
+`collaborative-live`, uma decisão `MITIGATE` sem confirmação HTTP 200 do
+FlowBlocker também é inválida e conserva o motivo operacional no relatório.
+O DROP pode encerrar o canal de controle do próprio `iperf3` e fazê-lo retornar
+status 1 antes de produzir o JSON final. Nesse modo, o workload registra
+`attack_disrupted`, continua até o ping final e só aceita a interrupção como
+efeito esperado quando a linha do tempo também confirma a execução HTTP 200 e
+o ping observa perda. Assim, ausência de tráfego, interrupção espontânea ou
+falha do DROP nunca é apresentada como sucesso.
+
+Em cenários DDoS, spikes ou decisões de mitigação anteriores ao timestamp do
+ataque classificam o ensaio como `CONTAMINATED`. Anomalias e ações são
+separadas entre baseline e ataque, e a latência de detecção considera apenas
+eventos posteriores ao início do ataque; por construção, ela nunca é negativa.
+Execuções `CONTAMINATED` e `INVALID` são contabilizadas separadamente e não
+entram nos denominadores de precision, recall ou F1.
+
+Compare quaisquer execuções em uma única tabela:
+
+``` bash
+python3 experiments/summarize_benchmark.py \
+  experiments/results/<execução-1> \
+  experiments/results/<execução-2> \
+  experiments/results/<execução-3> \
+  --output experiments/results/comparativo
+```
+
+O comparativo também calcula precision, recall e F1 agregadas. Para que
+essas métricas tenham significado, execute várias repetições de `benign`
+e `ddos` sob as mesmas taxas, durações, topologia, modelo e commit.
+
+------------------------------------------------------------------------
+
+**Versão**: 1.6 · **Data**: 2026-08-04 · **Status**: modelo offline,
+consenso MCDA multi-domínio, claim distribuído e benchmark reproduzível

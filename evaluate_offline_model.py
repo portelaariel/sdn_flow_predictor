@@ -37,19 +37,42 @@ def evaluate(
 
     any_counts = {"tp": 0, "fp": 0, "tn": 0, "fn": 0}
     spike_counts = {"tp": 0, "fp": 0, "tn": 0, "fn": 0}
-    initial_unscored = 0
+    rows_unscored = 0
+    priming_rows_unscored = 0
+    below_floor_rows_unscored = 0
+    attack_rows_unscored = 0
     spike_detections = drop_detections = 0
 
     grouped = _group(observations)
     for rows in grouped.values():
         level: Optional[float] = None
         trend = 0.0
+        primed = 0
         for row in rows:
             transformed = transform_value(row.value_bps, model.transform)
-            if level is None:
-                # Igual ao runtime: a primeira amostra apenas inicializa a série.
-                level = transformed
-                initial_unscored += 1
+            if primed < model.series_priming_samples:
+                # Igual ao runtime: observações subpiso não podem alinhar o
+                # nível; as demais atualizam Holt sem serem classificadas.
+                rows_unscored += 1
+                if row.value_bps < min_rate_bps:
+                    below_floor_rows_unscored += 1
+                    if row.is_attack:
+                        attack_rows_unscored += 1
+                        any_counts["fn"] += 1
+                        spike_counts["fn"] += 1
+                    continue
+                priming_rows_unscored += 1
+                if level is None:
+                    level = transformed
+                else:
+                    previous_level = level
+                    level = model.alpha * transformed + (1.0 - model.alpha) * (level + trend)
+                    trend = model.beta * (level - previous_level) + (1.0 - model.beta) * trend
+                primed += 1
+                if row.is_attack:
+                    attack_rows_unscored += 1
+                    any_counts["fn"] += 1
+                    spike_counts["fn"] += 1
                 continue
 
             prediction = level + trend
@@ -109,8 +132,14 @@ def evaluate(
 
     return {
         "rows_total": len(observations),
-        "rows_scored": len(observations) - initial_unscored,
-        "initial_rows_unscored": initial_unscored,
+        "rows_scored": len(observations) - rows_unscored,
+        "rows_unscored": rows_unscored,
+        # Alias conservado para consumidores dos relatórios v1/v2.
+        "initial_rows_unscored": rows_unscored,
+        "priming_rows_unscored": priming_rows_unscored,
+        "below_floor_rows_unscored": below_floor_rows_unscored,
+        "attack_rows_unscored": attack_rows_unscored,
+        "series_priming_samples": model.series_priming_samples,
         "series": len(grouped),
         "ddos_throughput_spike": classification(spike_counts),
         "all_throughput_anomalies": classification(any_counts),

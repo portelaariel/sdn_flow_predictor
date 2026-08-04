@@ -153,7 +153,11 @@ class CicDdosPreparationTests(unittest.TestCase):
             ddos = metrics["ddos_throughput_spike"]
             self.assertEqual(ddos["true_positives"], 1)
             self.assertEqual(ddos["false_positives"], 0)
-            self.assertEqual(metrics["initial_rows_unscored"], 1)
+            self.assertEqual(metrics["initial_rows_unscored"], 2)
+            self.assertEqual(metrics["priming_rows_unscored"], 2)
+            self.assertEqual(metrics["below_floor_rows_unscored"], 0)
+            self.assertEqual(metrics["attack_rows_unscored"], 0)
+            self.assertEqual(metrics["series_priming_samples"], 2)
 
     def test_held_out_evaluation_uses_independent_drop_threshold(self):
         observations = [

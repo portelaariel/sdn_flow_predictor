@@ -36,6 +36,10 @@ required_files=(
   eMSN_ENV/setup_env.sh
   eMSN_ENV/setup_mininet.py
   deploy_flow_predictor.sh
+  experiments/monitor_predictors.py
+  experiments/run_mininet_workload.py
+  experiments/summarize_benchmark.py
+  scripts/run_collaborative_benchmark.sh
 )
 for path in "${required_files[@]}"; do
   [[ -f "$path" ]] || { echo "missing required file: $path" >&2; exit 1; }
@@ -51,6 +55,7 @@ source config/runtime.env
 [[ "$PREDICTOR_OFFLINE_MODEL_REQUIRED" == "false" ]]
 [[ "$PREDICTOR_ONLINE_MODEL_ADAPTATION" == "false" ]]
 [[ "$PREDICTOR_EVENT_COOLDOWN_S" == "60" ]]
+[[ "$PREDICTOR_FLOW_IDLE_RESET_SAMPLES" == "2" ]]
 [[ "$PREDICTOR_COLLABORATION_ENABLED" == "false" ]]
 [[ -z "$PREDICTOR_COLLAB_EXPECTED_DOMAINS" ]]
 [[ "$PREDICTOR_COLLAB_MIN_DOMAINS" == "2" ]]
@@ -75,7 +80,11 @@ expect_invalid_input bash deploy_flow_predictor.sh 0 true
 expect_invalid_input bash deploy_flow_predictor.sh 2 invalid
 expect_invalid_input env PREDICTOR_COLLABORATION_ENABLED=true \
   PREDICTOR_COLLAB_MIN_DOMAINS=3 bash deploy_flow_predictor.sh 2 true
+expect_invalid_input env PREDICTOR_FLOW_IDLE_RESET_SAMPLES=0 \
+  bash deploy_flow_predictor.sh 2 true
 expect_invalid_input bash eMSN_ENV/setup_env.sh 0 2
+expect_invalid_input bash scripts/run_collaborative_benchmark.sh invalid ddos
+expect_invalid_input bash scripts/run_collaborative_benchmark.sh collaborative-live ddos
 echo "input_validation: ok"
 
 python3 -m unittest discover -s tests -v

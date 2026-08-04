@@ -9,7 +9,8 @@ from mininet.log import setLogLevel
 # - Switch protocol pinned to OpenFlow10 to match ryu ofproto_v1_0
 # - Each domain i uses controller at 192.168.(10+i).10, port (6633+i)
 
-def customTopology(c, s):
+def build_network(c, s):
+    """Build and start the multi-domain topology without opening a CLI."""
     net = Mininet(controller=RemoteController, link=TCLink, switch=OVSSwitch, build=False)
 
     # Controllers
@@ -57,8 +58,17 @@ def customTopology(c, s):
     for sw in switches:
         sw.dpctl('add-flow', 'dl_type=0x88cc,actions=CONTROLLER')
 
-    CLI(net)
-    net.stop()
+    return net
+
+
+def customTopology(c, s):
+    """Launch the topology interactively, preserving the original interface."""
+    net = build_network(c, s)
+
+    try:
+        CLI(net)
+    finally:
+        net.stop()
 
 if __name__ == '__main__':
     setLogLevel('info')
