@@ -12,6 +12,12 @@ from experiments.summarize_benchmark import (
 
 
 class BenchmarkToolTests(unittest.TestCase):
+    @staticmethod
+    def write_iperf(path, bits_per_second):
+        path.write_text(json.dumps({
+            "end": {"sum": {"bits_per_second": bits_per_second}}
+        }), encoding="utf-8")
+
     def test_flow_anomalies_selects_only_requested_pair(self):
         payload = {
             "anomalies": [
@@ -36,10 +42,19 @@ class BenchmarkToolTests(unittest.TestCase):
             (run_dir / "attack_start_ns.txt").write_text(
                 "1000000000\n", encoding="utf-8"
             )
+            (run_dir / "workload_status.json").write_text(
+                json.dumps({"valid": True}), encoding="utf-8"
+            )
+            (run_dir / "ping_before.txt").write_text(
+                "3 packets transmitted, 3 received, 0% packet loss\n",
+                encoding="utf-8",
+            )
             (run_dir / "ping_after.txt").write_text(
                 "5 packets transmitted, 0 received, 100% packet loss\n",
                 encoding="utf-8",
             )
+            self.write_iperf(run_dir / "baseline.json", 1_000_000)
+            self.write_iperf(run_dir / "attack.json", 100_000_000)
             row = {
                 "sampled_ns": 2_100_000_000,
                 "port": "6061",
@@ -77,6 +92,30 @@ class BenchmarkToolTests(unittest.TestCase):
             self.assertEqual(summary["classification"], "TP")
             self.assertEqual(aggregate_metrics([summary])["f1"], 1.0)
             self.assertIn("collaborative-live", markdown_table([summary]))
+
+    def test_missing_traffic_is_invalid_instead_of_true_negative(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "failed-benign"
+            run_dir.mkdir()
+            (run_dir / "metadata.json").write_text(json.dumps({
+                "mode": "collaborative-dry-run",
+                "scenario": "benign",
+                "flow": "10.0.0.1->10.0.0.8",
+            }), encoding="utf-8")
+            (run_dir / "workload_status.json").write_text(json.dumps({
+                "valid": False,
+                "reason": "switches sem conexão OpenFlow",
+            }), encoding="utf-8")
+
+            summary = summarize_run(run_dir)
+            metrics = aggregate_metrics([summary])
+
+            self.assertEqual(summary["classification"], "INVALID")
+            self.assertFalse(summary["measurement_valid"])
+            self.assertIn("switches sem conexão OpenFlow",
+                          summary["invalid_reasons"])
+            self.assertEqual(metrics["INVALID"], 1)
+            self.assertEqual(metrics["TN"], 0)
 
 
 if __name__ == "__main__":

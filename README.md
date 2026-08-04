@@ -611,8 +611,11 @@ requer secrets ou acesso ao servidor do testbed.
 `scripts/run_collaborative_benchmark.sh` automatiza deploy, topologia,
 tráfego e coleta. Ele encerra qualquer Mininet ativo com `mn -c`, cria a
 topologia configurada, acompanha as APIs a cada 500 ms e desmonta a
-topologia ao final. Execute-o a partir da raiz do repositório, com Ryu,
-ETCD, SimpleSwitch e FlowBlocker já disponíveis.
+topologia ao final. Por padrão, também reinicia Ryu, ETCD, SimpleSwitch e
+FlowBlocker antes de cada execução, eliminando estado residual e verificando
+as conexões OpenFlow antes de gerar tráfego. Portanto, não o execute junto a
+outra experiência ativa. Para reutilizar conscientemente um ambiente já
+validado, defina `BENCHMARK_BOOTSTRAP_ENV=false`.
 
 Há três modos:
 
@@ -641,10 +644,11 @@ bash scripts/run_collaborative_benchmark.sh \
   collaborative-live ddos --allow-mitigation
 ```
 
-Se ainda existir um claim do mesmo fluxo, o runner para antes de limpar
-a topologia e informa quantos segundos aguardar. Isso evita contaminar
-uma execução com o coordenador da anterior. O histórico CSV fica
-desabilitado no benchmark por padrão para economizar armazenamento; use
+Ao reutilizar o ambiente, se ainda existir um claim do mesmo fluxo, o runner
+para antes de limpar a topologia e informa quantos segundos aguardar. Isso
+evita contaminar uma execução com o coordenador da anterior. No bootstrap
+padrão, o ETCD é recriado para cada ensaio. O histórico CSV fica desabilitado
+no benchmark por padrão para economizar armazenamento; use
 `BENCHMARK_EXPORT_HISTORY=true` se as séries também forem necessárias.
 
 Taxas e durações podem ser alteradas sem editar o script:
@@ -665,7 +669,12 @@ Cada execução cria um diretório pequeno em
 - snapshots das APIs, flows OVS e logs dos containers;
 - `summary.json` e `summary.md` com score, domínios confirmadores,
   coordenador, quantidade de domínios que agiram, latências e classificação
-  `TP/TN/FP/FN`.
+  `TP/TN/FP/FN/INVALID`.
+
+Uma execução sem conexão com os controladores, sem ping mensurável, sem vazão
+do baseline/ataque ou com erro nas APIs é `INVALID` e faz o runner terminar
+com status diferente de zero. Assim, ausência de tráfego nunca é contabilizada
+como verdadeiro negativo.
 
 Compare quaisquer execuções em uma única tabela:
 

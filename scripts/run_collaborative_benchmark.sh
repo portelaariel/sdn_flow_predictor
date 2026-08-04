@@ -15,9 +15,10 @@ SCENARIO:
   benign                 Vazão UDP estável, sem salto de ataque
   ddos                   Baseline UDP seguido por salto volumétrico (default)
 
-O runner encerra qualquer topologia Mininet ativa com `mn -c`, recria a
-topologia 2x2, reimplanta os FlowPredictors e grava resultados compactos em
-experiments/results/. Configure taxas/durações pelas variáveis BENCHMARK_*.
+O runner encerra qualquer topologia Mininet ativa com `mn -c`, reinicia por
+padrão os containers do ambiente SDN, recria a topologia 2x2, reimplanta os
+FlowPredictors e grava resultados compactos em experiments/results/. Configure
+taxas/durações pelas variáveis BENCHMARK_*.
 EOF
 }
 
@@ -74,6 +75,7 @@ ATTACK_DURATION_S="${BENCHMARK_ATTACK_DURATION_S:-20}"
 SETTLE_S="${BENCHMARK_SETTLE_S:-4}"
 POLL_S="${BENCHMARK_POLL_S:-0.5}"
 BUILD_IMAGE="${BENCHMARK_BUILD_IMAGE:-true}"
+BOOTSTRAP_ENV="${BENCHMARK_BOOTSTRAP_ENV:-true}"
 EXPORT_HISTORY="${BENCHMARK_EXPORT_HISTORY:-false}"
 RESULTS_ROOT="${BENCHMARK_RESULTS_ROOT:-$PROJECT_ROOT/experiments/results}"
 MODEL_PATH="${PREDICTOR_OFFLINE_MODEL:-$PROJECT_ROOT/models/cic2019-drddos-udp-holt.json}"
@@ -91,6 +93,7 @@ for rate in "$BASELINE_RATE" "$ATTACK_RATE"; do
   [[ "$rate" =~ ^[1-9][0-9]*([KMG])?$ ]] || { echo "taxa iperf inválida: $rate" >&2; exit 2; }
 done
 [[ "$BUILD_IMAGE" == "true" || "$BUILD_IMAGE" == "false" ]] || exit 2
+[[ "$BOOTSTRAP_ENV" == "true" || "$BOOTSTRAP_ENV" == "false" ]] || exit 2
 [[ "$EXPORT_HISTORY" == "true" || "$EXPORT_HISTORY" == "false" ]] || exit 2
 [[ -r "$MODEL_PATH" ]] || { echo "modelo offline não encontrado: $MODEL_PATH" >&2; exit 2; }
 
@@ -109,10 +112,11 @@ for command in python3 curl jq sudo git docker mn ovs-ofctl iperf3 sha256sum; do
   command -v "$command" >/dev/null || { echo "comando obrigatório ausente: $command" >&2; exit 2; }
 done
 
-# Um claim da execução anterior impediria uma nova eleição para o mesmo fluxo.
+# Um claim da execução anterior impediria uma nova eleição para o mesmo fluxo
+# quando o ambiente existente é reutilizado. O bootstrap padrão recria o ETCD.
 # Falhar cedo é mais reprodutível do que aguardar silenciosamente ou apagar
 # coordenação que ainda pode pertencer a um experimento ativo.
-if [[ "$COLLABORATION" == "true" ]]; then
+if [[ "$COLLABORATION" == "true" && "$BOOTSTRAP_ENV" == "false" ]]; then
   NOW_NS="$(date +%s%N)"
   MAX_CLAIM_EXPIRY=0
   for ((i=0; i<CSETS; i++)); do
@@ -136,7 +140,6 @@ RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-${MODE}-${SCENARIO}"
 OUTDIR="$RESULTS_ROOT/$RUN_ID"
 mkdir -p "$OUTDIR"
 OUTDIR="$(cd "$OUTDIR" && pwd)"
-COMMANDS_FILE="$(mktemp "${TMPDIR:-/tmp}/flow-benchmark.XXXXXX")"
 STOP_FILE="$OUTDIR/monitor.stop"
 MONITOR_PID=""
 
@@ -145,13 +148,82 @@ cleanup() {
     touch "$STOP_FILE"
     wait "$MONITOR_PID" || true
   fi
-  rm -f "$COMMANDS_FILE"
 }
 trap cleanup EXIT
+
+wait_tcp() {
+  local host="$1" port="$2" tries="${3:-30}"
+  for ((attempt=1; attempt<=tries; attempt++)); do
+    if (echo > /dev/tcp/"$host"/"$port") >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+wait_http() {
+  local url="$1" tries="${2:-30}"
+  for ((attempt=1; attempt<=tries; attempt++)); do
+    if curl -fsS "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
 
 echo "[benchmark] modo=$MODE cenário=$SCENARIO fluxo=$FLOW saída=$OUTDIR"
 echo "[benchmark] limpando topologia Mininet anterior"
 sudo mn -c >/dev/null 2>&1 || true
+
+if [[ "$BOOTSTRAP_ENV" == "true" ]]; then
+  echo "[benchmark] reiniciando ambiente SDN para isolar a execução"
+  RUN_TEST=false RUN_PREDICTOR=false \
+    bash "$PROJECT_ROOT/eMSN_ENV/setup_env.sh" "$CSETS" "$SPER" \
+    2>&1 | tee "$OUTDIR/bootstrap.log"
+else
+  echo "[benchmark] reutilizando ambiente SDN existente"
+fi
+
+echo "[benchmark] validando controladores e serviços por domínio"
+wait_tcp "${ETCD_PREFIX}.11" 2379 30 || {
+  echo "ETCD indisponível em ${ETCD_PREFIX}.11:2379" >&2
+  exit 1
+}
+for ((i=0; i<CSETS; i++)); do
+  subnet=$((SUBNET_BASE + i))
+  controller_ip="192.168.${subnet}.10"
+  controller_port=$((CTRL_OF_PORT_BASE + i))
+  controller_api_port=$((CTRL_API_PORT_BASE + i))
+  switch_http_port=$((SSW_HTTP_PORT_BASE + i))
+  blocker_http_port=$((FB_HTTP_PORT_BASE + i))
+  for service in ryu-core simple-switch flow-blocker; do
+    container="${service}-${i}"
+    running="$(sudo docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)"
+    if [[ "$running" != "true" ]]; then
+      echo "container obrigatório não está ativo: $container" >&2
+      exit 1
+    fi
+  done
+  if ! wait_tcp "$controller_ip" "$controller_port" 30; then
+    sudo docker logs "ryu-core-${i}" > "$OUTDIR/ryu-core-${i}-preflight.log" 2>&1 || true
+    echo "controlador OpenFlow indisponível em ${controller_ip}:${controller_port}" >&2
+    exit 1
+  fi
+  wait_http "http://127.0.0.1:${controller_api_port}/stats/switches" 30 || {
+    echo "API Ryu indisponível na porta ${controller_api_port}" >&2
+    exit 1
+  }
+  wait_http "http://127.0.0.1:${switch_http_port}/" 30 || {
+    echo "SimpleSwitch indisponível na porta ${switch_http_port}" >&2
+    exit 1
+  }
+  wait_http "http://127.0.0.1:${blocker_http_port}/" 30 || {
+    echo "FlowBlocker indisponível na porta ${blocker_http_port}" >&2
+    exit 1
+  }
+done
 
 if [[ "$BUILD_IMAGE" == "true" ]]; then
   echo "[benchmark] construindo $PRED_IMG a partir do commit atual"
@@ -213,7 +285,10 @@ Path(os.environ["RUN_METADATA_PATH"]).write_text(
 )
 PY
 
-MONITOR_DURATION_S=$((BASELINE_DURATION_S + ATTACK_DURATION_S + SETTLE_S + 30))
+# A janela cobre também conexão OpenFlow, descoberta LLDP e as tentativas de
+# conectividade do executor. O stop-file encerra o monitor assim que a carga
+# termina, portanto a margem não aumenta a duração normal do ensaio.
+MONITOR_DURATION_S=$((BASELINE_DURATION_S + ATTACK_DURATION_S + SETTLE_S + 180))
 python3 "$PROJECT_ROOT/experiments/monitor_predictors.py" \
   --endpoints "$ENDPOINTS" \
   --flow "$FLOW" \
@@ -223,31 +298,25 @@ python3 "$PROJECT_ROOT/experiments/monitor_predictors.py" \
   --stop-file "$STOP_FILE" &
 MONITOR_PID=$!
 
-{
-  echo "$DESTINATION_HOST iperf3 -s -D"
-  echo "sh sleep 1"
-  echo "$SOURCE_HOST ping -c 4 $DESTINATION_IP > $OUTDIR/ping_before.txt"
-  echo "sh date +%s%N > $OUTDIR/baseline_start_ns.txt"
-  echo "$SOURCE_HOST iperf3 -c $DESTINATION_IP -u -b $BASELINE_RATE -t $BASELINE_DURATION_S -J > $OUTDIR/baseline.json 2> $OUTDIR/baseline.stderr"
-  echo "sh date +%s%N > $OUTDIR/baseline_end_ns.txt"
-  if [[ "$SCENARIO" == "ddos" ]]; then
-    echo "sh sleep 2"
-    echo "sh date +%s%N > $OUTDIR/attack_start_ns.txt"
-    echo "$SOURCE_HOST iperf3 -c $DESTINATION_IP -u -b $ATTACK_RATE -t $ATTACK_DURATION_S -J > $OUTDIR/attack.json 2> $OUTDIR/attack.stderr"
-    echo "sh date +%s%N > $OUTDIR/attack_end_ns.txt"
-  fi
-  echo "sh sleep $SETTLE_S"
-  echo "$SOURCE_HOST ping -c 5 $DESTINATION_IP > $OUTDIR/ping_after.txt"
-  for ((sw=1; sw<=CSETS * SPER; sw++)); do
-    echo "sh ovs-ofctl -O OpenFlow10 dump-flows s${sw} > $OUTDIR/ovs-flows-s${sw}.txt"
-  done
-  echo "exit"
-} > "$COMMANDS_FILE"
-
 echo "[benchmark] executando topologia e tráfego"
+set +e
 sudo env CSETS="$CSETS" SPER="$SPER" \
-  python3 "$PROJECT_ROOT/eMSN_ENV/setup_mininet.py" \
-  < "$COMMANDS_FILE" > "$OUTDIR/mininet.log" 2>&1
+  python3 "$PROJECT_ROOT/experiments/run_mininet_workload.py" \
+  --csets "$CSETS" \
+  --sper "$SPER" \
+  --source-host "$SOURCE_HOST" \
+  --destination-host "$DESTINATION_HOST" \
+  --destination-ip "$DESTINATION_IP" \
+  --scenario "$SCENARIO" \
+  --baseline-rate "$BASELINE_RATE" \
+  --attack-rate "$ATTACK_RATE" \
+  --baseline-duration-s "$BASELINE_DURATION_S" \
+  --attack-duration-s "$ATTACK_DURATION_S" \
+  --settle-s "$SETTLE_S" \
+  --output "$OUTDIR" \
+  > "$OUTDIR/mininet.log" 2>&1
+WORKLOAD_EXIT=$?
+set -e
 
 touch "$STOP_FILE"
 wait "$MONITOR_PID" || true
@@ -265,5 +334,11 @@ done
 sudo chown -R "$(id -u):$(id -g)" "$OUTDIR" 2>/dev/null || true
 python3 "$PROJECT_ROOT/experiments/summarize_benchmark.py" \
   "$OUTDIR" --output "$OUTDIR/summary"
+
+CLASSIFICATION="$(jq -r '.runs[0].classification // "INVALID"' "$OUTDIR/summary.json")"
+if [[ "$WORKLOAD_EXIT" -ne 0 || "$CLASSIFICATION" == "INVALID" ]]; then
+  echo "[benchmark] execução inválida; consulte $OUTDIR/workload_status.json e mininet.log" >&2
+  exit 1
+fi
 
 echo "[benchmark] concluído: $OUTDIR"

@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -40,14 +41,8 @@ def packet_loss_percent(path: Path) -> Optional[float]:
         text = path.read_text(encoding="utf-8")
     except OSError:
         return None
-    marker = "% packet loss"
-    if marker not in text:
-        return None
-    prefix = text.split(marker, 1)[0].rsplit(",", 1)[-1].strip()
-    try:
-        return float(prefix)
-    except ValueError:
-        return None
+    matches = re.findall(r"([0-9]+(?:\.[0-9]+)?)% packet loss", text)
+    return float(matches[-1]) if matches else None
 
 
 def iperf_bps(path: Path) -> Optional[float]:
@@ -62,6 +57,7 @@ def iperf_bps(path: Path) -> Optional[float]:
 
 def summarize_run(run_dir: Path) -> Dict[str, Any]:
     metadata = read_json(run_dir / "metadata.json", {}) or {}
+    workload = read_json(run_dir / "workload_status.json", {}) or {}
     flow = metadata.get("flow", "")
     detection_ns = None
     decisions = set()
@@ -137,11 +133,30 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
         round((claimed_ns - detection_ns) / 1e6, 3)
         if claimed_ns is not None and detection_ns is not None else None
     )
+    ping_before_loss = packet_loss_percent(run_dir / "ping_before.txt")
+    ping_after_loss = packet_loss_percent(run_dir / "ping_after.txt")
+    baseline_bps = iperf_bps(run_dir / "baseline.json")
+    attack_bps = iperf_bps(run_dir / "attack.json")
     expected_attack = metadata.get("scenario") == "ddos"
     collaborative = str(metadata.get("mode", "")).startswith("collaborative-")
     detected_attack = ("MITIGATE" in decisions if collaborative else bool(seen_spikes))
+    invalid_reasons = []
+    if workload.get("valid") is not True:
+        invalid_reasons.append(workload.get("reason") or "workload não validado")
+    if ping_before_loss is None:
+        invalid_reasons.append("ping inicial sem métrica")
+    if ping_after_loss is None:
+        invalid_reasons.append("ping final sem métrica")
+    if baseline_bps is None:
+        invalid_reasons.append("baseline sem vazão medida")
+    if expected_attack and attack_bps is None:
+        invalid_reasons.append("ataque sem vazão medida")
+    if endpoint_errors:
+        invalid_reasons.append(f"{endpoint_errors} erro(s) nas APIs dos preditores")
+    measurement_valid = not invalid_reasons
     classification = (
-        "TP" if expected_attack and detected_attack
+        "INVALID" if not measurement_valid
+        else "TP" if expected_attack and detected_attack
         else "FN" if expected_attack
         else "FP" if detected_attack
         else "TN"
@@ -162,19 +177,22 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
         "anomalies": len(seen_anomalies),
         "detection_latency_ms": detection_latency_ms,
         "consensus_latency_ms": consensus_latency_ms,
-        "ping_after_loss_percent": packet_loss_percent(run_dir / "ping_after.txt"),
-        "baseline_bps": iperf_bps(run_dir / "baseline.json"),
-        "attack_bps": iperf_bps(run_dir / "attack.json"),
+        "ping_before_loss_percent": ping_before_loss,
+        "ping_after_loss_percent": ping_after_loss,
+        "baseline_bps": baseline_bps,
+        "attack_bps": attack_bps,
         "endpoint_errors": endpoint_errors,
         "expected_attack": expected_attack,
         "detected_attack": detected_attack,
+        "measurement_valid": measurement_valid,
+        "invalid_reasons": invalid_reasons,
         "classification": classification,
     }
 
 
 def aggregate_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     counts = {name: sum(row.get("classification") == name for row in rows)
-              for name in ("TP", "TN", "FP", "FN")}
+              for name in ("TP", "TN", "FP", "FN", "INVALID")}
     precision_denominator = counts["TP"] + counts["FP"]
     recall_denominator = counts["TP"] + counts["FN"]
     precision = (counts["TP"] / precision_denominator
@@ -194,7 +212,7 @@ def markdown_table(rows: List[Dict[str, Any]]) -> str:
     headers = [
         "run", "mode", "scenario", "classe", "decisão", "score", "confirmações",
         "coordenador", "ações", "executada", "detecção ms", "consenso ms",
-        "perda ping %", "erros API",
+        "perda ping %", "erros API", "motivo inválido",
     ]
     lines = ["| " + " | ".join(headers) + " |",
              "| " + " | ".join(["---"] * len(headers)) + " |"]
@@ -207,7 +225,7 @@ def markdown_table(rows: List[Dict[str, Any]]) -> str:
             row.get("coordinator") or "-", len(row.get("action_domains", [])),
             row.get("mitigation_executed"), row.get("detection_latency_ms"),
             row.get("consensus_latency_ms"), row.get("ping_after_loss_percent"),
-            row.get("endpoint_errors"),
+            row.get("endpoint_errors"), "; ".join(row.get("invalid_reasons", [])) or "-",
         ]
         lines.append("| " + " | ".join("-" if value is None else str(value)
                                         for value in values) + " |")
@@ -215,7 +233,8 @@ def markdown_table(rows: List[Dict[str, Any]]) -> str:
     lines.extend([
         "",
         (f"TP={metrics['TP']} TN={metrics['TN']} FP={metrics['FP']} "
-         f"FN={metrics['FN']} precision={metrics['precision']} "
+         f"FN={metrics['FN']} INVALID={metrics['INVALID']} "
+         f"precision={metrics['precision']} "
          f"recall={metrics['recall']} f1={metrics['f1']}"),
     ])
     return "\n".join(lines) + "\n"

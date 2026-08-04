@@ -37,6 +37,7 @@ required_files=(
   eMSN_ENV/setup_mininet.py
   deploy_flow_predictor.sh
   experiments/monitor_predictors.py
+  experiments/run_mininet_workload.py
   experiments/summarize_benchmark.py
   scripts/run_collaborative_benchmark.sh
 )
