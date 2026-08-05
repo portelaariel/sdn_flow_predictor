@@ -3,7 +3,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from experiments.monitor_predictors import flow_anomalies, flow_predictions
+from experiments.monitor_predictors import (
+    flow_anomalies,
+    flow_predictions,
+    retain_new_agentic_events,
+)
 from experiments.run_mininet_workload import domain_table_has_hosts
 from experiments.summarize_benchmark import (
     aggregate_metrics,
@@ -43,6 +47,26 @@ class BenchmarkToolTests(unittest.TestCase):
             prediction_payload, "10.0.0.1->10.0.0.8"
         )
         self.assertEqual([row["key"] for row in predictions], ["wanted"])
+
+    def test_monitor_writes_each_agentic_transition_only_once(self):
+        seen = set()
+        payload = {
+            "decision_events": [
+                {"event_id": "event-2", "decision": "AGREED"},
+                {"event_id": "event-1", "decision": "WAITING_PROPOSALS"},
+            ],
+            "decisions": [{"decision": "AGREED"}],
+        }
+
+        first = retain_new_agentic_events(payload, seen)
+        second = retain_new_agentic_events(payload, seen)
+
+        self.assertEqual(
+            [row["event_id"] for row in first["decision_events"]],
+            ["event-2", "event-1"],
+        )
+        self.assertEqual(second["decision_events"], [])
+        self.assertEqual(second["decisions"], payload["decisions"])
 
     def test_domain_table_requires_both_mitigation_endpoints(self):
         payload = {"hosts": {"10.0.0.1": {"dpid": 1}}}
@@ -232,6 +256,14 @@ class BenchmarkToolTests(unittest.TestCase):
             )
             self.write_iperf(run_dir / "baseline.json", 1_000_000)
             self.write_iperf(run_dir / "attack.json", 100_000_000)
+            (run_dir / "initial-agent-6061.json").write_text(json.dumps({
+                "cid": "domain-1", "waiting_events": 1,
+                "expired_proposals": 0,
+            }), encoding="utf-8")
+            (run_dir / "initial-agent-6060.json").write_text(json.dumps({
+                "cid": "domain-0", "waiting_events": 1,
+                "expired_proposals": 1,
+            }), encoding="utf-8")
             row = {
                 "sampled_ns": 2_100_000_000,
                 "port": "6061",
@@ -259,9 +291,22 @@ class BenchmarkToolTests(unittest.TestCase):
                     "mode": "shadow",
                     "authoritative": False,
                     "cid": "domain-1",
-                    "decisions": [{
+                    "decisions": [],
+                    "waiting_events": 1,
+                    "expired_proposals": 0,
+                    "decision_events": [{
                         "flow": "10.0.0.1->10.0.0.8",
                         "decision": "AGREED",
+                        "event_id": "domain-1:agreement-1",
+                        "evaluated_ns": 2_000_000_000,
+                        "state_entered_ns": 2_000_000_000,
+                        "first_proposal_ns": 1_600_000_000,
+                        "last_proposal_ns": 1_800_000_000,
+                        "required_votes": 2,
+                        "proposals": [
+                            {"cid": "domain-0", "created_ns": 1_600_000_000},
+                            {"cid": "domain-1", "created_ns": 1_800_000_000},
+                        ],
                         "mitigate_votes": ["domain-0", "domain-1"],
                         "legacy_comparison": {
                             "available": True, "matches": True,
@@ -282,6 +327,9 @@ class BenchmarkToolTests(unittest.TestCase):
                     "authoritative": False,
                     "cid": "domain-0",
                     "decisions": [],
+                    "decision_events": [],
+                    "waiting_events": 2,
+                    "expired_proposals": 3,
                 },
             }
             (run_dir / "timeline.ndjson").write_text(
@@ -308,8 +356,36 @@ class BenchmarkToolTests(unittest.TestCase):
                 summary["agentic_mitigate_votes"], ["domain-0", "domain-1"]
             )
             self.assertTrue(summary["agentic_matches_mcda"])
-            self.assertEqual(aggregate_metrics([summary])["f1"], 1.0)
-            self.assertIn("collaborative-live", markdown_table([summary]))
+            self.assertTrue(summary["agentic_agent_agreement"])
+            self.assertEqual(summary["agentic_first_proposal_latency_ms"], 100.0)
+            self.assertEqual(
+                summary["agentic_proposal_collection_latency_ms"], 200.0
+            )
+            self.assertEqual(summary["agentic_deliberation_latency_ms"], 200.0)
+            self.assertEqual(summary["agentic_consensus_latency_ms"], 500.0)
+            self.assertEqual(summary["agentic_required_votes"], 2)
+            self.assertTrue(summary["agentic_quorum_reached"])
+            self.assertEqual(summary["agentic_proposal_timestamps_ns"], {
+                "domain-0": 1_600_000_000,
+                "domain-1": 1_800_000_000,
+            })
+            self.assertEqual(
+                summary["agentic_attack_to_consensus_latency_ms"], 1000.0
+            )
+            self.assertEqual(summary["agentic_waiting_events"], 1)
+            self.assertEqual(summary["agentic_expired_proposals"], 2)
+            metrics = aggregate_metrics([summary])
+            self.assertEqual(metrics["f1"], 1.0)
+            self.assertEqual(metrics["agentic"]["agreed_runs"], 1)
+            self.assertEqual(
+                metrics["agentic"]["agent_to_agent_agreement_rate"], 1.0
+            )
+            self.assertEqual(
+                metrics["agentic"]["agent_to_mcda_agreement_rate"], 1.0
+            )
+            table = markdown_table([summary])
+            self.assertIn("collaborative-live", table)
+            self.assertIn("agentic: AGREED=1/1", table)
 
     def test_live_drop_may_interrupt_iperf_when_execution_and_loss_are_confirmed(self):
         with tempfile.TemporaryDirectory() as tmp:

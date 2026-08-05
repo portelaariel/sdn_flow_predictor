@@ -260,6 +260,15 @@ delegar autoridade operacional. Os logs usam `[METRICS][AGENT_PROPOSAL]` e
 `[METRICS][AGENT_CONSENSUS]`; o estado completo fica em
 `GET /predictor/agent`.
 
+A API também mantém os 200 eventos de transição mais recentes em
+`decision_events`. Cada evento preserva o instante em que o estado foi atingido,
+os horários da primeira e da última proposta relevante e a decomposição entre
+coleta das propostas e deliberação. Esse histórico é limitado em memória e não
+é usado para decidir; sua finalidade é impedir que o benchmark perca estados
+curtos entre duas consultas HTTP. Durante o benchmark, cada `event_id` é escrito
+uma única vez na linha do tempo, evitando replicar o histórico inteiro a cada
+consulta e mantendo baixo o uso de armazenamento.
+
 Nesta fase, o cluster ETCD é parte do perímetro confiável: a checagem entre
 chave e payload evita inconsistência acidental, mas não é autenticação
 criptográfica de um domínio. Uma fase autoritativa futura deve exigir ACL por
@@ -740,6 +749,14 @@ Cada execução cria um diretório pequeno em
   coordenador, quantidade de domínios que agiram, latências e classificação
   `TP/TN/FP/FN/CONTAMINATED/INVALID`.
 
+Quando os agentes shadow estão habilitados, o resumo separa explicitamente a
+latência MCDA da latência agentic. Ele registra detecção→primeira proposta,
+primeira→última proposta, última proposta→`AGREED`, detecção→`AGREED` e
+ataque→`AGREED`. O agregado informa taxas de concordância agente–agente e
+agente–MCDA, além de propostas expiradas e episódios que aguardaram quórum.
+Contadores são calculados em relação ao snapshot inicial, portanto a opção
+`BENCHMARK_BOOTSTRAP_ENV=false` não incorpora execuções anteriores.
+
 Uma execução sem conexão com os controladores, sem ping mensurável, sem vazão
 do baseline/ataque, sem os dois hosts na tabela de domínios ou com erro nas
 APIs é `INVALID` e faz o runner terminar com status diferente de zero. Em
@@ -775,6 +792,6 @@ e `ddos` sob as mesmas taxas, durações, topologia, modelo e commit.
 
 ------------------------------------------------------------------------
 
-**Versão**: 1.7 · **Data**: 2026-08-05 · **Status**: modelo offline,
+**Versão**: 1.8 · **Data**: 2026-08-05 · **Status**: modelo offline,
 consenso MCDA multi-domínio, agentes deliberativos em shadow mode, claim
 distribuído e benchmark reproduzível

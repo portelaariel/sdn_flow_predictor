@@ -38,12 +38,38 @@ def endpoint_port(endpoint: str) -> str:
     return endpoint.rstrip("/").rsplit(":", 1)[-1]
 
 
-def capture_endpoint(endpoint: str, flow: str) -> Dict[str, Any]:
+def retain_new_agentic_events(payload: Dict[str, Any],
+                              seen_event_ids: Optional[set] = None) -> Dict[str, Any]:
+    """Evita repetir todo o histórico agentic em cada linha do NDJSON."""
+    if seen_event_ids is None:
+        return payload
+    compact = dict(payload)
+    fresh = []
+    events = payload.get("decision_events", [])
+    if not isinstance(events, list):
+        events = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_id = event.get("event_id")
+        if event_id is None or str(event_id) not in seen_event_ids:
+            fresh.append(event)
+            if event_id is not None:
+                seen_event_ids.add(str(event_id))
+    compact["decision_events"] = fresh
+    return compact
+
+
+def capture_endpoint(endpoint: str, flow: str,
+                     seen_agent_event_ids: Optional[set] = None) -> Dict[str, Any]:
     sampled_ns = time.time_ns()
     try:
         status = fetch_json(f"{endpoint}/predictor/status")
         collaboration = fetch_json(f"{endpoint}/predictor/collaboration")
-        agentic = fetch_json(f"{endpoint}/predictor/agent")
+        agentic = retain_new_agentic_events(
+            fetch_json(f"{endpoint}/predictor/agent"),
+            seen_agent_event_ids,
+        )
         anomalies = fetch_json(f"{endpoint}/predictor/anomalies?limit=500")
         predictions = fetch_json(f"{endpoint}/predictor/predictions?top=500")
         return {
@@ -96,12 +122,15 @@ def monitor(endpoints: List[str], flow: str, output_dir: Path,
                 )
 
     deadline = time.monotonic() + duration_s
+    seen_agent_events = {endpoint: set() for endpoint in endpoints}
     timeline_path = output_dir / "timeline.ndjson"
     with timeline_path.open("w", encoding="utf-8") as timeline:
         while True:
             for endpoint in endpoints:
                 timeline.write(json.dumps(
-                    capture_endpoint(endpoint, flow),
+                    capture_endpoint(
+                        endpoint, flow, seen_agent_events[endpoint]
+                    ),
                     sort_keys=True,
                     ensure_ascii=False,
                 ) + "\n")
@@ -112,7 +141,7 @@ def monitor(endpoints: List[str], flow: str, output_dir: Path,
 
     for endpoint in endpoints:
         port = endpoint_port(endpoint)
-        final = capture_endpoint(endpoint, flow)
+        final = capture_endpoint(endpoint, flow, seen_agent_events[endpoint])
         write_json(output_dir / f"final-{port}.json", final)
 
 

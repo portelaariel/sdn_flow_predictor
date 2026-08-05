@@ -4,6 +4,7 @@ import math
 import threading
 import types
 import unittest
+from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -63,6 +64,7 @@ class AgenticShadowManagerTests(unittest.TestCase):
             "Optional": Optional,
             "Tuple": Tuple,
             "threading": threading,
+            "deque": deque,
             "json": json,
             "math": math,
             "time": __import__("time"),
@@ -141,6 +143,8 @@ class AgenticShadowManagerTests(unittest.TestCase):
         manager.local_proposals = {}
         manager.dirty_flows = set()
         manager.decisions = {}
+        manager.decision_events = deque(maxlen=200)
+        manager.last_event_key = {}
         manager.last_logged_state = {}
         manager.domain_hosts = {}
         manager.topology_cached_at = 0.0
@@ -150,6 +154,8 @@ class AgenticShadowManagerTests(unittest.TestCase):
         manager.proposals_published = 0
         manager.agreements = 0
         manager.disagreements = 0
+        manager.waiting_events = 0
+        manager.expired_proposals = 0
         manager.started_ns = self.NOW_NS
         return manager
 
@@ -200,6 +206,15 @@ class AgenticShadowManagerTests(unittest.TestCase):
         self.assertFalse(decision["execution"]["attempted"])
         self.assertEqual(len(manager.engine.applied), 1)
         self.assertEqual(manager.engine.applied[0][0], flow)
+        self.assertEqual(len(manager.decision_events), 1)
+        event = manager.decision_events[0]
+        self.assertEqual(event["decision"], "AGREED")
+        self.assertEqual(event["state_entered_ns"], self.NOW_NS)
+        self.assertTrue(event["event_id"].startswith("domain-0:"))
+
+        manager._evaluate_negotiations()
+        self.assertEqual(len(manager.decision_events), 1)
+        self.assertEqual(manager.agreements, 1)
 
     def test_expired_proposal_does_not_delete_new_dirty_evidence(self):
         manager = self.bare_manager()
