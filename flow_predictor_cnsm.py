@@ -45,6 +45,13 @@ ENV (mesmo padrão dos demais serviços):
   COLLAB_EVIDENCE_TTL_S  12
   COLLAB_CLAIM_TTL_S     60
 
+  # Agente deliberativo por domínio (fase inicial sem autoridade):
+  AGENTIC_ENABLED        false
+  AGENTIC_SHADOW         true
+  AGENT_REQUIRED_VOTES   2
+  AGENT_PROPOSAL_TTL_S   12
+  AGENT_NEGOTIATION_WINDOW_S 4
+
   # Persistência do histórico (dataset offline p/ LSTM/GRU, RMSE/MAE, gráficos):
   EXPORT_ENABLED        true|false (default true)
   EXPORT_DIR            prediction_history
@@ -69,12 +76,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from flask import Flask, jsonify, request
 
+from agent_protocol import agent_flow_hash
 from collaborative_decision import (
     canonical_flow_key,
     clip01,
     load_collaboration_weights,
     score_collaborative_evidence,
 )
+from domain_agent import DomainAgent, domain_role
 from offline_model import (
     OfflineModel,
     inverse_transform_value,
@@ -123,6 +132,19 @@ COLLAB_RATE_RATIO_MAX = float(os.environ.get("COLLAB_RATE_RATIO_MAX", "10.0"))
 
 COLLAB_WEIGHTS = load_collaboration_weights(os.environ.get("COLLAB_WEIGHTS_JSON", ""))
 
+# --- Agente deliberativo por domínio (primeira fase: somente shadow mode) ---
+AGENTIC_ENABLED = os.environ.get("AGENTIC_ENABLED", "false").lower() == "true"
+AGENTIC_SHADOW = os.environ.get("AGENTIC_SHADOW", "true").lower() == "true"
+AGENT_REQUIRED_VOTES = int(os.environ.get("AGENT_REQUIRED_VOTES", "2"))
+AGENT_PROPOSAL_TTL_S = float(os.environ.get("AGENT_PROPOSAL_TTL_S", "12.0"))
+AGENT_NEGOTIATION_WINDOW_S = float(
+    os.environ.get("AGENT_NEGOTIATION_WINDOW_S", "4.0")
+)
+AGENT_PROPOSAL_THRESHOLD = float(
+    os.environ.get("AGENT_PROPOSAL_THRESHOLD", "0.65")
+)
+AGENT_TOPOLOGY_CACHE_S = float(os.environ.get("AGENT_TOPOLOGY_CACHE_S", "5.0"))
+
 if not math.isfinite(EVENT_COOLDOWN_S) or EVENT_COOLDOWN_S < 0.0:
     raise ValueError("ANOMALY_EVENT_COOLDOWN_S deve ser não negativo e finito")
 if FLOW_IDLE_RESET_SAMPLES < 1:
@@ -144,6 +166,23 @@ if not (0.0 <= COLLAB_SUSPECT_THRESHOLD <= COLLAB_ALERT_THRESHOLD
     raise ValueError("thresholds MCDA devem ser ordenados dentro de [0, 1]")
 if not math.isfinite(COLLAB_RATE_RATIO_MAX) or COLLAB_RATE_RATIO_MAX <= 1.0:
     raise ValueError("COLLAB_RATE_RATIO_MAX deve ser finito e maior que um")
+if (not math.isfinite(AGENT_PROPOSAL_TTL_S) or AGENT_PROPOSAL_TTL_S <= 0.0
+        or not math.isfinite(AGENT_NEGOTIATION_WINDOW_S)
+        or AGENT_NEGOTIATION_WINDOW_S <= 0.0
+        or AGENT_PROPOSAL_TTL_S < AGENT_NEGOTIATION_WINDOW_S
+        or not math.isfinite(AGENT_TOPOLOGY_CACHE_S)
+        or AGENT_TOPOLOGY_CACHE_S <= 0.0):
+    raise ValueError("janelas/TTLs do agente são inválidos")
+if not 0.0 <= AGENT_PROPOSAL_THRESHOLD <= 1.0:
+    raise ValueError("AGENT_PROPOSAL_THRESHOLD deve estar em [0, 1]")
+if AGENT_REQUIRED_VOTES < 1:
+    raise ValueError("AGENT_REQUIRED_VOTES deve ser positivo")
+if AGENTIC_ENABLED and not COLLABORATION_ENABLED:
+    raise ValueError("AGENTIC_ENABLED requer COLLABORATION_ENABLED=true")
+if AGENTIC_ENABLED and AGENT_REQUIRED_VOTES > COLLAB_EXPECTED_DOMAINS:
+    raise ValueError("AGENT_REQUIRED_VOTES não pode exceder os domínios esperados")
+if AGENTIC_ENABLED and not AGENTIC_SHADOW:
+    raise ValueError("a fase agentic atual suporta somente AGENTIC_SHADOW=true")
 
 # --- Persistência do histórico de predição (aditivo; não afeta a lógica online) ---
 EXPORT_ENABLED     = os.environ.get("EXPORT_ENABLED", "true").lower() == "true"
@@ -838,6 +877,406 @@ class Mitigator:
         return result
 
 
+class AgenticShadowManager:
+    """Executa um agente deliberativo por domínio sem autoridade de mitigação.
+
+    A entrada é exatamente a evidência local já agregada pelo caminho MCDA. O
+    agente publica uma proposta efêmera no ETCD, lê propostas dos pares e
+    registra se haveria concordância. Nenhum método desta classe chama o
+    FlowBlocker ou disputa o claim de mitigação.
+    """
+
+    def __init__(self, engine: Any):
+        self.engine = engine
+        self.agent = DomainAgent(
+            CONTROLLER_ID,
+            proposal_threshold=AGENT_PROPOSAL_THRESHOLD,
+            persistence_windows=COLLAB_PERSISTENCE_WINDOWS,
+            rate_ratio_max=COLLAB_RATE_RATIO_MAX,
+            proposal_ttl_s=AGENT_PROPOSAL_TTL_S,
+            required_votes=AGENT_REQUIRED_VOTES,
+            negotiation_window_s=AGENT_NEGOTIATION_WINDOW_S,
+        )
+        self.lock = threading.RLock()
+        self.wake = threading.Event()
+        self.local_evidence: Dict[str, Dict[str, Any]] = {}
+        self.local_proposals: Dict[str, Dict[str, Any]] = {}
+        self.dirty_flows = set()
+        self.decisions: Dict[str, Dict[str, Any]] = {}
+        self.last_logged_state: Dict[str, str] = {}
+        self.domain_hosts: Dict[str, Dict[str, Any]] = {}
+        self.topology_cached_at = 0.0
+        self.topology_retry_at: Dict[str, float] = {}
+        self.errors = 0
+        self.topology_errors = 0
+        self.proposals_published = 0
+        self.agreements = 0
+        self.disagreements = 0
+        self.started_ns = now_ns()
+        self.thread = threading.Thread(
+            target=self._run,
+            name=f"domain-agent-shadow-{CONTROLLER_ID}",
+            daemon=True,
+        )
+        self.thread.start()
+
+    def submit_evidence(self, evidence: Dict[str, Any]) -> bool:
+        flow = str(evidence.get("flow", ""))
+        if "->" not in flow:
+            return False
+        # A cópia JSON também garante que apenas tipos serializáveis cruzem a
+        # fronteira entre o detector e o agente.
+        row = json.loads(json.dumps(evidence, sort_keys=True))
+        submission_ns = now_ns()
+        forget_previous = False
+        with self.lock:
+            previous = self.local_evidence.get(flow)
+            if previous is not None:
+                old_window = int(previous.get("window_id", -1))
+                new_window = int(row.get("window_id", -1))
+                if new_window < old_window:
+                    return False
+                if (new_window == old_window
+                        and float(row.get("z_score", 0.0))
+                        < float(previous.get("z_score", 0.0))):
+                    return False
+            previous_proposal = self.local_proposals.get(flow)
+            if (previous_proposal is not None
+                    and (int(previous_proposal.get("expires_ns", 0)) <= submission_ns
+                         or int(previous_proposal.get("observation_ns", 0))
+                         + int(AGENT_PROPOSAL_TTL_S * 1e9) <= submission_ns)):
+                self.local_proposals.pop(flow, None)
+                self.decisions.pop(flow, None)
+                self.last_logged_state.pop(flow, None)
+                self.topology_retry_at.pop(flow, None)
+                forget_previous = True
+            self.local_evidence[flow] = row
+            self.dirty_flows.add(flow)
+            self.topology_retry_at.pop(flow, None)
+        if forget_previous:
+            self.agent.forget(flow)
+        self.wake.set()
+        return True
+
+    def _run(self):
+        while True:
+            self.wake.wait(COLLAB_EVALUATION_INTERVAL_S)
+            self.wake.clear()
+            try:
+                self._publish_dirty_proposals()
+                self._evaluate_negotiations()
+            except Exception as exc:  # agente precisa sobreviver a falhas transitórias
+                self.record_error("ciclo agentic", exc)
+
+    def record_error(self, context: str, exc: Exception) -> None:
+        """Registra falha observacional sem propagá-la ao caminho MCDA."""
+        with self.lock:
+            self.errors += 1
+        logger.error("Falha no agente shadow de %s (%s): %s",
+                     CONTROLLER_ID, context, exc)
+
+    def _load_domain_hosts(self) -> Dict[str, Dict[str, Any]]:
+        monotonic_now = time.monotonic()
+        with self.lock:
+            if (self.topology_cached_at > 0.0
+                    and monotonic_now - self.topology_cached_at < AGENT_TOPOLOGY_CACHE_S):
+                return dict(self.domain_hosts)
+        url = f"{FLOWBLOCKER_URL}/flowblocker/domain_table"
+        try:
+            response = requests.get(url, timeout=min(REQUEST_TIMEOUT_S, 2.0))
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("domain_table deve ser um objeto JSON")
+            hosts = payload.get("hosts", {})
+            if not isinstance(hosts, dict):
+                raise ValueError("domain_table sem objeto hosts")
+            normalized = {
+                str(ip): dict(row) for ip, row in hosts.items()
+                if isinstance(row, dict)
+            }
+            with self.lock:
+                self.domain_hosts = normalized
+                self.topology_cached_at = monotonic_now
+            return dict(normalized)
+        except (requests.exceptions.RequestException, ValueError) as exc:
+            self.topology_errors += 1
+            with self.lock:
+                self.domain_hosts = {}
+                self.topology_cached_at = monotonic_now
+            logger.warning("Agente não resolveu a topologia em %s: %s", url, exc)
+            # Um cache vencido não pode atribuir papéis SOURCE/DESTINATION: em
+            # caso de mobilidade ou remapeamento isso autorizaria uma crença
+            # usando topologia obsoleta. Falha fechada como UNKNOWN/WAIT.
+            return {}
+
+    def _topology_context(
+        self, evidence: Dict[str, Any]
+    ) -> Tuple[str, List[str], Optional[str], Optional[str]]:
+        hosts = self._load_domain_hosts()
+        source = hosts.get(str(evidence.get("src_ip", "")), {})
+        destination = hosts.get(str(evidence.get("dst_ip", "")), {})
+        source_cid = source.get("cid") if isinstance(source, dict) else None
+        destination_cid = (destination.get("cid")
+                           if isinstance(destination, dict) else None)
+        normalized_source = None if source_cid is None else str(source_cid)
+        normalized_destination = (
+            None if destination_cid is None else str(destination_cid)
+        )
+        role, relevant = domain_role(
+            CONTROLLER_ID,
+            normalized_source,
+            normalized_destination,
+        )
+        return role, relevant, normalized_source, normalized_destination
+
+    def _publish_dirty_proposals(self):
+        monotonic_now = time.monotonic()
+        current_ns = now_ns()
+        forgotten_flows = []
+        with self.lock:
+            for flow, evidence in list(self.local_evidence.items()):
+                observation_ns = int(evidence.get("ts_ns", 0))
+                if (observation_ns <= 0
+                        or observation_ns + int(AGENT_PROPOSAL_TTL_S * 1e9)
+                        <= current_ns):
+                    self.local_evidence.pop(flow, None)
+                    self.local_proposals.pop(flow, None)
+                    self.dirty_flows.discard(flow)
+                    self.topology_retry_at.pop(flow, None)
+                    self.decisions.pop(flow, None)
+                    self.last_logged_state.pop(flow, None)
+                    forgotten_flows.append(flow)
+            for flow, retry_at in list(self.topology_retry_at.items()):
+                evidence = self.local_evidence.get(flow)
+                observation_ns = int((evidence or {}).get("ts_ns", 0))
+                evidence_valid = (
+                    evidence is not None
+                    and observation_ns + int(AGENT_PROPOSAL_TTL_S * 1e9) > current_ns
+                )
+                if not evidence_valid:
+                    self.topology_retry_at.pop(flow, None)
+                elif retry_at <= monotonic_now:
+                    self.dirty_flows.add(flow)
+                    self.topology_retry_at.pop(flow, None)
+            flows = list(self.dirty_flows)
+            self.dirty_flows.clear()
+            evidence_rows = [
+                (flow, dict(self.local_evidence[flow]))
+                for flow in flows if flow in self.local_evidence
+            ]
+        for flow in forgotten_flows:
+            self.agent.forget(flow)
+        for index, (flow, evidence) in enumerate(evidence_rows):
+            try:
+                (role, relevant_domains, source_cid,
+                 destination_cid) = self._topology_context(evidence)
+                veto_reason = None
+                if (evidence.get("src_ip") in WHITELIST_IPS
+                        or evidence.get("dst_ip") in WHITELIST_IPS):
+                    veto_reason = "origem ou destino pertence à whitelist"
+                proposal = self.agent.build_proposal(
+                    evidence,
+                    role=role,
+                    relevant_domains=relevant_domains,
+                    source_cid=source_cid,
+                    destination_cid=destination_cid,
+                    created_ns=now_ns(),
+                    veto_reason=veto_reason,
+                )
+                lease = _etcd.lease(max(1, int(math.ceil(AGENT_PROPOSAL_TTL_S))))
+                key = (f"flowpredictor/agent-proposal/{agent_flow_hash(flow)}/"
+                       f"{proposal['window_id']}/{CONTROLLER_ID}")
+                _etcd.put(key, json.dumps(proposal, sort_keys=True), lease=lease)
+                with self.lock:
+                    self.local_proposals[flow] = proposal
+                    current = self.local_evidence.get(flow)
+                    same_evidence = (
+                        current is not None
+                        and int(current.get("window_id", -1))
+                        == int(evidence.get("window_id", -2))
+                    )
+                    if role == "UNKNOWN" and same_evidence:
+                        self.topology_retry_at[flow] = (
+                            time.monotonic() + AGENT_TOPOLOGY_CACHE_S
+                        )
+                    elif role != "UNKNOWN":
+                        self.topology_retry_at.pop(flow, None)
+                self.proposals_published += 1
+                _metric(
+                    "AGENT_PROPOSAL",
+                    f"agent={self.agent.agent_id} flow={flow} role={role} "
+                    f"proposal={proposal['proposal']} confidence={proposal['confidence']:.3f}",
+                )
+            except Exception:
+                with self.lock:
+                    self.dirty_flows.update(row[0] for row in evidence_rows[index:])
+                raise
+
+    def _read_proposals(self, flow: str) -> List[Dict[str, Any]]:
+        prefix = f"flowpredictor/agent-proposal/{agent_flow_hash(flow)}/"
+        rows = []
+        for raw, metadata in _etcd.get_prefix(prefix):
+            try:
+                item = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+                key_raw = getattr(metadata, "key")
+                key = (key_raw.decode("utf-8")
+                       if isinstance(key_raw, bytes) else str(key_raw))
+                if not key.startswith(prefix):
+                    raise ValueError("prefixo ETCD inesperado")
+                key_parts = key[len(prefix):].split("/")
+                if len(key_parts) != 2:
+                    raise ValueError("chave ETCD agentic inválida")
+                key_window, key_cid = key_parts
+                if (item.get("flow") != flow
+                        or int(item.get("window_id", -1)) != int(key_window)
+                        or str(item.get("cid", "")) != key_cid):
+                    raise ValueError("chave ETCD diverge do payload agentic")
+                rows.append(item)
+            except (AttributeError, TypeError, UnicodeError, ValueError):
+                logger.warning("Proposta agentic inválida sob %s", prefix)
+        return rows
+
+    def _legacy_comparison(self, flow: str,
+                           agent_decision: Dict[str, Any]) -> Dict[str, Any]:
+        collaboration = getattr(self.engine, "collaboration", None)
+        if collaboration is None:
+            return {"available": False, "matches": None}
+        with collaboration.lock:
+            legacy = collaboration.decisions.get(flow)
+            legacy_copy = None if legacy is None else {
+                "decision": legacy.get("decision"),
+                "score": legacy.get("score"),
+                "confirming_domains": list(legacy.get("confirming_domains", [])),
+                "evaluated_ns": legacy.get("evaluated_ns"),
+                "window_ids": list(legacy.get("window_ids", [])),
+            }
+        if legacy_copy is None:
+            return {"available": False, "matches": None}
+        agent_windows = {
+            int(value) for value in agent_decision.get("window_ids", [])
+        }
+        legacy_windows = {
+            int(value) for value in legacy_copy.get("window_ids", [])
+        }
+        if not agent_windows or not legacy_windows or not (agent_windows & legacy_windows):
+            return {
+                "available": False,
+                "matches": None,
+                "reason": "decisão MCDA pertence a outro episódio",
+                "mcda": legacy_copy,
+            }
+        matches = ((agent_decision.get("decision") == "AGREED")
+                   == (legacy_copy["decision"] == "MITIGATE"))
+        return {"available": True, "matches": matches, "mcda": legacy_copy}
+
+    def _evaluate_negotiations(self):
+        current_ns = now_ns()
+        with self.lock:
+            stale = [
+                flow for flow, proposal in self.local_proposals.items()
+                if (int(proposal.get("expires_ns", 0)) <= current_ns
+                    or int(proposal.get("observation_ns", 0))
+                    + int(AGENT_PROPOSAL_TTL_S * 1e9) <= current_ns)
+            ]
+            for flow in stale:
+                expired = self.local_proposals.pop(flow, None) or {}
+                evidence = self.local_evidence.get(flow)
+                has_new_evidence = (
+                    evidence is not None
+                    and (flow in self.dirty_flows
+                         or int(evidence.get("window_id", -1))
+                         > int(expired.get("window_id", -1)))
+                )
+                if has_new_evidence:
+                    # submit_evidence pode ter chegado entre a publicação e a
+                    # limpeza. Mantém a observação nova para o próximo ciclo.
+                    self.dirty_flows.add(flow)
+                    self.decisions.pop(flow, None)
+                    self.last_logged_state.pop(flow, None)
+                    self.agent.forget(flow)
+                else:
+                    self.local_evidence.pop(flow, None)
+                    self.dirty_flows.discard(flow)
+                    self.topology_retry_at.pop(flow, None)
+                    self.decisions.pop(flow, None)
+                    self.last_logged_state.pop(flow, None)
+                    self.agent.forget(flow)
+            flows = list(self.local_proposals)
+
+        for flow in flows:
+            decision = self.agent.decide(
+                self._read_proposals(flow), flow=flow, now_ns_value=now_ns()
+            )
+            decision.update({
+                "mode": "shadow",
+                "authoritative": False,
+                "execution": {
+                    "attempted": False,
+                    "executed": False,
+                    "reason": "shadow mode: decisão agentic não controla o FlowBlocker",
+                },
+            })
+            decision["legacy_comparison"] = self._legacy_comparison(flow, decision)
+            with self.lock:
+                previous = self.last_logged_state.get(flow)
+                self.decisions[flow] = decision
+                if previous != decision["decision"]:
+                    self.last_logged_state[flow] = decision["decision"]
+                    if decision["decision"] == "AGREED":
+                        self.agreements += 1
+                    elif decision["decision"] in {"DISAGREED", "VETOED"}:
+                        self.disagreements += 1
+                    _metric(
+                        "AGENT_CONSENSUS",
+                        f"flow={flow} decision={decision['decision']} "
+                        f"votes={decision['mitigate_votes']} "
+                        f"relevant={decision['relevant_domains']} shadow=true",
+                    )
+            self.engine.apply_agentic_decision(flow, decision)
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self.lock:
+            decisions = sorted(
+                self.decisions.values(),
+                key=lambda row: int(row.get("evaluated_ns", 0)),
+                reverse=True,
+            )[:50]
+            proposals = sorted(
+                self.local_proposals.values(),
+                key=lambda row: int(row.get("created_ns", 0)),
+                reverse=True,
+            )[:50]
+            return {
+                "requested": AGENTIC_ENABLED,
+                "active": True,
+                "mode": "shadow",
+                "authoritative": False,
+                "agent_id": self.agent.agent_id,
+                "cid": CONTROLLER_ID,
+                "uptime_s": round((now_ns() - self.started_ns) / 1e9, 1),
+                "local_evidence": len(self.local_evidence),
+                "proposals_published": self.proposals_published,
+                "agreements": self.agreements,
+                "disagreements": self.disagreements,
+                "errors": self.errors,
+                "topology_errors": self.topology_errors,
+                "topology_retries_pending": len(self.topology_retry_at),
+                "config": {
+                    "required_votes": AGENT_REQUIRED_VOTES,
+                    "consensus_policy": "quorum_after_all_relevant_agents_report",
+                    "proposal_threshold": AGENT_PROPOSAL_THRESHOLD,
+                    "proposal_ttl_s": AGENT_PROPOSAL_TTL_S,
+                    "negotiation_window_s": AGENT_NEGOTIATION_WINDOW_S,
+                    "topology_cache_s": AGENT_TOPOLOGY_CACHE_S,
+                    "weights": self.agent.weights,
+                },
+                "states": self.agent.snapshot_states(),
+                "proposals": proposals,
+                "decisions": decisions,
+            }
+
+
 class CollaborativeDecisionManager:
     """Publica evidências compactas e coordena uma decisão MCDA via ETCD.
 
@@ -962,7 +1401,22 @@ class CollaborativeDecisionManager:
                     evidence["observed_bps"] = float(anomaly.get("observed_bps", 0.0))
                     evidence["predicted_bps"] = float(anomaly.get("predicted_bps", 0.0))
             self.dirty_flows.add(flow)
+            agent_evidence = dict(evidence)
+            agent_evidence["dpids"] = list(evidence.get("dpids", []))
+        # O MCDA é autoritativo nesta fase. Acorde seu worker antes de chamar o
+        # componente shadow e nunca deixe uma falha observacional interromper
+        # detecção, consenso ou coleta.
         self.wake.set()
+        agentic = getattr(self.engine, "agentic", None)
+        if agentic is not None:
+            try:
+                agentic.submit_evidence(agent_evidence)
+            except Exception as exc:
+                recorder = getattr(agentic, "record_error", None)
+                if callable(recorder):
+                    recorder("submissão de evidência", exc)
+                else:
+                    logger.error("Falha isolada na submissão agentic: %s", exc)
         return True
 
     def _run(self):
@@ -1191,8 +1645,14 @@ class PredictorEngine:
         self.started_ns = now_ns()
         self.collaboration = (CollaborativeDecisionManager(self)
                               if COLLABORATION_ENABLED and _etcd is not None else None)
+        self.agentic = (AgenticShadowManager(self)
+                        if (AGENTIC_ENABLED and AGENTIC_SHADOW
+                            and self.collaboration is not None)
+                        else None)
         if COLLABORATION_ENABLED and self.collaboration is None:
             logger.error("Colaboração solicitada sem ETCD; mantendo decisão local como fallback")
+        if AGENTIC_ENABLED and self.agentic is None:
+            logger.error("Agente solicitado sem colaboração/ETCD; shadow mode indisponível")
 
     # ---- ingestão (chamada pelo Collector) ----
     def ingest(self, key: str, meta: Dict[str, Any], byte_count: int, ts: float):
@@ -1329,6 +1789,33 @@ class PredictorEngine:
                     if "mitigation" in decision:
                         item["mitigation"] = decision["mitigation"]
 
+    def apply_agentic_decision(self, flow: str,
+                               decision: Dict[str, Any]) -> None:
+        """Anexa a decisão shadow ao evento sem alterar sua mitigação."""
+        decision_windows = {
+            int(value) for value in decision.get("window_ids", [])
+        }
+        if not decision_windows:
+            return
+        window_ns = max(1, int(COLLAB_WINDOW_S * 1e9))
+        with self.lock:
+            for item in self.anomalies:
+                event_start_ns = int(
+                    item.get("first_seen_ns", item.get("ts_detect_ns", 0))
+                )
+                event_end_ns = int(
+                    item.get("last_seen_ns", item.get("ts_detect_ns", 0))
+                )
+                first_window = event_start_ns // window_ns
+                last_window = event_end_ns // window_ns
+                same_episode = any(
+                    first_window <= value <= last_window
+                    for value in decision_windows
+                )
+                if (canonical_flow_key(item) == flow
+                        and same_episode):
+                    item["agentic_shadow"] = decision
+
     def collaboration_snapshot(self) -> Dict[str, Any]:
         if self.collaboration is not None:
             return self.collaboration.snapshot()
@@ -1338,6 +1825,28 @@ class PredictorEngine:
             "reason": ("desativada por configuração" if not COLLABORATION_ENABLED
                        else "ETCD indisponível; decisão local ativa"),
             "cid": CONTROLLER_ID,
+            "decisions": [],
+        }
+
+    def agentic_snapshot(self) -> Dict[str, Any]:
+        if self.agentic is not None:
+            return self.agentic.snapshot()
+        if not AGENTIC_ENABLED:
+            reason = "desativado por configuração"
+        elif _etcd is None:
+            reason = "ETCD indisponível"
+        elif not COLLABORATION_ENABLED:
+            reason = "colaboração MCDA desativada"
+        else:
+            reason = "agente indisponível"
+        return {
+            "requested": AGENTIC_ENABLED,
+            "active": False,
+            "mode": "shadow" if AGENTIC_SHADOW else "unsupported",
+            "authoritative": False,
+            "cid": CONTROLLER_ID,
+            "reason": reason,
+            "proposals": [],
             "decisions": [],
         }
 
@@ -1413,6 +1922,11 @@ class PredictorEngine:
                     "requested": COLLABORATION_ENABLED,
                     "active": self.collaboration is not None,
                 },
+                "agentic": {
+                    "requested": AGENTIC_ENABLED,
+                    "active": self.agentic is not None,
+                    "mode": "shadow" if AGENTIC_SHADOW else "unsupported",
+                },
             }
             _etcd.put(f"flowpredictor/state/{CONTROLLER_ID}", json.dumps(state, default=str))
             _metric("ETCD_WRITE", f"cid={CONTROLLER_ID} key=flowpredictor/state/{CONTROLLER_ID} "
@@ -1437,6 +1951,7 @@ def index():
 @app.route("/predictor/status", methods=["GET"])
 def status():
     collaboration = engine.collaboration_snapshot()
+    agentic = engine.agentic_snapshot()
     with engine.lock:
         return jsonify({
             "cid": CONTROLLER_ID,
@@ -1455,6 +1970,17 @@ def status():
                 "claims_lost": collaboration.get("claims_lost", 0),
                 "errors": collaboration.get("errors", 0),
             },
+            "agentic": {
+                "requested": agentic["requested"],
+                "active": agentic["active"],
+                "mode": agentic.get("mode"),
+                "authoritative": agentic.get("authoritative", False),
+                "reason": agentic.get("reason"),
+                "proposals_published": agentic.get("proposals_published", 0),
+                "agreements": agentic.get("agreements", 0),
+                "disagreements": agentic.get("disagreements", 0),
+                "errors": agentic.get("errors", 0),
+            },
             "config": {
                 "poll_interval_s": POLL_INTERVAL_S,
                 "z_threshold_default": Z_THRESHOLD,
@@ -1472,6 +1998,9 @@ def status():
                 "etcd_enabled": _etcd is not None,
                 "collaboration_enabled": COLLABORATION_ENABLED,
                 "collaboration_active": engine.collaboration is not None,
+                "agentic_enabled": AGENTIC_ENABLED,
+                "agentic_shadow": AGENTIC_SHADOW,
+                "agentic_active": engine.agentic is not None,
             },
         }), 200
 
@@ -1530,6 +2059,12 @@ def anomalies():
 def collaboration_status():
     """Estado, critérios e decisões recentes do consenso multi-domínio."""
     return jsonify(engine.collaboration_snapshot()), 200
+
+
+@app.route("/predictor/agent", methods=["GET"])
+def agentic_status():
+    """Estado, propostas e decisões do agente deliberativo em shadow mode."""
+    return jsonify(engine.agentic_snapshot()), 200
 
 
 @app.route("/predictor/export/status", methods=["GET"])
@@ -1591,6 +2126,8 @@ if __name__ == "__main__":
     logger.info(f"FlowPredictor iniciando (cid={CONTROLLER_ID}, Ryu={RYU_BASE_URL}, "
                 f"FlowBlocker={FLOWBLOCKER_URL}, detection_mode={engine.detection_mode}, "
                 f"auto_mitigate={AUTO_MITIGATE}, dry_run={DRY_RUN}, "
-                f"collaboration_active={engine.collaboration is not None})")
+                f"collaboration_active={engine.collaboration is not None}, "
+                f"agentic_active={engine.agentic is not None}, "
+                f"agentic_shadow={AGENTIC_SHADOW})")
     collector.start()
     app.run(host="0.0.0.0", port=PORT, debug=False)

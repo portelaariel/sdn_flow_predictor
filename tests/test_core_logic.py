@@ -229,6 +229,8 @@ class PredictorTests(unittest.TestCase):
                 "_metric": lambda *_args: None,
                 "_etcd": None,
                 "COLLABORATION_ENABLED": False,
+                "AGENTIC_ENABLED": False,
+                "AGENTIC_SHADOW": True,
             },
         )
         engine = symbols["PredictorEngine"]()
@@ -351,6 +353,8 @@ class PredictorTests(unittest.TestCase):
                 "_metric": lambda *_args: None, "_etcd": FakeEtcd(),
                 "json": __import__("json"),
                 "COLLABORATION_ENABLED": True,
+                "AGENTIC_ENABLED": False,
+                "AGENTIC_SHADOW": True,
             },
         )
         engine = symbols["PredictorEngine"]()
@@ -371,6 +375,42 @@ class PredictorTests(unittest.TestCase):
         self.assertEqual(engine.collaboration.submitted, ["first"])
         self.assertEqual(event["mitigation"]["reason"],
                          "aguardando decisão colaborativa")
+
+    def test_agentic_decision_only_updates_its_observation_episode(self):
+        def canonical(anomaly):
+            meta = anomaly.get("meta", {})
+            return f"{meta.get('nw_src')}->{meta.get('nw_dst')}"
+
+        symbols = load_definitions(
+            "flow_predictor_cnsm.py",
+            {"PredictorEngine"},
+            {
+                "Any": Any, "Dict": Dict, "List": List,
+                "Optional": Optional, "Tuple": Tuple,
+                "OfflineModel": OfflineModel,
+                "canonical_flow_key": canonical,
+                "COLLAB_WINDOW_S": 4.0,
+            },
+        )
+        engine = object.__new__(symbols["PredictorEngine"])
+        engine.lock = __import__("threading").RLock()
+        old_event = {
+            "meta": {"nw_src": "10.0.0.1", "nw_dst": "10.0.0.8"},
+            "ts_detect_ns": 1_000_000_000,
+        }
+        current_event = {
+            "meta": {"nw_src": "10.0.0.1", "nw_dst": "10.0.0.8"},
+            "ts_detect_ns": 9_000_000_000,
+        }
+        engine.anomalies = deque([current_event, old_event])
+        decision = {"decision": "AGREED", "window_ids": [2]}
+
+        engine.apply_agentic_decision(
+            "10.0.0.1->10.0.0.8", decision
+        )
+
+        self.assertEqual(current_event["agentic_shadow"], decision)
+        self.assertNotIn("agentic_shadow", old_event)
 
 
 class FlowRuleTests(unittest.TestCase):
@@ -500,6 +540,9 @@ class CollaborativeManagerTests(unittest.TestCase):
             ),
             "now_ns": lambda: 10_000_000_000,
             "_metric": lambda *_args: None,
+            "logger": __import__("types").SimpleNamespace(
+                error=lambda *_args, **_kwargs: None
+            ),
         }
         load_definitions(
             "flow_predictor_cnsm.py",
@@ -544,6 +587,65 @@ class CollaborativeManagerTests(unittest.TestCase):
         self.assertEqual(evidence["dpids"], [1, 2])
         self.assertEqual(evidence["observed_bps"], 100_000_000.0)
         self.assertEqual(evidence["z_score"], 20.0)
+
+    def test_local_evidence_is_forwarded_to_shadow_agent(self):
+        manager = self.bare_manager()
+
+        class FakeAgentic:
+            def __init__(self):
+                self.rows = []
+
+            def submit_evidence(self, evidence):
+                self.rows.append(evidence)
+
+        manager.engine.agentic = FakeAgentic()
+        manager.submit({
+            "kind": "THROUGHPUT_SPIKE",
+            "meta": {
+                "type": "flow",
+                "dpid": 1,
+                "nw_src": "10.0.0.1",
+                "nw_dst": "10.0.0.8",
+            },
+            "ts_detect_ns": 5_000_000_000,
+            "z_score": 12.0,
+            "threshold": 4.0,
+            "observed_bps": 50_000_000.0,
+            "predicted_bps": 1_000_000.0,
+        })
+
+        self.assertEqual(len(manager.engine.agentic.rows), 1)
+        self.assertEqual(
+            manager.engine.agentic.rows[0]["flow"],
+            "10.0.0.1->10.0.0.8",
+        )
+
+    def test_shadow_failure_does_not_interrupt_mcda_submission(self):
+        manager = self.bare_manager()
+
+        class FailingAgentic:
+            def submit_evidence(self, _evidence):
+                raise RuntimeError("shadow unavailable")
+
+        manager.engine.agentic = FailingAgentic()
+        accepted = manager.submit({
+            "kind": "THROUGHPUT_SPIKE",
+            "meta": {
+                "type": "flow",
+                "dpid": 1,
+                "nw_src": "10.0.0.1",
+                "nw_dst": "10.0.0.8",
+            },
+            "ts_detect_ns": 5_000_000_000,
+            "z_score": 12.0,
+            "threshold": 4.0,
+            "observed_bps": 50_000_000.0,
+            "predicted_bps": 1_000_000.0,
+        })
+
+        self.assertTrue(accepted)
+        self.assertTrue(manager.wake.is_set())
+        self.assertIn("10.0.0.1->10.0.0.8", manager.local_candidates)
 
     def test_model_identity_includes_the_priming_contract(self):
         manager = self.bare_manager()

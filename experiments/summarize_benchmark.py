@@ -83,12 +83,26 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
     baseline_spikes = set()
     attack_spikes = set()
     baseline_mitigate = False
+    agentic_decisions = set()
+    agentic_mitigate_votes = set()
+    agentic_comparisons: Dict[str, tuple] = {}
+    agentic_active_domains = set()
 
     for row in read_timeline(run_dir / "timeline.ndjson"):
         if row.get("error"):
             endpoint_errors += 1
             continue
         cid = row.get("status", {}).get("cid") or row.get("port")
+        agentic = row.get("agentic", {})
+        if not isinstance(agentic, dict):
+            agentic = {}
+        if (agentic.get("requested") is True
+                and agentic.get("active") is True
+                and agentic.get("mode") == "shadow"
+                and agentic.get("authoritative") is False):
+            agent_cid = agentic.get("cid") or cid
+            if agent_cid is not None:
+                agentic_active_domains.add(str(agent_cid))
         for anomaly in row.get("anomalies", []):
             anomaly_id = anomaly.get("anomaly_id")
             if anomaly_id:
@@ -164,6 +178,22 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
             elif mitigation.get("reason") and mitigation_reason is None:
                 mitigation_reason = mitigation["reason"]
 
+        for decision in agentic.get("decisions", []):
+            if flow and decision.get("flow") != flow:
+                continue
+            state = decision.get("decision")
+            if state:
+                agentic_decisions.add(state)
+            agentic_mitigate_votes.update(decision.get("mitigate_votes", []))
+            comparison = decision.get("legacy_comparison", {})
+            if comparison.get("available") and isinstance(comparison.get("matches"), bool):
+                evaluated_ns = int(decision.get("evaluated_ns", row.get("sampled_ns", 0)))
+                previous = agentic_comparisons.get(str(cid))
+                if previous is None or evaluated_ns >= previous[0]:
+                    agentic_comparisons[str(cid)] = (
+                        evaluated_ns, comparison["matches"]
+                    )
+
     detection_latency_ms = (
         round((detection_ns - attack_start_ns) / 1e6, 3)
         if detection_ns is not None and attack_start_ns is not None else None
@@ -210,6 +240,21 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
             and ping_after_loss <= 0.0):
         invalid_reasons.append(
             "FlowBlocker confirmou execução, mas o ping não observou perda"
+        )
+    agentic_shadow = metadata.get("agentic_shadow") is True
+    try:
+        expected_agent_domains = max(1, int(metadata.get("controller_sets", 1)))
+    except (TypeError, ValueError):
+        expected_agent_domains = 1
+    if agentic_shadow and len(agentic_active_domains) < expected_agent_domains:
+        invalid_reasons.append(
+            "agentes shadow ativos em "
+            f"{len(agentic_active_domains)}/{expected_agent_domains} domínio(s)"
+        )
+    if (agentic_shadow and expected_attack and attack_spikes
+            and not agentic_decisions):
+        invalid_reasons.append(
+            "anomalia de ataque sem decisão registrada pelos agentes shadow"
         )
     measurement_valid = not invalid_reasons
     contamination_reasons = []
@@ -266,6 +311,15 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
         "invalid_reasons": invalid_reasons,
         "contamination_reasons": contamination_reasons,
         "classification": classification,
+        "agentic_shadow": agentic_shadow,
+        "agentic_active_domains": sorted(agentic_active_domains),
+        "agentic_expected_domains": expected_agent_domains,
+        "agentic_decisions": sorted(agentic_decisions),
+        "agentic_mitigate_votes": sorted(agentic_mitigate_votes),
+        "agentic_matches_mcda": (
+            all(value[1] for value in agentic_comparisons.values())
+            if agentic_comparisons else None
+        ),
     }
 
 

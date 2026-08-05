@@ -57,6 +57,88 @@ class BenchmarkToolTests(unittest.TestCase):
             payload, "10.0.0.1", "10.0.0.8", 1, 3
         ))
 
+    def test_agentic_run_is_invalid_when_agents_or_decisions_are_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "inactive-agentic-ddos"
+            run_dir.mkdir()
+            (run_dir / "metadata.json").write_text(json.dumps({
+                "mode": "collaborative-dry-run",
+                "scenario": "ddos",
+                "flow": "10.0.0.1->10.0.0.8",
+                "controller_sets": 2,
+                "agentic_shadow": True,
+            }), encoding="utf-8")
+            (run_dir / "attack_start_ns.txt").write_text(
+                "1000000000\n", encoding="utf-8"
+            )
+            (run_dir / "workload_status.json").write_text(
+                json.dumps({"valid": True}), encoding="utf-8"
+            )
+            for name in ("ping_before.txt", "ping_after.txt"):
+                (run_dir / name).write_text(
+                    "3 packets transmitted, 3 received, 0% packet loss\n",
+                    encoding="utf-8",
+                )
+            self.write_iperf(run_dir / "baseline.json", 1_000_000)
+            self.write_iperf(run_dir / "attack.json", 100_000_000)
+            rows = [
+                {
+                    "sampled_ns": 1_500_000_000,
+                    "port": str(6060 + index),
+                    "status": {"cid": f"domain-{index}"},
+                    "agentic": {
+                        "requested": True,
+                        "active": False,
+                        "mode": "shadow",
+                        "authoritative": False,
+                        "cid": f"domain-{index}",
+                        "decisions": [],
+                    },
+                    "anomalies": ([{
+                        "anomaly_id": "attack-a",
+                        "kind": "THROUGHPUT_SPIKE",
+                        "ts_detect_ns": 1_500_000_000,
+                        "mitigation": {
+                            "attempted": False,
+                            "executed": False,
+                            "reason": "aguardando decisão colaborativa",
+                        },
+                    }] if index == 0 else []),
+                    "collaboration": {"decisions": []},
+                }
+                for index in range(2)
+            ]
+            (run_dir / "timeline.ndjson").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+
+            summary = summarize_run(run_dir)
+
+            self.assertEqual(summary["classification"], "INVALID")
+            self.assertEqual(summary["agentic_active_domains"], [])
+            self.assertIn(
+                "agentes shadow ativos em 0/2 domínio(s)",
+                summary["invalid_reasons"],
+            )
+            self.assertIn(
+                "anomalia de ataque sem decisão registrada pelos agentes shadow",
+                summary["invalid_reasons"],
+            )
+
+            # Se Holt não detectar nada, ausência de negociação é um FN real,
+            # não uma medição inválida: o agente só recebe candidatos anômalos.
+            rows[0]["anomalies"] = []
+            for row in rows:
+                row["agentic"]["active"] = True
+            (run_dir / "timeline.ndjson").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            no_detection = summarize_run(run_dir)
+            self.assertEqual(no_detection["classification"], "FN")
+            self.assertEqual(no_detection["invalid_reasons"], [])
+
     def test_live_mitigation_failure_is_invalid_with_real_reason(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "failed-live"
@@ -131,6 +213,8 @@ class BenchmarkToolTests(unittest.TestCase):
                 "mode": "collaborative-live",
                 "scenario": "ddos",
                 "flow": "10.0.0.1->10.0.0.8",
+                "controller_sets": 2,
+                "agentic_shadow": True,
             }), encoding="utf-8")
             (run_dir / "attack_start_ns.txt").write_text(
                 "1000000000\n", encoding="utf-8"
@@ -169,9 +253,40 @@ class BenchmarkToolTests(unittest.TestCase):
                     "mitigation": {"attempted": True, "executed": True,
                                    "reason": "FlowBlocker HTTP 200"},
                 }]},
+                "agentic": {
+                    "requested": True,
+                    "active": True,
+                    "mode": "shadow",
+                    "authoritative": False,
+                    "cid": "domain-1",
+                    "decisions": [{
+                        "flow": "10.0.0.1->10.0.0.8",
+                        "decision": "AGREED",
+                        "mitigate_votes": ["domain-0", "domain-1"],
+                        "legacy_comparison": {
+                            "available": True, "matches": True,
+                        },
+                    }],
+                },
+            }
+            peer_row = {
+                "sampled_ns": 2_100_000_000,
+                "port": "6060",
+                "status": {"cid": "domain-0"},
+                "anomalies": [],
+                "collaboration": {"decisions": []},
+                "agentic": {
+                    "requested": True,
+                    "active": True,
+                    "mode": "shadow",
+                    "authoritative": False,
+                    "cid": "domain-0",
+                    "decisions": [],
+                },
             }
             (run_dir / "timeline.ndjson").write_text(
-                json.dumps(row) + "\n", encoding="utf-8"
+                json.dumps(row) + "\n" + json.dumps(peer_row) + "\n",
+                encoding="utf-8",
             )
 
             summary = summarize_run(run_dir)
@@ -185,6 +300,14 @@ class BenchmarkToolTests(unittest.TestCase):
             self.assertEqual(summary["ping_after_loss_percent"], 100.0)
             self.assertTrue(summary["mitigation_executed"])
             self.assertEqual(summary["classification"], "TP")
+            self.assertEqual(summary["agentic_decisions"], ["AGREED"])
+            self.assertEqual(
+                summary["agentic_active_domains"], ["domain-0", "domain-1"]
+            )
+            self.assertEqual(
+                summary["agentic_mitigate_votes"], ["domain-0", "domain-1"]
+            )
+            self.assertTrue(summary["agentic_matches_mcda"])
             self.assertEqual(aggregate_metrics([summary])["f1"], 1.0)
             self.assertIn("collaborative-live", markdown_table([summary]))
 

@@ -36,7 +36,8 @@ if [[ "$DRY_RUN" != "true" && "$DRY_RUN" != "false" ]]; then
   exit 2
 fi
 for value in "$PREDICTOR_OFFLINE_MODEL_REQUIRED" "$PREDICTOR_ONLINE_MODEL_ADAPTATION" \
-  "$PREDICTOR_COLLABORATION_ENABLED"; do
+  "$PREDICTOR_COLLABORATION_ENABLED" "$PREDICTOR_AGENTIC_ENABLED" \
+  "$PREDICTOR_AGENTIC_SHADOW"; do
   if [[ "$value" != "true" && "$value" != "false" ]]; then
     echo "predictor boolean settings must be true or false" >&2
     exit 2
@@ -58,6 +59,25 @@ done
 if [[ "$PREDICTOR_COLLABORATION_ENABLED" == "true" ]] \
   && (( PREDICTOR_COLLAB_MIN_DOMAINS > COLLAB_EXPECTED_DOMAINS )); then
   echo "PREDICTOR_COLLAB_MIN_DOMAINS cannot exceed expected domains" >&2
+  exit 2
+fi
+if ! [[ "$PREDICTOR_AGENT_REQUIRED_VOTES" =~ ^[1-9][0-9]*$ ]]; then
+  echo "PREDICTOR_AGENT_REQUIRED_VOTES must be a positive integer" >&2
+  exit 2
+fi
+if [[ "$PREDICTOR_AGENTIC_ENABLED" == "true" ]] \
+  && [[ "$PREDICTOR_COLLABORATION_ENABLED" != "true" ]]; then
+  echo "PREDICTOR_AGENTIC_ENABLED requires collaboration" >&2
+  exit 2
+fi
+if [[ "$PREDICTOR_AGENTIC_ENABLED" == "true" ]] \
+  && [[ "$PREDICTOR_AGENTIC_SHADOW" != "true" ]]; then
+  echo "the current agentic phase supports shadow mode only" >&2
+  exit 2
+fi
+if [[ "$PREDICTOR_AGENTIC_ENABLED" == "true" ]] \
+  && (( PREDICTOR_AGENT_REQUIRED_VOTES > COLLAB_EXPECTED_DOMAINS )); then
+  echo "PREDICTOR_AGENT_REQUIRED_VOTES cannot exceed expected domains" >&2
   exit 2
 fi
 
@@ -90,6 +110,35 @@ fi
 HISTORY_ROOT="${PREDICTION_HISTORY_ROOT:-$SCRIPT_DIR}"
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
+
+endpoint_ready() {
+  local url="$1" kind="$2"
+  curl -fsS "$url" 2>/dev/null | python3 -c '
+import json
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except (TypeError, ValueError):
+    raise SystemExit(1)
+
+kind = sys.argv[1]
+if kind == "status":
+    ready = isinstance(payload, dict) and bool(payload.get("cid"))
+elif kind == "collaboration":
+    ready = payload.get("requested") is True and payload.get("active") is True
+elif kind == "agent":
+    ready = (
+        payload.get("requested") is True
+        and payload.get("active") is True
+        and payload.get("mode") == "shadow"
+        and payload.get("authoritative") is False
+    )
+else:
+    ready = False
+raise SystemExit(0 if ready else 1)
+' "$kind" >/dev/null 2>&1
+}
 
 # Build da imagem se ausente
 if ! sudo docker images --format '{{.Repository}}' | grep -qx "$PRED_IMG"; then
@@ -128,7 +177,9 @@ for ((i=0; i<C; i++)); do
   log "  Dataset em: $HIST_DIR"
   log "  Detecção: $MODEL_DESCRIPTION"
   log "  Colaboração: $PREDICTOR_COLLABORATION_ENABLED (quórum=$PREDICTOR_COLLAB_MIN_DOMAINS/$COLLAB_EXPECTED_DOMAINS)"
-  sudo docker run -d --name "flow-predictor-$i" --network "$NET" --ip "$PRED_IP" \
+  log "  Agente: $PREDICTOR_AGENTIC_ENABLED (shadow=$PREDICTOR_AGENTIC_SHADOW, votos=$PREDICTOR_AGENT_REQUIRED_VOTES)"
+  CONTAINER="flow-predictor-$i"
+  sudo docker create --name "$CONTAINER" --network "$NET" --ip "$PRED_IP" \
     -v "$HIST_DIR:/app/prediction_history" \
     "${MODEL_DOCKER_ARGS[@]}" \
     -e EXPORT_ENABLED="$PREDICTOR_EXPORT_ENABLED" \
@@ -164,20 +215,72 @@ for ((i=0; i<C; i++)); do
     -e COLLAB_DECISION_THRESHOLD="$PREDICTOR_COLLAB_DECISION_THRESHOLD" \
     -e COLLAB_RATE_RATIO_MAX="$PREDICTOR_COLLAB_RATE_RATIO_MAX" \
     -e COLLAB_WEIGHTS_JSON="$PREDICTOR_COLLAB_WEIGHTS_JSON" \
+    -e AGENTIC_ENABLED="$PREDICTOR_AGENTIC_ENABLED" \
+    -e AGENTIC_SHADOW="$PREDICTOR_AGENTIC_SHADOW" \
+    -e AGENT_REQUIRED_VOTES="$PREDICTOR_AGENT_REQUIRED_VOTES" \
+    -e AGENT_PROPOSAL_TTL_S="$PREDICTOR_AGENT_PROPOSAL_TTL_S" \
+    -e AGENT_NEGOTIATION_WINDOW_S="$PREDICTOR_AGENT_NEGOTIATION_WINDOW_S" \
+    -e AGENT_PROPOSAL_THRESHOLD="$PREDICTOR_AGENT_PROPOSAL_THRESHOLD" \
+    -e AGENT_TOPOLOGY_CACHE_S="$PREDICTOR_AGENT_TOPOLOGY_CACHE_S" \
     -p "$PRED_HTTP_PORT:$PRED_HTTP_PORT" \
-    "$PRED_IMG"
+    "$PRED_IMG" >/dev/null
 
-  # Conecta à rede ETCD (mesmo padrão do FlowBlocker)
-  sudo docker network connect "$ETCD_NET" "flow-predictor-$i" 2>/dev/null || true
+  # O cliente ETCD é criado na importação do processo Python. Por isso a
+  # segunda rede precisa existir antes do primeiro byte do aplicativo rodar.
+  if [[ "$ETCD_NET" != "$NET" ]]; then
+    if ! sudo docker network connect "$ETCD_NET" "$CONTAINER" 2>/dev/null; then
+      if [[ "$PREDICTOR_COLLABORATION_ENABLED" == "true" \
+            || "$PREDICTOR_AGENTIC_ENABLED" == "true" ]]; then
+        log "❌ não foi possível conectar $CONTAINER à rede $ETCD_NET"
+        sudo docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+        exit 1
+      fi
+      log "⚠️  ETCD indisponível para $CONTAINER; mantendo detector local"
+    fi
+  fi
+  if ! sudo docker start "$CONTAINER" >/dev/null; then
+    log "❌ não foi possível iniciar $CONTAINER"
+    sudo docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    exit 1
+  fi
 
-  # Readiness check
+  # Readiness funcional: HTTP sozinho não basta quando colaboração/agente
+  # dependem do ETCD. O deploy só retorna sucesso quando os modos solicitados
+  # aparecem efetivamente ativos na API.
+  READY=false
   for retry in {1..30}; do
-    if curl -fsS "http://127.0.0.1:${PRED_HTTP_PORT}/predictor/status" >/dev/null 2>&1; then
+    STATUS_READY=false
+    COLLAB_READY=false
+    AGENT_READY=false
+    endpoint_ready \
+      "http://127.0.0.1:${PRED_HTTP_PORT}/predictor/status" status \
+      && STATUS_READY=true
+    if [[ "$PREDICTOR_COLLABORATION_ENABLED" != "true" ]]; then
+      COLLAB_READY=true
+    elif endpoint_ready \
+      "http://127.0.0.1:${PRED_HTTP_PORT}/predictor/collaboration" collaboration; then
+      COLLAB_READY=true
+    fi
+    if [[ "$PREDICTOR_AGENTIC_ENABLED" != "true" ]]; then
+      AGENT_READY=true
+    elif endpoint_ready \
+      "http://127.0.0.1:${PRED_HTTP_PORT}/predictor/agent" agent; then
+      AGENT_READY=true
+    fi
+    if [[ "$STATUS_READY" == "true" \
+          && ( "$PREDICTOR_COLLABORATION_ENABLED" != "true" || "$COLLAB_READY" == "true" ) \
+          && ( "$PREDICTOR_AGENTIC_ENABLED" != "true" || "$AGENT_READY" == "true" ) ]]; then
       log "✅ flow-predictor-$i pronto"
+      READY=true
       break
     fi
     sleep 1
   done
+  if [[ "$READY" != "true" ]]; then
+    log "❌ $CONTAINER não atingiu readiness funcional"
+    sudo docker logs --tail 100 "$CONTAINER" >&2 || true
+    exit 1
+  fi
 done
 
 log ""
@@ -190,6 +293,7 @@ for ((i=0; i<C; i++)); do
   echo "    Predições:   curl http://127.0.0.1:$p/predictor/predictions | jq ."
   echo "    Anomalias:   curl http://127.0.0.1:$p/predictor/anomalies | jq ."
   echo "    Colaboração: curl http://127.0.0.1:$p/predictor/collaboration | jq ."
+  echo "    Agente:      curl http://127.0.0.1:$p/predictor/agent | jq ."
   echo "    Dataset:     curl http://127.0.0.1:$p/predictor/export/status | jq ."
 done
 log ""

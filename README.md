@@ -41,6 +41,8 @@ coordenação entre domínios.
 | --- | --- | --- |
 | FlowPredictor | `flow_predictor_cnsm.py` | `Dockerfile.flow_predictor` |
 | Decisão colaborativa | `collaborative_decision.py` | critérios MCDA puros e reproduzíveis |
+| Agente de domínio | `domain_agent.py` | deliberação local e negociação shadow |
+| Protocolo dos agentes | `agent_protocol.py` | contrato JSON estrito e validação de propostas |
 | Contrato do modelo | `offline_model.py` | valida o artefato JSON no treino e no runtime |
 | Treinamento offline | `train_offline_model.py` | converte CSVs rotulados em um modelo versionável |
 | Preparação CIC-DDoS2019 | `prepare_cicddos2019.py` | agrega CSVs grandes em janelas temporais compactas |
@@ -230,7 +232,45 @@ queda do ETCD durante o consenso é tratada de forma conservadora: novas
 ações colaborativas aguardam a recuperação, em vez de cada domínio
 bloquear independentemente.
 
-### 2.6 Mitigação autônoma - guard-rails antes de agir
+### 2.6 Agentes de domínio em shadow mode
+
+Com `PREDICTOR_AGENTIC_ENABLED=true`, cada FlowPredictor também instancia um
+agente deliberativo associado ao seu domínio. O agente recebe a mesma evidência
+Holt compacta usada pelo MCDA, consulta a tabela agregada do FlowBlocker para
+identificar se representa a origem, o destino, ambos ou apenas um observador e
+publica uma proposta efêmera em
+`flowpredictor/agent-proposal/<hash>/<janela>/<cid>`.
+
+As propostas usam um contrato JSON fechado e podem assumir `MITIGATE`, `WAIT`,
+`NORMAL`, `ABSTAIN` ou `VETO`. O contrato carrega o par topológico ordenado
+`source_cid`/`destination_cid`, valida se o papel alegado é coerente com o CID e
+confere `cid`/janela contra a chave ETCD. A simultaneidade usa o instante da
+observação Holt, não o horário de publicação — um retry não rejuvenesce uma
+evidência antiga. Para um fluxo cross-domain, o quórum padrão de duas propostas
+`MITIGATE` recentes, compatíveis e sem `NORMAL`/`VETO` gera `AGREED`. Ausência de
+um domínio gera `WAITING_PROPOSALS`; topologias divergentes,
+`TOPOLOGY_MISMATCH`; modelos diferentes, `MODEL_MISMATCH`; whitelist,
+`VETOED`. Um fluxo inteiramente local exige apenas o agente do seu único domínio
+responsável.
+
+Esta primeira fase é obrigatoriamente **shadow**: a decisão agentic é anexada à
+anomalia e comparada com a decisão MCDA, mas nunca disputa claim nem chama o
+FlowBlocker. Essa separação permite medir concordâncias e divergências antes de
+delegar autoridade operacional. Os logs usam `[METRICS][AGENT_PROPOSAL]` e
+`[METRICS][AGENT_CONSENSUS]`; o estado completo fica em
+`GET /predictor/agent`.
+
+Nesta fase, o cluster ETCD é parte do perímetro confiável: a checagem entre
+chave e payload evita inconsistência acidental, mas não é autenticação
+criptográfica de um domínio. Uma fase autoritativa futura deve exigir ACL por
+prefixo e identidade mTLS ou assinatura das propostas antes de permitir que um
+resultado agentic controle mitigação.
+
+O score local do agente é explicável e combina severidade Holt (0,35), razão de
+vazão (0,20), persistência (0,20), confiabilidade do modelo (0,15) e papel
+topológico (0,10). Não há LLM ou aprendizado por reforço no caminho crítico.
+
+### 2.7 Mitigação autônoma - guard-rails antes de agir
 
 A resposta automatizada só é segura se for **conservadora por
 construção**. O mitigador aplica cinco portões em sequência antes de
@@ -254,7 +294,7 @@ domínios, o FlowBlocker local instala o DROP no seu DPID e propaga ao
 peer via `/receive_flow`, o FlowPredictor não precisa conhecer a
 topologia inter-domínio.
 
-### 2.7 Ciclo de feedback
+### 2.8 Ciclo de feedback
 
 `POST /predictor/feedback` com
 `{"anomaly_id": "...", "verdict": "false_positive"}` ajusta somente o
@@ -282,6 +322,7 @@ precision/recall ao longo do experimento.
 | GET | `/predictor/anomalies?limit=N` | Anomalias recentes com resultado da mitigação |
 | GET | `/predictor/model` | Modo efetivo, parâmetros e proveniência do modelo offline |
 | GET | `/predictor/collaboration` | Configuração MCDA, evidências, claims e decisões explicadas |
+| GET | `/predictor/agent` | Propostas, estados, negociação shadow e comparação com o MCDA |
 | GET | `/predictor/export/status` | Estado e contadores da exportação CSV |
 | POST | `/predictor/feedback` | `{"anomaly_id", "verdict"}` — refina *thresholds* |
 | POST | `/predictor/config` | Ajuste em tempo de execução: `auto_mitigate`, `dry_run`, `min_rate_bps`, `cooldown_s`, `event_cooldown_s` |
@@ -462,6 +503,8 @@ PREDICTOR_OFFLINE_MODEL="$PWD/models/cic2019-drddos-udp-holt.json" \
 PREDICTOR_OFFLINE_MODEL_REQUIRED=true \
 PREDICTOR_COLLABORATION_ENABLED=true \
 PREDICTOR_COLLAB_MIN_DOMAINS=2 \
+PREDICTOR_AGENTIC_ENABLED=true \
+PREDICTOR_AGENTIC_SHADOW=true \
 PREDICTOR_DRY_RUN=true \
   bash deploy_flow_predictor.sh 2 true
 ```
@@ -478,6 +521,7 @@ Confirme o modo efetivo:
 curl http://127.0.0.1:6060/predictor/model | jq .
 curl http://127.0.0.1:6060/predictor/status | jq '.model'
 curl http://127.0.0.1:6060/predictor/collaboration | jq .
+curl http://127.0.0.1:6060/predictor/agent | jq .
 ```
 
 O resultado deve conter `"loaded": true` e `"mode": "offline"`.
@@ -524,6 +568,7 @@ mininet> h1 iperf3 -c 10.0.0.4 -u -b 100M -t 20  # SPIKE UDP súbito
 # 7. Observar detecção, consenso e dry-run da mitigação
 curl http://127.0.0.1:6060/predictor/anomalies | jq '.anomalies[0]'
 curl http://127.0.0.1:6060/predictor/collaboration | jq '.decisions[0]'
+curl http://127.0.0.1:6060/predictor/agent | jq '.decisions[0]'
 docker logs flow-predictor-0 | grep "\[METRICS\]\[MITIGATION_DRYRUN\]"
 
 # 8. Armar mitigação real e repetir o passo 6
@@ -659,6 +704,10 @@ bash scripts/run_collaborative_benchmark.sh local-dry-run ddos
 # Mede consenso e eleição sem alterar o plano de dados
 bash scripts/run_collaborative_benchmark.sh collaborative-dry-run ddos
 
+# Compara a negociação dos agentes shadow com o MCDA no mesmo ensaio
+BENCHMARK_AGENTIC_ENABLED=true \
+  bash scripts/run_collaborative_benchmark.sh collaborative-dry-run ddos
+
 # Após o claim anterior expirar, valida o DROP real
 bash scripts/run_collaborative_benchmark.sh \
   collaborative-live ddos --allow-mitigation
@@ -685,7 +734,7 @@ Cada execução cria um diretório pequeno em
 
 - metadados, hash do modelo e commit Git;
 - JSON do iperf e ping antes/depois;
-- linha do tempo NDJSON de predições do fluxo, anomalias e decisões;
+- linha do tempo NDJSON de predições, anomalias, decisões MCDA e agentic shadow;
 - snapshots das APIs, flows OVS e logs dos containers;
 - `summary.json` e `summary.md` com score, domínios confirmadores,
   coordenador, quantidade de domínios que agiram, latências e classificação
@@ -726,5 +775,6 @@ e `ddos` sob as mesmas taxas, durações, topologia, modelo e commit.
 
 ------------------------------------------------------------------------
 
-**Versão**: 1.6 · **Data**: 2026-08-04 · **Status**: modelo offline,
-consenso MCDA multi-domínio, claim distribuído e benchmark reproduzível
+**Versão**: 1.7 · **Data**: 2026-08-05 · **Status**: modelo offline,
+consenso MCDA multi-domínio, agentes deliberativos em shadow mode, claim
+distribuído e benchmark reproduzível

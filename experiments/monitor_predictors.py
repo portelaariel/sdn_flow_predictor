@@ -43,6 +43,7 @@ def capture_endpoint(endpoint: str, flow: str) -> Dict[str, Any]:
     try:
         status = fetch_json(f"{endpoint}/predictor/status")
         collaboration = fetch_json(f"{endpoint}/predictor/collaboration")
+        agentic = fetch_json(f"{endpoint}/predictor/agent")
         anomalies = fetch_json(f"{endpoint}/predictor/anomalies?limit=500")
         predictions = fetch_json(f"{endpoint}/predictor/predictions?top=500")
         return {
@@ -56,6 +57,7 @@ def capture_endpoint(endpoint: str, flow: str) -> Dict[str, Any]:
                 "collaboration": status.get("collaboration"),
             },
             "collaboration": collaboration,
+            "agentic": agentic,
             "anomalies": flow_anomalies(anomalies, flow),
             "predictions": flow_predictions(predictions, flow),
         }
@@ -81,7 +83,7 @@ def monitor(endpoints: List[str], flow: str, output_dir: Path,
     output_dir.mkdir(parents=True, exist_ok=True)
     for endpoint in endpoints:
         port = endpoint_port(endpoint)
-        for resource in ("status", "model", "collaboration"):
+        for resource in ("status", "model", "collaboration", "agent"):
             try:
                 write_json(
                     output_dir / f"initial-{resource}-{port}.json",

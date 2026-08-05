@@ -18,16 +18,39 @@ sudo() {
     network)
       if [[ "${2:-}" == "ls" ]]; then
         echo "ryu-network-0"
+      elif [[ "${2:-}" == "connect" ]]; then
+        printf 'network-connect %s\n' "$*" >> "$COMMAND_LOG"
+        if [[ "${MOCK_ETCD_CONNECT_FAIL:-false}" == "true" ]]; then
+          return 1
+        fi
       fi
       ;;
-    run)
-      printf '%s\n' "$*" >> "$COMMAND_LOG"
+    create)
+      printf 'create %s\n' "$*" >> "$COMMAND_LOG"
+      ;;
+    start)
+      printf 'start %s\n' "$*" >> "$COMMAND_LOG"
       ;;
   esac
   return 0
 }
 
 curl() {
+  local url="${*: -1}"
+  case "$url" in
+    */predictor/status)
+      printf '%s\n' '{"cid":"domain-test"}'
+      ;;
+    */predictor/collaboration)
+      printf '%s\n' '{"requested":true,"active":true}'
+      ;;
+    */predictor/agent)
+      printf '%s\n' '{"requested":true,"active":true,"mode":"shadow","authoritative":false}'
+      ;;
+    *)
+      printf '%s\n' '{}'
+      ;;
+  esac
   return 0
 }
 
@@ -47,8 +70,16 @@ grep -q -- '-e FLOW_IDLE_RESET_SAMPLES=2' "$COMMAND_LOG"
 grep -q -- '-e COLLABORATION_ENABLED=false' "$COMMAND_LOG"
 grep -q -- '-e COLLAB_EXPECTED_DOMAINS=1' "$COMMAND_LOG"
 grep -q -- '-e COLLAB_MIN_DOMAINS=2' "$COMMAND_LOG"
+grep -q -- '-e AGENTIC_ENABLED=false' "$COMMAND_LOG"
+grep -q -- '-e AGENTIC_SHADOW=true' "$COMMAND_LOG"
+grep -q -- '-e AGENT_REQUIRED_VOTES=2' "$COMMAND_LOG"
 grep -q -- '-e DRY_RUN=true' "$COMMAND_LOG"
 grep -q -- '-p 6060:6060' "$COMMAND_LOG"
+
+CREATE_LINE="$(grep -n '^create ' "$COMMAND_LOG" | head -n 1 | cut -d: -f1)"
+CONNECT_LINE="$(grep -n '^network-connect ' "$COMMAND_LOG" | head -n 1 | cut -d: -f1)"
+START_LINE="$(grep -n '^start ' "$COMMAND_LOG" | head -n 1 | cut -d: -f1)"
+(( CREATE_LINE < CONNECT_LINE && CONNECT_LINE < START_LINE ))
 
 MODEL_PATH="$TEST_TMP/ddos-holt.json"
 touch "$MODEL_PATH"
@@ -70,5 +101,31 @@ PREDICTOR_COLLAB_MIN_DOMAINS=2 \
 grep -q -- '-e COLLABORATION_ENABLED=true' "$COMMAND_LOG"
 grep -q -- '-e COLLAB_EXPECTED_DOMAINS=2' "$COMMAND_LOG"
 grep -q -- '-e COLLAB_MIN_DOMAINS=2' "$COMMAND_LOG"
+
+PREDICTION_HISTORY_ROOT="$TEST_TMP/history-agentic" \
+PREDICTOR_COLLABORATION_ENABLED=true \
+PREDICTOR_AGENTIC_ENABLED=true \
+PREDICTOR_AGENTIC_SHADOW=true \
+PREDICTOR_AGENT_REQUIRED_VOTES=2 \
+  bash "$PROJECT_ROOT/deploy_flow_predictor.sh" 2 true >/dev/null
+
+grep -q -- '-e AGENTIC_ENABLED=true' "$COMMAND_LOG"
+grep -q -- '-e AGENTIC_SHADOW=true' "$COMMAND_LOG"
+grep -q -- '-e AGENT_REQUIRED_VOTES=2' "$COMMAND_LOG"
+grep -q -- '-e AGENT_PROPOSAL_THRESHOLD=0.65' "$COMMAND_LOG"
+
+# ETCD continua opcional para o detector local, mas é requisito estrito para
+# colaboração/agentes.
+MOCK_ETCD_CONNECT_FAIL=true \
+PREDICTION_HISTORY_ROOT="$TEST_TMP/history-local-without-etcd" \
+  bash "$PROJECT_ROOT/deploy_flow_predictor.sh" 1 true >/dev/null
+
+if MOCK_ETCD_CONNECT_FAIL=true \
+  PREDICTION_HISTORY_ROOT="$TEST_TMP/history-collab-without-etcd" \
+  PREDICTOR_COLLABORATION_ENABLED=true \
+  bash "$PROJECT_ROOT/deploy_flow_predictor.sh" 2 true >/dev/null 2>&1; then
+  echo "collaborative deploy unexpectedly succeeded without ETCD network" >&2
+  exit 1
+fi
 
 echo "deploy_smoke: ok"

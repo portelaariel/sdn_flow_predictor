@@ -25,6 +25,8 @@ required_files=(
   config/runtime.env
   Dockerfile.flow_predictor
   flow_predictor_cnsm.py
+  agent_protocol.py
+  domain_agent.py
   collaborative_decision.py
   offline_model.py
   train_offline_model.py
@@ -59,6 +61,10 @@ source config/runtime.env
 [[ "$PREDICTOR_COLLABORATION_ENABLED" == "false" ]]
 [[ -z "$PREDICTOR_COLLAB_EXPECTED_DOMAINS" ]]
 [[ "$PREDICTOR_COLLAB_MIN_DOMAINS" == "2" ]]
+[[ "$PREDICTOR_AGENTIC_ENABLED" == "false" ]]
+[[ "$PREDICTOR_AGENTIC_SHADOW" == "true" ]]
+[[ "$PREDICTOR_AGENT_REQUIRED_VOTES" == "2" ]]
+[[ "$PREDICTOR_AGENT_PROPOSAL_THRESHOLD" == "0.65" ]]
 
 override_config="$(ETCD_SUBNET=250 ETCD_NODES=2 bash -c '
   source config/runtime.env
@@ -82,9 +88,19 @@ expect_invalid_input env PREDICTOR_COLLABORATION_ENABLED=true \
   PREDICTOR_COLLAB_MIN_DOMAINS=3 bash deploy_flow_predictor.sh 2 true
 expect_invalid_input env PREDICTOR_FLOW_IDLE_RESET_SAMPLES=0 \
   bash deploy_flow_predictor.sh 2 true
+expect_invalid_input env PREDICTOR_AGENTIC_ENABLED=true \
+  PREDICTOR_COLLABORATION_ENABLED=false bash deploy_flow_predictor.sh 2 true
+expect_invalid_input env PREDICTOR_AGENTIC_ENABLED=true \
+  PREDICTOR_COLLABORATION_ENABLED=true PREDICTOR_AGENTIC_SHADOW=false \
+  bash deploy_flow_predictor.sh 2 true
+expect_invalid_input env PREDICTOR_AGENTIC_ENABLED=true \
+  PREDICTOR_COLLABORATION_ENABLED=true PREDICTOR_AGENT_REQUIRED_VOTES=3 \
+  bash deploy_flow_predictor.sh 2 true
 expect_invalid_input bash eMSN_ENV/setup_env.sh 0 2
 expect_invalid_input bash scripts/run_collaborative_benchmark.sh invalid ddos
 expect_invalid_input bash scripts/run_collaborative_benchmark.sh collaborative-live ddos
+expect_invalid_input env BENCHMARK_AGENTIC_ENABLED=true \
+  bash scripts/run_collaborative_benchmark.sh local-dry-run ddos
 echo "input_validation: ok"
 
 python3 -m unittest discover -s tests -v
