@@ -903,6 +903,11 @@ class AgenticShadowManager:
         self.local_proposals: Dict[str, Dict[str, Any]] = {}
         self.dirty_flows = set()
         self.decisions: Dict[str, Dict[str, Any]] = {}
+        # Histórico imutável de transições. O monitor do benchmark consulta a
+        # API em intervalos e não pode depender de observar um estado efêmero
+        # exatamente no ciclo em que ele ocorreu.
+        self.decision_events = deque(maxlen=200)
+        self.last_event_key: Dict[str, Tuple[Any, ...]] = {}
         self.last_logged_state: Dict[str, str] = {}
         self.domain_hosts: Dict[str, Dict[str, Any]] = {}
         self.topology_cached_at = 0.0
@@ -912,6 +917,8 @@ class AgenticShadowManager:
         self.proposals_published = 0
         self.agreements = 0
         self.disagreements = 0
+        self.waiting_events = 0
+        self.expired_proposals = 0
         self.started_ns = now_ns()
         self.thread = threading.Thread(
             target=self._run,
@@ -946,7 +953,9 @@ class AgenticShadowManager:
                          or int(previous_proposal.get("observation_ns", 0))
                          + int(AGENT_PROPOSAL_TTL_S * 1e9) <= submission_ns)):
                 self.local_proposals.pop(flow, None)
+                self.expired_proposals += 1
                 self.decisions.pop(flow, None)
+                self.last_event_key.pop(flow, None)
                 self.last_logged_state.pop(flow, None)
                 self.topology_retry_at.pop(flow, None)
                 forget_previous = True
@@ -1041,10 +1050,12 @@ class AgenticShadowManager:
                         or observation_ns + int(AGENT_PROPOSAL_TTL_S * 1e9)
                         <= current_ns):
                     self.local_evidence.pop(flow, None)
-                    self.local_proposals.pop(flow, None)
+                    if self.local_proposals.pop(flow, None) is not None:
+                        self.expired_proposals += 1
                     self.dirty_flows.discard(flow)
                     self.topology_retry_at.pop(flow, None)
                     self.decisions.pop(flow, None)
+                    self.last_event_key.pop(flow, None)
                     self.last_logged_state.pop(flow, None)
                     forgotten_flows.append(flow)
             for flow, retry_at in list(self.topology_retry_at.items()):
@@ -1181,6 +1192,7 @@ class AgenticShadowManager:
             ]
             for flow in stale:
                 expired = self.local_proposals.pop(flow, None) or {}
+                self.expired_proposals += 1
                 evidence = self.local_evidence.get(flow)
                 has_new_evidence = (
                     evidence is not None
@@ -1193,6 +1205,7 @@ class AgenticShadowManager:
                     # limpeza. Mantém a observação nova para o próximo ciclo.
                     self.dirty_flows.add(flow)
                     self.decisions.pop(flow, None)
+                    self.last_event_key.pop(flow, None)
                     self.last_logged_state.pop(flow, None)
                     self.agent.forget(flow)
                 else:
@@ -1200,6 +1213,7 @@ class AgenticShadowManager:
                     self.dirty_flows.discard(flow)
                     self.topology_retry_at.pop(flow, None)
                     self.decisions.pop(flow, None)
+                    self.last_event_key.pop(flow, None)
                     self.last_logged_state.pop(flow, None)
                     self.agent.forget(flow)
             flows = list(self.local_proposals)
@@ -1219,20 +1233,49 @@ class AgenticShadowManager:
             })
             decision["legacy_comparison"] = self._legacy_comparison(flow, decision)
             with self.lock:
-                previous = self.last_logged_state.get(flow)
-                self.decisions[flow] = decision
-                if previous != decision["decision"]:
-                    self.last_logged_state[flow] = decision["decision"]
+                event_key = (
+                    decision["decision"],
+                    tuple(decision.get("window_ids", [])),
+                    decision.get("source_cid"),
+                    decision.get("destination_cid"),
+                )
+                previous_event_key = self.last_event_key.get(flow)
+                if event_key == previous_event_key:
+                    prior_decision = self.decisions.get(flow, {})
+                    decision["state_entered_ns"] = int(
+                        prior_decision.get("state_entered_ns", decision["evaluated_ns"])
+                    )
+                    decision["event_id"] = prior_decision.get("event_id")
+                else:
+                    decision["state_entered_ns"] = int(decision["evaluated_ns"])
+                    windows = ",".join(
+                        str(value) for value in decision.get("window_ids", [])
+                    ) or "none"
+                    decision["event_id"] = (
+                        f"{CONTROLLER_ID}:{flow}:{windows}:"
+                        f"{decision['decision']}:{decision['state_entered_ns']}"
+                    )
+                    self.last_event_key[flow] = event_key
+                    # Cópia JSON: impede que atualizações posteriores do estado
+                    # corrente alterem retroativamente o evento auditável.
+                    self.decision_events.append(json.loads(json.dumps(decision)))
                     if decision["decision"] == "AGREED":
                         self.agreements += 1
-                    elif decision["decision"] in {"DISAGREED", "VETOED"}:
+                    elif decision["decision"] in {
+                        "DISAGREED", "VETOED", "MODEL_MISMATCH",
+                        "TOPOLOGY_MISMATCH",
+                    }:
                         self.disagreements += 1
+                    elif decision["decision"].startswith("WAITING"):
+                        self.waiting_events += 1
                     _metric(
                         "AGENT_CONSENSUS",
                         f"flow={flow} decision={decision['decision']} "
                         f"votes={decision['mitigate_votes']} "
                         f"relevant={decision['relevant_domains']} shadow=true",
                     )
+                self.decisions[flow] = decision
+                self.last_logged_state[flow] = decision["decision"]
             self.engine.apply_agentic_decision(flow, decision)
 
     def snapshot(self) -> Dict[str, Any]:
@@ -1259,6 +1302,8 @@ class AgenticShadowManager:
                 "proposals_published": self.proposals_published,
                 "agreements": self.agreements,
                 "disagreements": self.disagreements,
+                "waiting_events": self.waiting_events,
+                "expired_proposals": self.expired_proposals,
                 "errors": self.errors,
                 "topology_errors": self.topology_errors,
                 "topology_retries_pending": len(self.topology_retry_at),
@@ -1274,6 +1319,7 @@ class AgenticShadowManager:
                 "states": self.agent.snapshot_states(),
                 "proposals": proposals,
                 "decisions": decisions,
+                "decision_events": list(reversed(self.decision_events)),
             }
 
 
@@ -1846,8 +1892,11 @@ class PredictorEngine:
             "authoritative": False,
             "cid": CONTROLLER_ID,
             "reason": reason,
+            "waiting_events": 0,
+            "expired_proposals": 0,
             "proposals": [],
             "decisions": [],
+            "decision_events": [],
         }
 
     # ---- feedback loop: ajusta a sensibilidade da série afetada ----

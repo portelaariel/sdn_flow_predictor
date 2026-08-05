@@ -219,6 +219,10 @@ class DomainAgent:
                 for item in current
             ],
             "confidence": 0.0,
+            "first_proposal_ns": None,
+            "last_proposal_ns": None,
+            "proposal_collection_latency_ms": None,
+            "decision_after_last_proposal_ms": None,
         }
         if not current:
             return self._record_decision(base, "NO_PROPOSALS", "sem proposta recente")
@@ -260,6 +264,17 @@ class DomainAgent:
             )
             base["observation_end_ns"] = max(
                 item["observation_ns"] for item in relevant_rows
+            )
+            proposal_times = [item["created_ns"] for item in relevant_rows]
+            base["first_proposal_ns"] = min(proposal_times)
+            base["last_proposal_ns"] = max(proposal_times)
+            base["proposal_collection_latency_ms"] = round(
+                (base["last_proposal_ns"] - base["first_proposal_ns"]) / 1e6,
+                3,
+            )
+            base["decision_after_last_proposal_ms"] = round(
+                (base["evaluated_ns"] - base["last_proposal_ns"]) / 1e6,
+                3,
             )
         missing = sorted(set(relevant) - set(by_cid))
         if missing:

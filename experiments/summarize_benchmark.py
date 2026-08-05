@@ -4,6 +4,7 @@
 import argparse
 import json
 import re
+import statistics
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -60,6 +61,9 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
     workload = read_json(run_dir / "workload_status.json", {}) or {}
     flow = metadata.get("flow", "")
     expected_attack = metadata.get("scenario") == "ddos"
+    run_started_ns = metadata.get("started_ns")
+    if not isinstance(run_started_ns, int):
+        run_started_ns = None
     collaborative = str(metadata.get("mode", "")).startswith("collaborative-")
     live_mode = metadata.get("mode") == "collaborative-live"
     attack_disrupted = workload.get("attack_disrupted") is True
@@ -87,6 +91,24 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
     agentic_mitigate_votes = set()
     agentic_comparisons: Dict[str, tuple] = {}
     agentic_active_domains = set()
+    agentic_events: Dict[str, Dict[str, Any]] = {}
+    agentic_waiting_by_domain: Dict[str, int] = {}
+    agentic_expired_by_domain: Dict[str, int] = {}
+    initial_waiting_by_domain: Dict[str, int] = {}
+    initial_expired_by_domain: Dict[str, int] = {}
+
+    for path in run_dir.glob("initial-agent-*.json"):
+        initial = read_json(path, {}) or {}
+        initial_cid = initial.get("cid")
+        if initial_cid is None:
+            continue
+        initial_cid = str(initial_cid)
+        initial_waiting_by_domain[initial_cid] = int(
+            initial.get("waiting_events", 0)
+        )
+        initial_expired_by_domain[initial_cid] = int(
+            initial.get("expired_proposals", 0)
+        )
 
     for row in read_timeline(run_dir / "timeline.ndjson"):
         if row.get("error"):
@@ -103,6 +125,14 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
             agent_cid = agentic.get("cid") or cid
             if agent_cid is not None:
                 agentic_active_domains.add(str(agent_cid))
+                agentic_waiting_by_domain[str(agent_cid)] = max(
+                    agentic_waiting_by_domain.get(str(agent_cid), 0),
+                    int(agentic.get("waiting_events", 0)),
+                )
+                agentic_expired_by_domain[str(agent_cid)] = max(
+                    agentic_expired_by_domain.get(str(agent_cid), 0),
+                    int(agentic.get("expired_proposals", 0)),
+                )
         for anomaly in row.get("anomalies", []):
             anomaly_id = anomaly.get("anomaly_id")
             if anomaly_id:
@@ -178,8 +208,23 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
             elif mitigation.get("reason") and mitigation_reason is None:
                 mitigation_reason = mitigation["reason"]
 
-        for decision in agentic.get("decisions", []):
+        agent_cid = str(agentic.get("cid") or cid)
+        current_decisions = agentic.get("decisions", [])
+        decision_events = agentic.get("decision_events", [])
+        if not isinstance(current_decisions, list):
+            current_decisions = []
+        if not isinstance(decision_events, list):
+            decision_events = []
+        for decision in current_decisions + decision_events:
+            if not isinstance(decision, dict):
+                continue
             if flow and decision.get("flow") != flow:
+                continue
+            transition_ns = decision.get(
+                "state_entered_ns", decision.get("evaluated_ns")
+            )
+            if (run_started_ns is not None and isinstance(transition_ns, int)
+                    and transition_ns < run_started_ns):
                 continue
             state = decision.get("decision")
             if state:
@@ -188,11 +233,19 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
             comparison = decision.get("legacy_comparison", {})
             if comparison.get("available") and isinstance(comparison.get("matches"), bool):
                 evaluated_ns = int(decision.get("evaluated_ns", row.get("sampled_ns", 0)))
-                previous = agentic_comparisons.get(str(cid))
+                previous = agentic_comparisons.get(agent_cid)
                 if previous is None or evaluated_ns >= previous[0]:
-                    agentic_comparisons[str(cid)] = (
+                    agentic_comparisons[agent_cid] = (
                         evaluated_ns, comparison["matches"]
                     )
+            event_id = decision.get("event_id")
+            if not event_id:
+                event_id = (
+                    f"{agent_cid}:{decision.get('flow')}:{state}:"
+                    f"{decision.get('state_entered_ns', decision.get('evaluated_ns'))}:"
+                    f"{','.join(str(v) for v in decision.get('window_ids', []))}"
+                )
+            agentic_events.setdefault(str(event_id), decision)
 
     detection_latency_ms = (
         round((detection_ns - attack_start_ns) / 1e6, 3)
@@ -201,6 +254,77 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
     consensus_latency_ms = (
         round((claimed_ns - detection_ns) / 1e6, 3)
         if claimed_ns is not None and detection_ns is not None else None
+    )
+    agreement_events = [
+        event for event in agentic_events.values()
+        if event.get("decision") == "AGREED"
+        and isinstance(event.get("state_entered_ns", event.get("evaluated_ns")), int)
+    ]
+    if detection_ns is not None:
+        agreement_events = [
+            event for event in agreement_events
+            if int(event.get("state_entered_ns", event.get("evaluated_ns")))
+            >= detection_ns
+        ]
+    elif expected_attack and attack_start_ns is not None:
+        agreement_events = [
+            event for event in agreement_events
+            if int(event.get("state_entered_ns", event.get("evaluated_ns")))
+            >= attack_start_ns
+        ]
+    first_agreement = min(
+        agreement_events,
+        key=lambda event: int(
+            event.get("state_entered_ns", event.get("evaluated_ns"))
+        ),
+        default=None,
+    )
+    agentic_agreement_ns = (
+        int(first_agreement.get("state_entered_ns", first_agreement.get("evaluated_ns")))
+        if first_agreement is not None else None
+    )
+    first_proposal_ns = (
+        first_agreement.get("first_proposal_ns")
+        if first_agreement is not None else None
+    )
+    last_proposal_ns = (
+        first_agreement.get("last_proposal_ns")
+        if first_agreement is not None else None
+    )
+    proposal_timestamps_ns: Dict[str, int] = {}
+    if first_agreement is not None:
+        proposal_times = [
+            item.get("created_ns") for item in first_agreement.get("proposals", [])
+            if isinstance(item, dict) and isinstance(item.get("created_ns"), int)
+        ]
+        if first_proposal_ns is None and proposal_times:
+            first_proposal_ns = min(proposal_times)
+        if last_proposal_ns is None and proposal_times:
+            last_proposal_ns = max(proposal_times)
+        proposal_timestamps_ns = {
+            str(item["cid"]): int(item["created_ns"])
+            for item in first_agreement.get("proposals", [])
+            if (isinstance(item, dict) and item.get("cid") is not None
+                and isinstance(item.get("created_ns"), int))
+        }
+
+    def latency_ms(end_ns: Any, start_ns: Any) -> Optional[float]:
+        if not isinstance(end_ns, int) or not isinstance(start_ns, int):
+            return None
+        if end_ns < start_ns:
+            return None
+        return round((end_ns - start_ns) / 1e6, 3)
+
+    agentic_consensus_latency_ms = latency_ms(agentic_agreement_ns, detection_ns)
+    agentic_attack_to_consensus_latency_ms = latency_ms(
+        agentic_agreement_ns, attack_start_ns
+    )
+    agentic_first_proposal_latency_ms = latency_ms(first_proposal_ns, detection_ns)
+    agentic_proposal_collection_latency_ms = latency_ms(
+        last_proposal_ns, first_proposal_ns
+    )
+    agentic_deliberation_latency_ms = latency_ms(
+        agentic_agreement_ns, last_proposal_ns
     )
     ping_before_loss = packet_loss_percent(run_dir / "ping_before.txt")
     ping_after_loss = packet_loss_percent(run_dir / "ping_after.txt")
@@ -299,6 +423,7 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
         "attack_spike_anomalies": len(attack_spikes),
         "detection_latency_ms": detection_latency_ms,
         "consensus_latency_ms": consensus_latency_ms,
+        "mcda_consensus_latency_ms": consensus_latency_ms,
         "ping_before_loss_percent": ping_before_loss,
         "ping_after_loss_percent": ping_after_loss,
         "baseline_bps": baseline_bps,
@@ -316,6 +441,43 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
         "agentic_expected_domains": expected_agent_domains,
         "agentic_decisions": sorted(agentic_decisions),
         "agentic_mitigate_votes": sorted(agentic_mitigate_votes),
+        "agentic_agreement_ns": agentic_agreement_ns,
+        "agentic_first_proposal_ns": first_proposal_ns,
+        "agentic_last_proposal_ns": last_proposal_ns,
+        "agentic_proposal_timestamps_ns": proposal_timestamps_ns,
+        "agentic_required_votes": (
+            first_agreement.get("required_votes")
+            if first_agreement is not None else None
+        ),
+        "agentic_quorum_reached": first_agreement is not None,
+        "agentic_first_proposal_latency_ms": agentic_first_proposal_latency_ms,
+        "agentic_proposal_collection_latency_ms": (
+            agentic_proposal_collection_latency_ms
+        ),
+        "agentic_deliberation_latency_ms": agentic_deliberation_latency_ms,
+        "agentic_consensus_latency_ms": agentic_consensus_latency_ms,
+        "agentic_attack_to_consensus_latency_ms": (
+            agentic_attack_to_consensus_latency_ms
+        ),
+        "agentic_agreement_events": sum(
+            event.get("decision") == "AGREED" for event in agentic_events.values()
+        ),
+        "agentic_disagreement_events": sum(
+            event.get("decision") in {
+                "DISAGREED", "VETOED", "MODEL_MISMATCH", "TOPOLOGY_MISMATCH",
+            }
+            for event in agentic_events.values()
+        ),
+        "agentic_waiting_events": sum(
+            max(0, value - initial_waiting_by_domain.get(cid, 0))
+            for cid, value in agentic_waiting_by_domain.items()
+        ),
+        "agentic_expired_proposals": sum(
+            max(0, value - initial_expired_by_domain.get(cid, 0))
+            for cid, value in agentic_expired_by_domain.items()
+        ),
+        "agentic_agent_agreement": bool(first_agreement),
+        "agentic_mcda_comparison_domains": sorted(agentic_comparisons),
         "agentic_matches_mcda": (
             all(value[1] for value in agentic_comparisons.values())
             if agentic_comparisons else None
@@ -333,18 +495,86 @@ def aggregate_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     recall = counts["TP"] / recall_denominator if recall_denominator else None
     f1 = (2 * precision * recall / (precision + recall)
           if precision is not None and recall is not None and precision + recall else None)
+    agentic_candidates = [
+        row for row in rows
+        if row.get("agentic_shadow")
+        and row.get("measurement_valid")
+        and not row.get("contamination_reasons")
+        and row.get("attack_spike_anomalies", 0) > 0
+    ]
+    agentic_comparable = [
+        row for row in agentic_candidates
+        if isinstance(row.get("agentic_matches_mcda"), bool)
+    ]
+
+    def rate(numerator: int, denominator: int) -> Optional[float]:
+        return round(numerator / denominator, 6) if denominator else None
+
+    def distribution(field: str) -> Dict[str, Any]:
+        values = [
+            float(row[field]) for row in agentic_candidates
+            if isinstance(row.get(field), (int, float))
+        ]
+        if not values:
+            return {"n": 0, "mean": None, "median": None,
+                    "sample_stddev": None, "min": None, "max": None}
+        return {
+            "n": len(values),
+            "mean": round(statistics.mean(values), 3),
+            "median": round(statistics.median(values), 3),
+            "sample_stddev": (
+                round(statistics.stdev(values), 3) if len(values) > 1 else None
+            ),
+            "min": round(min(values), 3),
+            "max": round(max(values), 3),
+        }
+
+    agreed_runs = sum(
+        row.get("agentic_agent_agreement") is True for row in agentic_candidates
+    )
+    matching_runs = sum(
+        row.get("agentic_matches_mcda") is True for row in agentic_comparable
+    )
     return {
         **counts,
         "precision": (None if precision is None else round(precision, 6)),
         "recall": (None if recall is None else round(recall, 6)),
         "f1": (None if f1 is None else round(f1, 6)),
+        "agentic": {
+            "candidate_runs": len(agentic_candidates),
+            "agreed_runs": agreed_runs,
+            "agent_to_agent_agreement_rate": rate(
+                agreed_runs, len(agentic_candidates)
+            ),
+            "mcda_comparable_runs": len(agentic_comparable),
+            "mcda_matching_runs": matching_runs,
+            "agent_to_mcda_agreement_rate": rate(
+                matching_runs, len(agentic_comparable)
+            ),
+            "waiting_events": sum(
+                row.get("agentic_waiting_events", 0) for row in agentic_candidates
+            ),
+            "expired_proposals": sum(
+                row.get("agentic_expired_proposals", 0)
+                for row in agentic_candidates
+            ),
+            "consensus_latency_ms": distribution(
+                "agentic_consensus_latency_ms"
+            ),
+            "attack_to_consensus_latency_ms": distribution(
+                "agentic_attack_to_consensus_latency_ms"
+            ),
+            "proposal_collection_latency_ms": distribution(
+                "agentic_proposal_collection_latency_ms"
+            ),
+        },
     }
 
 
 def markdown_table(rows: List[Dict[str, Any]]) -> str:
     headers = [
         "run", "mode", "scenario", "classe", "decisão", "score", "confirmações",
-        "coordenador", "ações", "executada", "detecção ms", "consenso ms",
+        "coordenador", "ações", "executada", "detecção ms", "MCDA ms", "agente ms",
         "spikes base", "perda ping %", "erros API", "problema",
     ]
     lines = ["| " + " | ".join(headers) + " |",
@@ -357,7 +587,9 @@ def markdown_table(rows: List[Dict[str, Any]]) -> str:
             row.get("max_score"), len(row.get("confirming_domains", [])),
             row.get("coordinator") or "-", len(row.get("action_domains", [])),
             row.get("mitigation_executed"), row.get("detection_latency_ms"),
-            row.get("consensus_latency_ms"), row.get("baseline_spike_anomalies"),
+            row.get("mcda_consensus_latency_ms"),
+            row.get("agentic_consensus_latency_ms"),
+            row.get("baseline_spike_anomalies"),
             row.get("ping_after_loss_percent"), row.get("endpoint_errors"),
             "; ".join(row.get("invalid_reasons", [])
                       + row.get("contamination_reasons", [])) or "-",
@@ -372,6 +604,12 @@ def markdown_table(rows: List[Dict[str, Any]]) -> str:
          f"INVALID={metrics['INVALID']} "
          f"precision={metrics['precision']} "
          f"recall={metrics['recall']} f1={metrics['f1']}"),
+        ("agentic: "
+         f"AGREED={metrics['agentic']['agreed_runs']}/"
+         f"{metrics['agentic']['candidate_runs']} "
+         f"agente-agente={metrics['agentic']['agent_to_agent_agreement_rate']} "
+         f"agente-MCDA={metrics['agentic']['agent_to_mcda_agreement_rate']} "
+         f"latência média={metrics['agentic']['consensus_latency_ms']['mean']} ms"),
     ])
     return "\n".join(lines) + "\n"
 

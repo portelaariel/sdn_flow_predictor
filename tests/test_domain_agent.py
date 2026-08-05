@@ -99,8 +99,12 @@ class DomainAgentTests(unittest.TestCase):
     def test_two_relevant_agents_must_agree(self):
         coordinator = self.agent("domain-0")
         proposals = [
-            self.proposal("domain-0", "SOURCE"),
-            self.proposal("domain-1", "DESTINATION"),
+            self.proposal(
+                "domain-0", "SOURCE", created_ns=self.NOW_NS - 200_000_000
+            ),
+            self.proposal(
+                "domain-1", "DESTINATION", created_ns=self.NOW_NS - 50_000_000
+            ),
         ]
 
         decision = coordinator.decide(
@@ -114,6 +118,10 @@ class DomainAgentTests(unittest.TestCase):
         self.assertEqual(decision["required_votes"], 2)
         self.assertEqual(decision["source_cid"], "domain-0")
         self.assertEqual(decision["destination_cid"], "domain-1")
+        self.assertEqual(decision["first_proposal_ns"], self.NOW_NS - 200_000_000)
+        self.assertEqual(decision["last_proposal_ns"], self.NOW_NS - 50_000_000)
+        self.assertEqual(decision["proposal_collection_latency_ms"], 150.0)
+        self.assertEqual(decision["decision_after_last_proposal_ms"], 50.0)
 
     def test_missing_peer_proposal_waits(self):
         decision = self.agent("domain-0").decide(
