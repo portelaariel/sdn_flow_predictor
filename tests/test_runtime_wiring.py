@@ -22,6 +22,12 @@ class RuntimeWiringTests(unittest.TestCase):
         cls.workload_source = (
             ROOT / "experiments/run_mininet_workload.py"
         ).read_text(encoding="utf-8")
+        cls.dockerfile = (ROOT / "Dockerfile.flow_predictor").read_text(
+            encoding="utf-8"
+        )
+        cls.monitor_source = (
+            ROOT / "experiments/monitor_predictors.py"
+        ).read_text(encoding="utf-8")
 
     def _block(self, start_marker, end_marker):
         start = self.setup_script.index(start_marker)
@@ -94,6 +100,13 @@ class RuntimeWiringTests(unittest.TestCase):
         self.assertNotIn("time.sleep(2.0)", self.workload_source)
         self.assertIn("ping_reverse_discovery.txt", self.workload_source)
         self.assertIn("wait_for_domain_hosts(", self.workload_source)
+
+    def test_agent_modules_and_endpoint_are_wired_into_runtime(self):
+        self.assertIn("agent_protocol.py", self.dockerfile)
+        self.assertIn("domain_agent.py", self.dockerfile)
+        self.assertIn('/predictor/agent', self.monitor_source)
+        self.assertIn('"agentic": agentic', self.monitor_source)
+        self.assertIn('PREDICTOR_AGENTIC_ENABLED="$AGENTIC"', self.benchmark_source)
 
 
 if __name__ == "__main__":

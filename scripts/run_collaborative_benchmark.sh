@@ -77,6 +77,7 @@ POLL_S="${BENCHMARK_POLL_S:-0.5}"
 BUILD_IMAGE="${BENCHMARK_BUILD_IMAGE:-true}"
 BOOTSTRAP_ENV="${BENCHMARK_BOOTSTRAP_ENV:-true}"
 EXPORT_HISTORY="${BENCHMARK_EXPORT_HISTORY:-false}"
+AGENTIC="${BENCHMARK_AGENTIC_ENABLED:-false}"
 RESULTS_ROOT="${BENCHMARK_RESULTS_ROOT:-$PROJECT_ROOT/experiments/results}"
 MODEL_PATH="${PREDICTOR_OFFLINE_MODEL:-$PROJECT_ROOT/models/cic2019-drddos-udp-holt.json}"
 
@@ -86,6 +87,10 @@ for integer in "$CSETS" "$SPER" "$BASELINE_DURATION_S" "$ATTACK_DURATION_S" "$SE
     exit 2
   }
 done
+if [[ "$COLLABORATION" == "true" ]] && (( CSETS < 2 )); then
+  echo "modos collaborative-* exigem pelo menos dois domínios" >&2
+  exit 2
+fi
 for host in "$SOURCE_HOST" "$DESTINATION_HOST"; do
   [[ "$host" =~ ^h[1-9][0-9]*$ ]] || { echo "host inválido: $host" >&2; exit 2; }
 done
@@ -95,6 +100,11 @@ done
 [[ "$BUILD_IMAGE" == "true" || "$BUILD_IMAGE" == "false" ]] || exit 2
 [[ "$BOOTSTRAP_ENV" == "true" || "$BOOTSTRAP_ENV" == "false" ]] || exit 2
 [[ "$EXPORT_HISTORY" == "true" || "$EXPORT_HISTORY" == "false" ]] || exit 2
+[[ "$AGENTIC" == "true" || "$AGENTIC" == "false" ]] || exit 2
+if [[ "$AGENTIC" == "true" && "$COLLABORATION" != "true" ]]; then
+  echo "BENCHMARK_AGENTIC_ENABLED requer um modo collaborative-*" >&2
+  exit 2
+fi
 [[ -r "$MODEL_PATH" ]] || { echo "modelo offline não encontrado: $MODEL_PATH" >&2; exit 2; }
 
 TOTAL_HOSTS=$((CSETS * SPER * 2))
@@ -237,15 +247,40 @@ for ((i=0; i<CSETS; i++)); do
   }
 done
 
-echo "[benchmark] implantando preditores (collaboration=$COLLABORATION dry_run=$DRY_RUN)"
+echo "[benchmark] implantando preditores (collaboration=$COLLABORATION agentic=$AGENTIC dry_run=$DRY_RUN)"
 PREDICTOR_OFFLINE_MODEL="$MODEL_PATH" \
 PREDICTOR_OFFLINE_MODEL_REQUIRED=true \
 PREDICTOR_ONLINE_MODEL_ADAPTATION=false \
 PREDICTOR_COLLABORATION_ENABLED="$COLLABORATION" \
 PREDICTOR_COLLAB_EXPECTED_DOMAINS="$CSETS" \
 PREDICTOR_COLLAB_MIN_DOMAINS=2 \
+PREDICTOR_AGENTIC_ENABLED="$AGENTIC" \
+PREDICTOR_AGENTIC_SHADOW=true \
+PREDICTOR_AGENT_REQUIRED_VOTES=2 \
 PREDICTOR_EXPORT_ENABLED="$EXPORT_HISTORY" \
   bash "$PROJECT_ROOT/deploy_flow_predictor.sh" "$CSETS" "$DRY_RUN"
+
+if [[ "$AGENTIC" == "true" ]]; then
+  echo "[benchmark] validando agentes shadow por domínio"
+  for ((i=0; i<CSETS; i++)); do
+    port=$((PREDICTOR_PORT_BASE + i))
+    agent_payload="$(
+      curl -fsS "http://127.0.0.1:${port}/predictor/agent" 2>/dev/null || true
+    )"
+    if ! jq -e '
+      .requested == true and
+      .active == true and
+      .mode == "shadow" and
+      .authoritative == false and
+      (.agent_id | type == "string" and length > 0) and
+      (.cid | type == "string" and length > 0)
+    ' >/dev/null 2>&1 <<< "$agent_payload"; then
+      printf '%s\n' "$agent_payload" > "$OUTDIR/agent-preflight-${port}.json"
+      echo "agente shadow inativo ou inválido na porta ${port}" >&2
+      exit 1
+    fi
+  done
+fi
 
 ENDPOINTS=""
 for ((i=0; i<CSETS; i++)); do
@@ -265,6 +300,7 @@ RUN_BASELINE_RATE="$BASELINE_RATE" RUN_ATTACK_RATE="$ATTACK_RATE" \
 RUN_BASELINE_DURATION="$BASELINE_DURATION_S" RUN_ATTACK_DURATION="$ATTACK_DURATION_S" \
 RUN_CSETS="$CSETS" RUN_SPER="$SPER" RUN_STARTED_NS="$RUN_STARTED_NS" \
 RUN_GIT_COMMIT="$GIT_COMMIT" RUN_MODEL_SHA256="$MODEL_SHA256" \
+RUN_AGENTIC="$AGENTIC" \
 python3 - <<'PY'
 import json
 import os
@@ -285,6 +321,7 @@ payload = {
     "started_ns": int(os.environ["RUN_STARTED_NS"]),
     "git_commit": os.environ["RUN_GIT_COMMIT"],
     "model_sha256": os.environ["RUN_MODEL_SHA256"],
+    "agentic_shadow": os.environ["RUN_AGENTIC"] == "true",
 }
 Path(os.environ["RUN_METADATA_PATH"]).write_text(
     json.dumps(payload, indent=2, sort_keys=True) + "\n",

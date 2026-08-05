@@ -1,0 +1,387 @@
+import ast
+import json
+import math
+import threading
+import types
+import unittest
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from agent_protocol import agent_flow_hash
+from domain_agent import DomainAgent, domain_role
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_manager(namespace):
+    source = (ROOT / "flow_predictor_cnsm.py").read_text(encoding="utf-8")
+    tree = ast.parse(source, filename="flow_predictor_cnsm.py")
+    selected = [
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "AgenticShadowManager"
+    ]
+    exec(compile(ast.Module(body=selected, type_ignores=[]),
+                 "flow_predictor_cnsm.py", "exec"), namespace)
+    return namespace["AgenticShadowManager"]
+
+
+class AgenticShadowManagerTests(unittest.TestCase):
+    NOW_NS = 10_000_000_000
+
+    class FakeEtcd:
+        class Lease:
+            id = 1
+
+        class Metadata:
+            def __init__(self, key):
+                self.key = key.encode("utf-8")
+
+        def __init__(self):
+            self.values = {}
+
+        def lease(self, _ttl):
+            return self.Lease()
+
+        def put(self, key, value, lease=None):
+            self.values[key] = value.encode("utf-8")
+
+        def get_prefix(self, prefix):
+            return [
+                (value, self.Metadata(key)) for key, value in self.values.items()
+                if key.startswith(prefix)
+            ]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.etcd = cls.FakeEtcd()
+        cls.metrics = []
+        cls.manager_class = load_manager({
+            "Any": Any,
+            "Dict": Dict,
+            "List": List,
+            "Optional": Optional,
+            "Tuple": Tuple,
+            "threading": threading,
+            "json": json,
+            "math": math,
+            "time": __import__("time"),
+            "DomainAgent": DomainAgent,
+            "domain_role": domain_role,
+            "agent_flow_hash": agent_flow_hash,
+            "CONTROLLER_ID": "domain-0",
+            "AGENT_PROPOSAL_THRESHOLD": 0.65,
+            "COLLAB_PERSISTENCE_WINDOWS": 3,
+            "COLLAB_RATE_RATIO_MAX": 10.0,
+            "AGENT_PROPOSAL_TTL_S": 12.0,
+            "AGENT_REQUIRED_VOTES": 2,
+            "AGENT_NEGOTIATION_WINDOW_S": 4.0,
+            "COLLAB_EVALUATION_INTERVAL_S": 0.5,
+            "AGENT_TOPOLOGY_CACHE_S": 5.0,
+            "FLOWBLOCKER_URL": "http://flow-blocker",
+            "REQUEST_TIMEOUT_S": 1.0,
+            "WHITELIST_IPS": set(),
+            "AGENTIC_ENABLED": True,
+            "AGENTIC_SHADOW": True,
+            "now_ns": lambda: cls.NOW_NS,
+            "_metric": lambda tag, message: cls.metrics.append((tag, message)),
+            "_etcd": cls.etcd,
+            "logger": types.SimpleNamespace(
+                warning=lambda *_args, **_kwargs: None,
+                error=lambda *_args, **_kwargs: None,
+            ),
+            "requests": types.SimpleNamespace(),
+        })
+
+    def setUp(self):
+        self.etcd.values.clear()
+        self.metrics.clear()
+
+    @staticmethod
+    def evidence(cid="domain-0"):
+        return {
+            "schema_version": 1,
+            "cid": cid,
+            "flow": "10.0.0.1->10.0.0.8",
+            "src_ip": "10.0.0.1",
+            "dst_ip": "10.0.0.8",
+            "window_id": 2,
+            "ts_ns": 9_500_000_000,
+            "observed_bps": 100_000_000.0,
+            "predicted_bps": 1_000_000.0,
+            "z_score": 15.0,
+            "threshold": 5.0,
+            "persistence_windows": 2,
+            "model_id": "holt:model-a",
+            "model_reliability": 0.92,
+        }
+
+    def bare_manager(self):
+        manager = object.__new__(self.manager_class)
+
+        class Engine:
+            collaboration = None
+
+            def __init__(self):
+                self.applied = []
+
+            def apply_agentic_decision(self, flow, decision):
+                self.applied.append((flow, decision))
+
+        manager.engine = Engine()
+        manager.agent = DomainAgent(
+            "domain-0", proposal_threshold=0.65,
+            persistence_windows=3, rate_ratio_max=10.0,
+            proposal_ttl_s=12.0, required_votes=2,
+            negotiation_window_s=4.0,
+        )
+        manager.lock = threading.RLock()
+        manager.wake = threading.Event()
+        manager.local_evidence = {}
+        manager.local_proposals = {}
+        manager.dirty_flows = set()
+        manager.decisions = {}
+        manager.last_logged_state = {}
+        manager.domain_hosts = {}
+        manager.topology_cached_at = 0.0
+        manager.topology_retry_at = {}
+        manager.errors = 0
+        manager.topology_errors = 0
+        manager.proposals_published = 0
+        manager.agreements = 0
+        manager.disagreements = 0
+        manager.started_ns = self.NOW_NS
+        return manager
+
+    def test_runtime_publishes_structured_proposal_and_never_executes(self):
+        manager = self.bare_manager()
+        flow = "10.0.0.1->10.0.0.8"
+        manager.local_evidence[flow] = self.evidence()
+        manager.dirty_flows.add(flow)
+        manager._topology_context = types.MethodType(
+            lambda _self, _evidence: (
+                "SOURCE", ["domain-0", "domain-1"],
+                "domain-0", "domain-1",
+            ),
+            manager,
+        )
+
+        manager._publish_dirty_proposals()
+
+        proposal = manager.local_proposals[flow]
+        self.assertEqual(proposal["proposal"], "MITIGATE")
+        self.assertEqual(proposal["role"], "SOURCE")
+        self.assertEqual(manager.proposals_published, 1)
+        self.assertTrue(any(key.startswith("flowpredictor/agent-proposal/")
+                            for key in self.etcd.values))
+
+        peer = DomainAgent(
+            "domain-1", proposal_threshold=0.65,
+            persistence_windows=3, rate_ratio_max=10.0,
+            proposal_ttl_s=12.0, required_votes=2,
+            negotiation_window_s=4.0,
+        ).build_proposal(
+            self.evidence("domain-1"),
+            role="DESTINATION",
+            relevant_domains=["domain-0", "domain-1"],
+            source_cid="domain-0",
+            destination_cid="domain-1",
+            created_ns=self.NOW_NS,
+        )
+        peer_key = (f"flowpredictor/agent-proposal/{agent_flow_hash(flow)}/"
+                    f"{peer['window_id']}/domain-1")
+        self.etcd.put(peer_key, json.dumps(peer))
+
+        manager._evaluate_negotiations()
+
+        decision = manager.decisions[flow]
+        self.assertEqual(decision["decision"], "AGREED")
+        self.assertFalse(decision["authoritative"])
+        self.assertFalse(decision["execution"]["attempted"])
+        self.assertEqual(len(manager.engine.applied), 1)
+        self.assertEqual(manager.engine.applied[0][0], flow)
+
+    def test_expired_proposal_does_not_delete_new_dirty_evidence(self):
+        manager = self.bare_manager()
+        flow = "10.0.0.1->10.0.0.8"
+        old = self.evidence()
+        old.update({"window_id": 2, "expires_ns": self.NOW_NS - 1})
+        new = self.evidence()
+        new["window_id"] = 3
+        manager.local_proposals[flow] = old
+        manager.local_evidence[flow] = new
+        manager.dirty_flows.add(flow)
+
+        manager._evaluate_negotiations()
+
+        self.assertNotIn(flow, manager.local_proposals)
+        self.assertEqual(manager.local_evidence[flow]["window_id"], 3)
+        self.assertIn(flow, manager.dirty_flows)
+
+    def test_new_evidence_resets_episode_when_observation_ttl_expired(self):
+        manager = self.bare_manager()
+        flow = "10.0.0.1->10.0.0.8"
+        old = self.evidence()
+        old.update({
+            "observation_ns": old["ts_ns"],
+            "expires_ns": 40_000_000_000,
+        })
+        manager.local_proposals[flow] = old
+        manager.local_evidence[flow] = self.evidence()
+        manager.decisions[flow] = {"decision": "AGREED"}
+        manager.last_logged_state[flow] = "AGREED"
+        manager.agent.states[flow] = {"state": "AGREED"}
+        new = self.evidence()
+        new.update({"window_id": 3, "ts_ns": 29_500_000_000})
+        original_now = self.__class__.NOW_NS
+        self.__class__.NOW_NS = 30_000_000_000
+        try:
+            self.assertTrue(manager.submit_evidence(new))
+        finally:
+            self.__class__.NOW_NS = original_now
+
+        self.assertNotIn(flow, manager.decisions)
+        self.assertNotIn(flow, manager.last_logged_state)
+        self.assertNotIn(flow, manager.agent.states)
+        self.assertEqual(manager.local_evidence[flow]["window_id"], 3)
+
+    def test_expired_topology_cache_fails_closed(self):
+        manager = self.bare_manager()
+        manager.domain_hosts = {
+            "10.0.0.1": {"cid": "domain-0"},
+            "10.0.0.8": {"cid": "domain-1"},
+        }
+        manager.topology_cached_at = -1.0
+        globals_dict = self.manager_class._load_domain_hosts.__globals__
+        original_requests = globals_dict["requests"]
+
+        class RequestException(Exception):
+            pass
+
+        globals_dict["requests"] = types.SimpleNamespace(
+            get=lambda *_args, **_kwargs: (_ for _ in ()).throw(RequestException()),
+            exceptions=types.SimpleNamespace(RequestException=RequestException),
+        )
+        try:
+            self.assertEqual(manager._load_domain_hosts(), {})
+        finally:
+            globals_dict["requests"] = original_requests
+
+    def test_unknown_topology_is_retried_while_evidence_is_valid(self):
+        manager = self.bare_manager()
+        flow = "10.0.0.1->10.0.0.8"
+        manager.local_evidence[flow] = self.evidence()
+        manager.dirty_flows.add(flow)
+        contexts = iter([
+            ("UNKNOWN", [], None, None),
+            ("SOURCE", ["domain-0", "domain-1"],
+             "domain-0", "domain-1"),
+        ])
+        manager._topology_context = types.MethodType(
+            lambda _self, _evidence: next(contexts), manager
+        )
+
+        manager._publish_dirty_proposals()
+
+        self.assertEqual(manager.local_proposals[flow]["proposal"], "WAIT")
+        self.assertIn(flow, manager.topology_retry_at)
+
+        manager.topology_retry_at[flow] = 0.0
+        manager._publish_dirty_proposals()
+
+        self.assertEqual(manager.local_proposals[flow]["proposal"], "MITIGATE")
+        self.assertNotIn(flow, manager.topology_retry_at)
+
+    def test_stale_dirty_evidence_is_pruned_without_a_proposal(self):
+        manager = self.bare_manager()
+        flow = "10.0.0.1->10.0.0.8"
+        manager.local_evidence[flow] = self.evidence()
+        manager.dirty_flows.add(flow)
+        manager.decisions[flow] = {"decision": "WAITING"}
+        manager.last_logged_state[flow] = "WAITING"
+        manager.agent.states[flow] = {"state": "WAITING"}
+        original_now = self.__class__.NOW_NS
+        self.__class__.NOW_NS = 30_000_000_000
+        manager._topology_context = types.MethodType(
+            lambda *_args: self.fail("stale evidence reached topology lookup"),
+            manager,
+        )
+        try:
+            manager._publish_dirty_proposals()
+        finally:
+            self.__class__.NOW_NS = original_now
+
+        self.assertNotIn(flow, manager.local_evidence)
+        self.assertNotIn(flow, manager.dirty_flows)
+        self.assertNotIn(flow, manager.decisions)
+        self.assertNotIn(flow, manager.agent.states)
+
+    def test_etcd_key_must_match_proposal_identity(self):
+        manager = self.bare_manager()
+        flow = "10.0.0.1->10.0.0.8"
+        proposal = DomainAgent(
+            "domain-1", proposal_threshold=0.65,
+            persistence_windows=3, rate_ratio_max=10.0,
+            proposal_ttl_s=12.0, required_votes=2,
+            negotiation_window_s=4.0,
+        ).build_proposal(
+            self.evidence("domain-1"),
+            role="DESTINATION",
+            relevant_domains=["domain-0", "domain-1"],
+            source_cid="domain-0",
+            destination_cid="domain-1",
+            created_ns=self.NOW_NS,
+        )
+        forged_key = (
+            f"flowpredictor/agent-proposal/{agent_flow_hash(flow)}/"
+            f"{proposal['window_id']}/domain-0"
+        )
+        self.etcd.put(forged_key, json.dumps(proposal))
+
+        self.assertEqual(manager._read_proposals(flow), [])
+
+    def test_expiry_clears_current_episode_state(self):
+        manager = self.bare_manager()
+        flow = "10.0.0.1->10.0.0.8"
+        expired = self.evidence()
+        expired["expires_ns"] = self.NOW_NS - 1
+        manager.local_proposals[flow] = expired
+        manager.local_evidence[flow] = self.evidence()
+        manager.decisions[flow] = {"decision": "AGREED"}
+        manager.last_logged_state[flow] = "AGREED"
+        manager.agent.states[flow] = {"state": "AGREED"}
+
+        manager._evaluate_negotiations()
+
+        self.assertNotIn(flow, manager.decisions)
+        self.assertNotIn(flow, manager.last_logged_state)
+        self.assertNotIn(flow, manager.agent.states)
+
+    def test_mcda_comparison_requires_the_same_episode(self):
+        manager = self.bare_manager()
+        flow = "10.0.0.1->10.0.0.8"
+        collaboration = types.SimpleNamespace(
+            lock=threading.RLock(),
+            decisions={flow: {
+                "decision": "MITIGATE",
+                "score": 0.95,
+                "confirming_domains": ["domain-0", "domain-1"],
+                "evaluated_ns": self.NOW_NS,
+                "window_ids": [99],
+            }},
+        )
+        manager.engine.collaboration = collaboration
+        agent_decision = {"decision": "AGREED", "window_ids": [2]}
+
+        different = manager._legacy_comparison(flow, agent_decision)
+        self.assertFalse(different["available"])
+        self.assertIsNone(different["matches"])
+
+        collaboration.decisions[flow]["window_ids"] = [2]
+        same = manager._legacy_comparison(flow, agent_decision)
+        self.assertTrue(same["available"])
+        self.assertTrue(same["matches"])
+
+
+if __name__ == "__main__":
+    unittest.main()

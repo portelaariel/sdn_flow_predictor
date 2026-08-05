@@ -87,6 +87,14 @@ def score_collaborative_evidence(
 
     current = list(latest_by_cid.values())
     model_ids = sorted({str(item.get("model_id", "unknown")) for item in current})
+    window_ids = set()
+    for item in current:
+        try:
+            window_id = int(item.get("window_id", -1))
+        except (TypeError, ValueError):
+            continue
+        if window_id >= 0:
+            window_ids.add(window_id)
     empty_criteria = {name: 0.0 for name in weights}
     base = {
         "score": 0.0,
@@ -97,6 +105,13 @@ def score_collaborative_evidence(
         "expected_domains": expected_domains,
         "min_domains": min_domains,
         "model_ids": model_ids,
+        "window_ids": sorted(window_ids),
+        "observation_start_ns": (
+            min(int(item["ts_ns"]) for item in current) if current else None
+        ),
+        "observation_end_ns": (
+            max(int(item["ts_ns"]) for item in current) if current else None
+        ),
     }
     if not current:
         return {**base, "decision": "NO_EVIDENCE", "reason": "sem evidência recente"}
