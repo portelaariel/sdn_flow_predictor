@@ -43,7 +43,9 @@ required_files=(
   experiments/run_mininet_workload.py
   experiments/summarize_benchmark.py
   experiments/run_agentic_fault_suite.py
+  experiments/evaluate_agentic_runtime_faults.py
   scripts/run_collaborative_benchmark.sh
+  scripts/run_agentic_runtime_faults.sh
 )
 for path in "${required_files[@]}"; do
   [[ -f "$path" ]] || { echo "missing required file: $path" >&2; exit 1; }
@@ -103,6 +105,7 @@ expect_invalid_input bash scripts/run_collaborative_benchmark.sh invalid ddos
 expect_invalid_input bash scripts/run_collaborative_benchmark.sh collaborative-live ddos
 expect_invalid_input env BENCHMARK_AGENTIC_ENABLED=true \
   bash scripts/run_collaborative_benchmark.sh local-dry-run ddos
+expect_invalid_input bash scripts/run_agentic_runtime_faults.sh invalid
 echo "input_validation: ok"
 
 python3 -m unittest discover -s tests -v

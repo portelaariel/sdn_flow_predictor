@@ -1,14 +1,19 @@
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
+from experiments.evaluate_agentic_runtime_faults import evaluate
 from experiments.monitor_predictors import (
     flow_anomalies,
     flow_predictions,
     retain_new_agentic_events,
 )
-from experiments.run_mininet_workload import domain_table_has_hosts
+from experiments.run_mininet_workload import (
+    domain_table_has_hosts,
+    wait_for_attack_release,
+)
 from experiments.summarize_benchmark import (
     aggregate_metrics,
     markdown_table,
@@ -80,6 +85,114 @@ class BenchmarkToolTests(unittest.TestCase):
         self.assertFalse(domain_table_has_hosts(
             payload, "10.0.0.1", "10.0.0.8", 1, 3
         ))
+
+    def test_attack_gate_announces_readiness_and_waits_for_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gate = Path(tmp)
+            result = []
+            thread = threading.Thread(
+                target=lambda: result.append(wait_for_attack_release(gate, 2.0))
+            )
+            thread.start()
+            for _attempt in range(100):
+                if (gate / "attack.ready.json").exists():
+                    break
+                threading.Event().wait(0.01)
+            self.assertTrue((gate / "attack.ready.json").exists())
+            self.assertTrue(thread.is_alive())
+            (gate / "attack.release").touch()
+            thread.join(timeout=2.0)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result, [None])
+            self.assertTrue((gate / "attack.released.json").exists())
+
+    def test_runtime_fault_report_requires_fail_closed_and_fresh_recovery(self):
+        flow = "10.0.0.1->10.0.0.8"
+
+        def agent_payload(events, errors=0):
+            return {
+                "active": True,
+                "mode": "shadow",
+                "authoritative": False,
+                "errors": errors,
+                "decisions": [],
+                "decision_events": events,
+            }
+
+        def event(cid, decision, entered_ns, proposals=None):
+            return {
+                "event_id": f"{cid}:{decision}:{entered_ns}",
+                "flow": flow,
+                "decision": decision,
+                "state_entered_ns": entered_ns,
+                "participating_domains": ["domain-0", "domain-1"],
+                "proposals": proposals or [],
+            }
+
+        proposals = [
+            {"cid": cid, "observation_ns": 120, "created_ns": 125}
+            for cid in ("domain-0", "domain-1")
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rows_by_episode = {
+                "missing-agent": [
+                    {"port": "6060", "status": {"cid": "domain-0"},
+                     "agentic": agent_payload([
+                         event("domain-0", "WAITING_PROPOSALS", 120)
+                     ])},
+                ],
+                "missing-agent-recovery": [
+                    {"port": str(6060 + index), "status": {"cid": f"domain-{index}"},
+                     "agentic": agent_payload([
+                         event(f"domain-{index}", "AGREED", 130, proposals)
+                     ])}
+                    for index in range(2)
+                ],
+                "etcd-partition": [
+                    {"port": "6060", "status": {"cid": "domain-0"},
+                     "agentic": agent_payload([], errors=0)},
+                    {"port": "6060", "status": {"cid": "domain-0"},
+                     "agentic": agent_payload([], errors=2)},
+                ],
+                "etcd-recovery": [
+                    {"port": str(6060 + index), "status": {"cid": f"domain-{index}"},
+                     "agentic": agent_payload([
+                         event(f"domain-{index}", "AGREED", 140, proposals)
+                     ])}
+                    for index in range(2)
+                ],
+            }
+            for name, rows in rows_by_episode.items():
+                episode = root / name
+                episode.mkdir()
+                (episode / "attack_start_ns.txt").write_text("100\n", encoding="utf-8")
+                (episode / "workload_status.json").write_text(
+                    json.dumps({"valid": True}), encoding="utf-8"
+                )
+                (episode / "timeline.ndjson").write_text(
+                    "".join(json.dumps(row) + "\n" for row in rows),
+                    encoding="utf-8",
+                )
+            (root / "flowblocker-requests.log").write_text("", encoding="utf-8")
+
+            report = evaluate(root, flow, 2)
+
+            self.assertTrue(report["aggregate"]["safe"])
+            self.assertEqual(report["aggregate"]["passed"], 4)
+            self.assertTrue(report["global_checks"]["no_flowblocker_request"])
+
+            stale = rows_by_episode["etcd-recovery"][0]["agentic"]["decision_events"][0]
+            stale["proposals"][0]["observation_ns"] = 99
+            (root / "etcd-recovery" / "timeline.ndjson").write_text(
+                "".join(
+                    json.dumps(row) + "\n"
+                    for row in rows_by_episode["etcd-recovery"]
+                ),
+                encoding="utf-8",
+            )
+            unsafe = evaluate(root, flow, 2)
+            self.assertFalse(unsafe["aggregate"]["safe"])
 
     def test_agentic_run_is_invalid_when_agents_or_decisions_are_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
