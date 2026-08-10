@@ -16,6 +16,11 @@ from experiments.evaluate_agentic_live_run import (
 from experiments.evaluate_agentic_live_campaign import (
     evaluate as evaluate_agentic_live_campaign,
 )
+from experiments.evaluate_agentic_live_replication import (
+    bootstrap_mean_interval,
+    evaluate as evaluate_agentic_live_replication,
+    wilson_interval,
+)
 from experiments.evaluate_agentic_runtime_faults import evaluate
 from experiments.monitor_predictors import (
     flow_anomalies,
@@ -738,6 +743,133 @@ class BenchmarkToolTests(unittest.TestCase):
             unsafe = evaluate_agentic_live_campaign(root)
             self.assertFalse(unsafe["aggregate"]["campaign_ready"])
             self.assertFalse(unsafe["checks"]["all_benign_rejected"])
+
+    def test_agentic_live_replication_requires_balanced_frozen_protocol(self):
+        protocol = {
+            "10.0.0.1->10.0.0.8": ("h1", "h8", "1M", "50M"),
+            "10.0.0.2->10.0.0.7": ("h2", "h7", "2M", "100M"),
+            "10.0.0.3->10.0.0.6": ("h3", "h6", "5M", "150M"),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pilot_path = root / "pilot.json"
+            pilot_path.write_text(json.dumps({
+                "aggregate": {
+                    "campaign_ready": True,
+                    "operational_ready": True,
+                    "comparative_ready": True,
+                }
+            }), encoding="utf-8")
+            (root / "replication-manifest.json").write_text(json.dumps({
+                "mode": "agentic-live-statistical-replication",
+                "design": {
+                    "runs_per_scenario": 9,
+                    "repetitions_per_flow": 3,
+                    "distinct_flows": 3,
+                    "bootstrap_resamples": 100,
+                    "bootstrap_seed": 7,
+                },
+                "baseline": {
+                    "pilot_report": str(pilot_path),
+                    "model_sha256": "model-a",
+                },
+                "runtime": {
+                    "git_commit": "commit-a",
+                    "model_sha256": "model-a",
+                },
+                "execution": {
+                    "tracked_tree_clean": True,
+                    "disk_preflight_passed": True,
+                    "campaign_exit_code": 0,
+                    "campaign_summary": (
+                        "agentic-live-campaign-test/campaign-summary.json"
+                    ),
+                },
+            }), encoding="utf-8")
+            campaign_root = root / "agentic-live-campaign-test"
+            campaign_root.mkdir()
+            manifest_cases = []
+            rows = []
+            for repetition in range(3):
+                for flow, (source, destination, baseline, attack) in protocol.items():
+                    pair_id = f"{repetition}-{source}-{destination}"
+                    for scenario in ("benign", "ddos"):
+                        case_id = f"{pair_id}-{scenario}"
+                        manifest_cases.append({
+                            "case_id": case_id,
+                            "pair_id": pair_id,
+                            "scenario": scenario,
+                            "flow": flow,
+                            "baseline_rate": baseline,
+                            "attack_rate": attack,
+                        })
+                        is_attack = scenario == "ddos"
+                        rows.append({
+                            "case_id": case_id,
+                            "expected_scenario": scenario,
+                            "expected_flow": flow,
+                            "classification": "TP" if is_attack else "TN",
+                            "passed": True,
+                            "git_commit": "commit-a",
+                            "model_sha256": "model-a",
+                            "detection_latency_ms": 500 + repetition if is_attack else None,
+                            "mcda_consensus_latency_ms": 800 + repetition if is_attack else None,
+                            "agentic_consensus_latency_ms": 1100 + repetition if is_attack else None,
+                            "mcda_max_convergence_latency_ms": 300 + repetition if is_attack else None,
+                        })
+            (campaign_root / "campaign-manifest.json").write_text(
+                json.dumps({"cases": manifest_cases}), encoding="utf-8"
+            )
+            campaign_payload = {
+                "cases": rows,
+                "aggregate": {
+                    "campaign_ready": True,
+                    "operational_ready": True,
+                    "comparative_ready": True,
+                },
+                "metrics": {
+                    "agent_to_mcda_agreement_rate": 0.888889,
+                    "agent_to_mcda_domain_agreement_rate": 0.944444,
+                    "mcda_bounded_convergence_rate": 1.0,
+                    "winner_distribution": {"domain-0": 5, "domain-1": 4},
+                },
+            }
+            (campaign_root / "campaign-summary.json").write_text(
+                json.dumps(campaign_payload), encoding="utf-8"
+            )
+
+            report = evaluate_agentic_live_replication(
+                root, bootstrap_resamples=100, bootstrap_seed=7
+            )
+            self.assertTrue(report["aggregate"]["replication_ready"])
+            self.assertEqual(report["metrics"]["TP"], 9)
+            self.assertEqual(report["metrics"]["TN"], 9)
+            self.assertLess(report["metrics"]["sensitivity_ci95"]["low"], 1.0)
+            self.assertEqual(
+                report["metrics"]["latencies"]["detection_latency_ms"]["n"],
+                9,
+            )
+
+            rows.pop()
+            (campaign_root / "campaign-summary.json").write_text(json.dumps({
+                **campaign_payload, "cases": rows,
+            }), encoding="utf-8")
+            unbalanced = evaluate_agentic_live_replication(
+                root, bootstrap_resamples=100, bootstrap_seed=7
+            )
+            self.assertFalse(unbalanced["aggregate"]["replication_ready"])
+            self.assertFalse(unbalanced["checks"]["expected_case_count"])
+
+    def test_replication_confidence_intervals_are_deterministic(self):
+        interval = wilson_interval(9, 9)
+        self.assertEqual(interval["estimate"], 1.0)
+        self.assertGreater(interval["low"], 0.7)
+        self.assertLess(interval["low"], 0.71)
+        first = bootstrap_mean_interval([1, 2, 3], resamples=100, seed=11)
+        second = bootstrap_mean_interval([1, 2, 3], resamples=100, seed=11)
+        self.assertEqual(first, second)
+        self.assertLessEqual(first["low"], 2.0)
+        self.assertGreaterEqual(first["high"], 2.0)
 
     def test_agentic_live_summary_uses_agent_claim_and_mcda_observation(self):
         flow = "10.0.0.1->10.0.0.8"
