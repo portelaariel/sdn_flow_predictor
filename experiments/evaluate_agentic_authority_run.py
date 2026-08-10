@@ -45,7 +45,15 @@ def evaluate(run_dir: Path) -> Dict[str, Any]:
     benchmark_run = ((benchmark.get("runs") or [{}])[0]
                      if isinstance(benchmark, dict) else {})
     flow = str(metadata.get("flow") or "")
+    scenario = str(metadata.get("scenario") or "")
     attack_start_ns = read_ns(run_dir / "attack_start_ns.txt")
+    try:
+        run_started_ns = int(metadata.get("started_ns", 0) or 0)
+    except (TypeError, ValueError):
+        run_started_ns = 0
+    evaluation_start_ns = (
+        attack_start_ns if scenario == "ddos" else run_started_ns
+    )
     try:
         expected_domains = max(1, int(metadata.get("controller_sets", 2) or 2))
     except (TypeError, ValueError):
@@ -75,7 +83,7 @@ def evaluate(run_dir: Path) -> Dict[str, Any]:
             if not isinstance(event, dict) or event.get("flow") != flow:
                 continue
             entered_ns = int(event.get("state_entered_ns", 0) or 0)
-            if entered_ns < attack_start_ns:
+            if entered_ns < evaluation_start_ns:
                 continue
             copy = dict(event)
             copy["observed_by"] = str(agent.get("cid") or cid)
@@ -151,49 +159,78 @@ def evaluate(run_dir: Path) -> Dict[str, Any]:
                 and "actions=drop" in content):
             drop_rules.append(str(path))
 
-    checks = {
+    common_checks = {
         "metadata_is_authority_dry_run": (
             metadata.get("mode") == "collaborative-dry-run"
             and metadata.get("agentic_enabled") is True
             and metadata.get("agentic_mode") == "authority-dry-run"
+            and scenario in {"benign", "ddos"}
         ),
-        "attack_timestamp_valid": attack_start_ns > 0,
         "workload_valid": workload.get("valid") is True,
-        "benchmark_tp": benchmark_run.get("classification") == "TP",
         "no_endpoint_errors": endpoint_errors == 0,
         "all_agents_active": len(active_domains) == expected_domains,
-        "all_agents_authorized": len(authorized_domains) == expected_domains,
-        "fresh_evidence_only": (
-            len(fresh_authorized) == len(authorized)
-            and len({
-                event.get("observed_by") for event in fresh_authorized
-            }) == expected_domains
-        ),
-        "all_authorizations_have_claim": (
-            len(claim_records) == len(authorized)
-            and all(isinstance(claim, dict) for claim in claim_records)
-        ),
-        "single_claim_winner": len(winners) == 1 and len(winner_domains) == 1,
-        "claim_owner_consistent": claim_coordinators == winner_domains,
-        "winner_matches_would_execute": would_execute == winner_domains,
-        "claim_not_degraded": not degraded_claims,
         "agent_never_actuated": not attempted_or_executed,
-        "mcda_comparison_available": (
-            len(mcda_by_domain) == expected_domains
-            and len(mcda_records) == len(authorized)
-        ),
-        "agent_matches_mcda": (
-            bool(mcda_records) and all(matches for _domain, matches in mcda_records)
-        ),
         "no_flowblocker_request": blocker_requests == 0,
         "no_drop_rule": not drop_rules,
     }
+    if scenario == "ddos":
+        scenario_checks = {
+            "attack_timestamp_valid": attack_start_ns > 0,
+            "benchmark_tp": benchmark_run.get("classification") == "TP",
+            "all_agents_authorized": len(authorized_domains) == expected_domains,
+            "fresh_evidence_only": (
+                len(fresh_authorized) == len(authorized)
+                and len({
+                    event.get("observed_by") for event in fresh_authorized
+                }) == expected_domains
+            ),
+            "all_authorizations_have_claim": (
+                len(claim_records) == len(authorized)
+                and all(isinstance(claim, dict) for claim in claim_records)
+            ),
+            "single_claim_winner": (
+                len(winners) == 1 and len(winner_domains) == 1
+            ),
+            "claim_owner_consistent": claim_coordinators == winner_domains,
+            "winner_matches_would_execute": would_execute == winner_domains,
+            "claim_not_degraded": not degraded_claims,
+            "mcda_comparison_available": (
+                len(mcda_by_domain) == expected_domains
+                and len(mcda_records) == len(authorized)
+            ),
+            "agent_matches_mcda": (
+                bool(mcda_records)
+                and all(matches for _domain, matches in mcda_records)
+            ),
+        }
+    else:
+        scenario_checks = {
+            "run_timestamp_valid": run_started_ns > 0,
+            "benchmark_tn": benchmark_run.get("classification") == "TN",
+            "no_agent_agreement": not agreed,
+            "no_agent_authorization": not authorized,
+            "no_agent_claim": not claim_records,
+            "no_would_execute": not would_execute,
+        }
+    checks = {**common_checks, **scenario_checks}
     return {
         "schema_version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "mode": "authority-dry-run",
         "run": run_dir.name,
+        "scenario": scenario,
         "flow": flow,
+        "source_host": metadata.get("source_host"),
+        "destination_host": metadata.get("destination_host"),
+        "baseline_rate": metadata.get("baseline_rate"),
+        "attack_rate": metadata.get("attack_rate"),
+        "git_commit": metadata.get("git_commit"),
+        "model_sha256": metadata.get("model_sha256"),
+        "classification": benchmark_run.get("classification"),
+        "detection_latency_ms": benchmark_run.get("detection_latency_ms"),
+        "agentic_consensus_latency_ms": benchmark_run.get(
+            "agentic_consensus_latency_ms"
+        ),
         "active_domains": sorted(active_domains),
         "agreed_events": len(agreed),
         "authorized_domains": sorted(str(value) for value in authorized_domains),
@@ -215,6 +252,7 @@ def print_report(report: Dict[str, Any]) -> None:
     print(json.dumps({
         "mode": report["mode"],
         "run": report["run"],
+        "scenario": report["scenario"],
         "flow": report["flow"],
         "authorized_domains": report["authorized_domains"],
         "claim_winner_domains": report["claim_winner_domains"],

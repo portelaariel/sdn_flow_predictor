@@ -308,6 +308,28 @@ atuação, zero request ao FlowBlocker e zero regra DROP. O resultado fica em
 `experiments/results/authority-dry-run-*/authority-summary.json`; qualquer
 invariante violada produz status de saída diferente de zero.
 
+Uma execução isolada valida o encadeamento, mas não é evidência suficiente para
+promover os agentes. A campanha de promoção executa controles positivos e
+negativos em pares de hosts e taxas diferentes:
+
+``` bash
+bash scripts/run_agentic_authority_campaign.sh
+```
+
+O padrão executa seis casos isolados: benigno e DDoS para `h1->h8`, `h2->h7`
+e `h3->h6`, usando respectivamente `1M/50M`, `2M/100M` e `5M/150M`. O ambiente
+é recriado entre casos; a imagem só precisa ser construída no primeiro. O
+agregador exige `TP` com dois agentes autorizados e um único claim nos casos
+DDoS, além de `TN` sem `AGREED`, autorização, claim ou `would_execute` nos
+controles benignos. Também exige um único commit, um único artefato de modelo,
+zero atuação, zero request ao FlowBlocker e zero DROP em toda a campanha.
+
+Os resultados ficam em
+`experiments/results/authority-campaign-*/campaign-summary.json` e `.md`. O
+campo `promotion_ready=true` significa apenas que o estágio dry-run atingiu os
+critérios experimentais configurados; ele não habilita nem conecta
+`authority-live` automaticamente.
+
 A matriz determinística de fault injection pode ser executada sem Mininet,
 containers ou privilégios de administrador:
 
@@ -797,6 +819,9 @@ BENCHMARK_AGENTIC_ENABLED=true \
 
 # Agentes revalidam AGREED e elegem quem agiria, sem chamar o FlowBlocker
 bash scripts/run_agentic_authority_dry_run.sh
+
+# Campanha positiva/negativa antes de considerar autoridade operacional
+bash scripts/run_agentic_authority_campaign.sh
 
 # Após o claim anterior expirar, valida o DROP real
 bash scripts/run_collaborative_benchmark.sh \
