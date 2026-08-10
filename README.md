@@ -279,6 +279,29 @@ O score local do agente é explicável e combina severidade Holt (0,35), razão 
 vazão (0,20), persistência (0,20), confiabilidade do modelo (0,15) e papel
 topológico (0,10). Não há LLM ou aprendizado por reforço no caminho crítico.
 
+#### Gate de segurança para autoridade futura
+
+`agent_authority.py` adiciona uma segunda validação entre `AGREED` e qualquer
+ação futura. O gate revalida identidade do evento, fluxo, quórum, papéis,
+topologia, modelo, janela e TTL. Um claim separado em
+`flowpredictor/agent-mitigation-claim/<hash>` garante um único vencedor e falha
+fechada quando o ETCD está indisponível. Nesta versão o gate e o claim são
+testados, mas permanecem deliberadamente desconectados do FlowBlocker.
+
+A matriz determinística de fault injection pode ser executada sem Mininet,
+containers ou privilégios de administrador:
+
+``` bash
+python3 experiments/run_agentic_fault_suite.py \
+  --output experiments/results/agentic-fault-gate
+```
+
+Ela cobre ausência de agente, TTL, incompatibilidade de modelo/topologia, veto,
+divergência, duplicação, episódio antigo, payload `AGREED` adulterado, falha do
+ETCD e disputa simultânea do claim. O relatório registra explicitamente
+`dataplane_touched=false`; qualquer autorização insegura produz status de saída
+diferente de zero e também faz `scripts/validate_repository.sh` falhar.
+
 ### 2.7 Mitigação autônoma - guard-rails antes de agir
 
 A resposta automatizada só é segura se for **conservadora por

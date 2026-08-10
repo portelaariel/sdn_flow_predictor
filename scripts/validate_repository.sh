@@ -27,6 +27,7 @@ required_files=(
   flow_predictor_cnsm.py
   agent_protocol.py
   domain_agent.py
+  agent_authority.py
   collaborative_decision.py
   offline_model.py
   train_offline_model.py
@@ -41,6 +42,7 @@ required_files=(
   experiments/monitor_predictors.py
   experiments/run_mininet_workload.py
   experiments/summarize_benchmark.py
+  experiments/run_agentic_fault_suite.py
   scripts/run_collaborative_benchmark.sh
 )
 for path in "${required_files[@]}"; do
@@ -104,4 +106,5 @@ expect_invalid_input env BENCHMARK_AGENTIC_ENABLED=true \
 echo "input_validation: ok"
 
 python3 -m unittest discover -s tests -v
+python3 experiments/run_agentic_fault_suite.py --quiet
 bash tests/test_deploy_script.sh
