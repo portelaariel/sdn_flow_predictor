@@ -51,6 +51,12 @@ def evaluate(root: Path) -> Dict[str, Any]:
     expected_cases = manifest.get("cases") or []
     minimums = manifest.get("minimums") or {}
     prerequisites = manifest.get("prerequisites") or {}
+    try:
+        expected_convergence_window_ms = float(
+            manifest.get("mcda_convergence_window_ms", 1000.0)
+        )
+    except (TypeError, ValueError):
+        expected_convergence_window_ms = 0.0
     if not isinstance(expected_cases, list):
         expected_cases = []
     if not isinstance(minimums, dict):
@@ -119,6 +125,18 @@ def evaluate(root: Path) -> Dict[str, Any]:
                     "ping_after_loss_percent"
                 ),
                 "agentic_matches_mcda": report.get("agentic_matches_mcda"),
+                "agentic_mcda_comparisons": (
+                    report.get("agentic_mcda_comparisons") or {}
+                ),
+                "mcda_converged_within_bound": report.get(
+                    "mcda_converged_within_bound"
+                ),
+                "mcda_convergence_window_ms": report.get(
+                    "mcda_convergence_window_ms"
+                ),
+                "mcda_max_convergence_latency_ms": report.get(
+                    "mcda_max_convergence_latency_ms"
+                ),
             })
         else:
             row.update({
@@ -132,6 +150,10 @@ def evaluate(root: Path) -> Dict[str, Any]:
                 "agentic_consensus_latency_ms": None,
                 "ping_after_loss_percent": None,
                 "agentic_matches_mcda": None,
+                "agentic_mcda_comparisons": {},
+                "mcda_converged_within_bound": None,
+                "mcda_convergence_window_ms": None,
+                "mcda_max_convergence_latency_ms": None,
             })
         row["identity_matches_manifest"] = (
             row["scenario"] == row["expected_scenario"]
@@ -178,6 +200,7 @@ def evaluate(root: Path) -> Dict[str, Any]:
     checks = {
         "manifest_valid": bool(expected_cases) and len(expected_ids) == len(expected_cases),
         "prerequisites_valid": prerequisites_valid,
+        "convergence_window_valid": expected_convergence_window_ms > 0,
         "minimums_valid": minimums_valid,
         "all_cases_reported": (
             len(rows) == len(expected_cases)
@@ -213,8 +236,13 @@ def evaluate(root: Path) -> Dict[str, Any]:
             and row["drop_rules"] == 0
             for row in benign_rows
         ),
-        "all_agents_match_mcda": bool(ddos_rows) and all(
-            row["agentic_matches_mcda"] is True for row in ddos_rows
+        "all_mcda_observers_converged": bool(ddos_rows) and all(
+            row["mcda_converged_within_bound"] is True for row in ddos_rows
+        ),
+        "single_mcda_convergence_window": bool(ddos_rows) and all(
+            row["mcda_convergence_window_ms"]
+            == expected_convergence_window_ms
+            for row in ddos_rows
         ),
         "one_flowblocker_request_per_attack": sum(
             row["flowblocker_requests"] for row in rows
@@ -230,13 +258,27 @@ def evaluate(root: Path) -> Dict[str, Any]:
             if isinstance(row.get(field), (int, float))
         ]
 
-    campaign_ready = all(checks.values())
+    operational_checks = {
+        name: passed for name, passed in checks.items()
+        if name != "all_mcda_observers_converged"
+    }
+    operational_ready = all(operational_checks.values())
+    comparative_ready = checks["all_mcda_observers_converged"]
+    campaign_ready = operational_ready and comparative_ready
+    comparison_rows = [
+        comparison
+        for row in ddos_rows
+        for comparison in row["agentic_mcda_comparisons"].values()
+        if isinstance(comparison, dict)
+        and isinstance(comparison.get("matches"), bool)
+    ]
     return {
         "schema_version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "mode": "authority-live-multiflow-campaign",
         "root": str(root),
         "prerequisites": prerequisites,
+        "mcda_convergence_window_ms": expected_convergence_window_ms,
         "checks": checks,
         "cases": rows,
         "unexpected_reports": unexpected,
@@ -248,12 +290,26 @@ def evaluate(root: Path) -> Dict[str, Any]:
                 sum(row["agentic_matches_mcda"] is True for row in ddos_rows),
                 len(ddos_rows),
             ),
+            "agent_to_mcda_domain_agreement_rate": rate(
+                sum(item["matches"] is True for item in comparison_rows),
+                len(comparison_rows),
+            ),
+            "mcda_bounded_convergence_rate": rate(
+                sum(
+                    row["mcda_converged_within_bound"] is True
+                    for row in ddos_rows
+                ),
+                len(ddos_rows),
+            ),
             "detection_latency_ms": distribution(values("detection_latency_ms")),
             "mcda_consensus_latency_ms": distribution(
                 values("mcda_consensus_latency_ms")
             ),
             "agentic_consensus_latency_ms": distribution(
                 values("agentic_consensus_latency_ms")
+            ),
+            "mcda_convergence_latency_ms": distribution(
+                values("mcda_max_convergence_latency_ms")
             ),
             "ping_after_loss_percent": distribution(
                 values("ping_after_loss_percent")
@@ -267,6 +323,8 @@ def evaluate(root: Path) -> Dict[str, Any]:
             "failed": sum(not row["passed"] for row in rows),
             "checks_passed": sum(checks.values()),
             "checks_total": len(checks),
+            "operational_ready": operational_ready,
+            "comparative_ready": comparative_ready,
             "campaign_ready": campaign_ready,
         },
     }
@@ -274,8 +332,8 @@ def evaluate(root: Path) -> Dict[str, Any]:
 
 def markdown(report: Dict[str, Any]) -> str:
     lines = [
-        "| caso | cenário | fluxo | classe | gate | executor | requests | DROP | agente=MCDA |",
-        "| --- | --- | --- | --- | --- | --- | ---: | ---: | --- |",
+        "| caso | cenário | fluxo | classe | gate | executor | requests | DROP | agente=MCDA@autoridade | MCDA convergiu |",
+        "| --- | --- | --- | --- | --- | --- | ---: | ---: | --- | --- |",
     ]
     for row in report["cases"]:
         lines.append(
@@ -284,7 +342,8 @@ def markdown(report: Dict[str, Any]) -> str:
             f"{'PASS' if row['passed'] else 'FAIL'} | "
             f"{','.join(row['execution_domains']) or '-'} | "
             f"{row['flowblocker_requests']} | {row['drop_rules']} | "
-            f"{row['agentic_matches_mcda'] if row['expected_scenario'] == 'ddos' else '-'} |"
+            f"{row['agentic_matches_mcda'] if row['expected_scenario'] == 'ddos' else '-'} | "
+            f"{row['mcda_converged_within_bound'] if row['expected_scenario'] == 'ddos' else '-'} |"
         )
     metrics, aggregate = report["metrics"], report["aggregate"]
     lines.extend([
@@ -293,11 +352,16 @@ def markdown(report: Dict[str, Any]) -> str:
             f"TP={metrics['TP']} TN={metrics['TN']} FP={metrics['FP']} "
             f"FN={metrics['FN']} precision={metrics['precision']} "
             f"recall={metrics['recall']} specificity={metrics['specificity']} "
-            f"f1={metrics['f1']} agente-MCDA="
-            f"{metrics['agent_to_mcda_agreement_rate']}"
+            f"f1={metrics['f1']} agente-MCDA@autoridade="
+            f"{metrics['agent_to_mcda_agreement_rate']} "
+            f"agente-MCDA@domínio="
+            f"{metrics['agent_to_mcda_domain_agreement_rate']} "
+            f"MCDA-convergência={metrics['mcda_bounded_convergence_rate']}"
         ),
         (
             f"campaign_ready={str(aggregate['campaign_ready']).lower()} "
+            f"operational_ready={str(aggregate['operational_ready']).lower()} "
+            f"comparative_ready={str(aggregate['comparative_ready']).lower()} "
             f"cases={aggregate['passed']}/{aggregate['expected']} "
             f"checks={aggregate['checks_passed']}/{aggregate['checks_total']}"
         ),

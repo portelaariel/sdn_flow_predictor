@@ -474,8 +474,10 @@ class BenchmarkToolTests(unittest.TestCase):
                 "event_id": f"{cid}:live",
                 "flow": flow,
                 "decision": "AGREED",
+                "window_ids": [2],
                 "state_entered_ns": attack_ns + 500_000_000,
                 "authority": {
+                    "evaluated_ns": attack_ns + 500_000_000,
                     "authorized": True,
                     "claim": {
                         "won": won,
@@ -486,10 +488,11 @@ class BenchmarkToolTests(unittest.TestCase):
                         "available": True,
                         "matches": True,
                         "basis": "authority_evaluation",
-                        "captured_ns": attack_ns + 450_000_000,
+                        "captured_ns": attack_ns + 500_000_000,
                         "mcda": {
                             "decision": "MITIGATE",
                             "evaluated_ns": attack_ns + 400_000_000,
+                            "window_ids": [2],
                         },
                     },
                 },
@@ -514,6 +517,7 @@ class BenchmarkToolTests(unittest.TestCase):
                         "flow": flow,
                         "decision": "MITIGATE",
                         "evaluated_ns": attack_ns + 400_000_000,
+                        "window_ids": [2],
                         "claim": None,
                         "mitigation": {
                             "attempted": False,
@@ -565,6 +569,56 @@ class BenchmarkToolTests(unittest.TestCase):
             self.assertEqual(report["winner_domains"], ["domain-0"])
             self.assertEqual(report["execution_domains"], ["domain-0"])
             self.assertTrue(report["agentic_matches_mcda"])
+            self.assertTrue(report["mcda_converged_within_bound"])
+
+            # Uma divergência instantânea do observador não invalida a
+            # segurança agentic. A convergência deve ocorrer no mesmo episódio
+            # e dentro do limite experimental.
+            comparison = rows[0]["agentic"]["decisions"][0]["authority"][
+                "mcda_comparison"
+            ]
+            comparison.update({
+                "matches": False,
+                "mcda": {
+                    "decision": "CORROBORATED",
+                    "evaluated_ns": attack_ns + 400_000_000,
+                    "window_ids": [2],
+                },
+            })
+            rows[0]["collaboration"]["decisions"][0].update({
+                "decision": "CORROBORATED",
+                "evaluated_ns": attack_ns + 400_000_000,
+            })
+            converged = json.loads(json.dumps(rows[0]))
+            converged["sampled_ns"] = attack_ns + 1_100_000_000
+            converged["collaboration"]["decisions"] = [{
+                "flow": flow,
+                "decision": "MITIGATE",
+                "evaluated_ns": attack_ns + 1_000_000_000,
+                "window_ids": [2],
+                "claim": None,
+                "mitigation": {
+                    "attempted": False,
+                    "executed": False,
+                    "owner": "agentic",
+                },
+            }]
+            (run_dir / "timeline.ndjson").write_text(
+                "".join(json.dumps(item) + "\n" for item in rows + [converged]),
+                encoding="utf-8",
+            )
+            lagged = evaluate_agentic_live_run(run_dir)
+            self.assertTrue(lagged["aggregate"]["safe"])
+            self.assertFalse(lagged["agentic_matches_mcda"])
+            self.assertFalse(
+                lagged["observational_checks"][
+                    "agent_matches_mcda_at_authority"
+                ]
+            )
+            self.assertTrue(lagged["mcda_converged_within_bound"])
+            self.assertEqual(
+                lagged["mcda_convergence"]["domain-0"]["latency_ms"], 500.0
+            )
 
             rows[0]["collaboration"]["decisions"][0]["claim"] = {
                 "won": True,
@@ -583,6 +637,7 @@ class BenchmarkToolTests(unittest.TestCase):
             root = Path(tmp)
             manifest = {
                 "minimums": {"ddos": 1, "benign": 1, "distinct_flows": 1},
+                "mcda_convergence_window_ms": 1000,
                 "prerequisites": {
                     "promotion_ready": True,
                     "canary_ready": True,
@@ -611,6 +666,10 @@ class BenchmarkToolTests(unittest.TestCase):
                 "agentic_consensus_latency_ms": None,
                 "ping_after_loss_percent": 0.0,
                 "agentic_matches_mcda": None,
+                "agentic_mcda_comparisons": {},
+                "mcda_converged_within_bound": None,
+                "mcda_max_convergence_latency_ms": None,
+                "mcda_convergence_window_ms": 1000.0,
                 "checks": {},
                 "aggregate": {"safe": True},
             }
@@ -635,7 +694,13 @@ class BenchmarkToolTests(unittest.TestCase):
                 "mcda_consensus_latency_ms": 900.0,
                 "agentic_consensus_latency_ms": 1200.0,
                 "ping_after_loss_percent": 100.0,
-                "agentic_matches_mcda": True,
+                "agentic_matches_mcda": False,
+                "agentic_mcda_comparisons": {
+                    "domain-0": {"matches": False},
+                    "domain-1": {"matches": True},
+                },
+                "mcda_converged_within_bound": True,
+                "mcda_max_convergence_latency_ms": 588.775,
             }
             for case_id, payload in (("01-benign", benign), ("01-ddos", ddos)):
                 case_dir = root / case_id
@@ -655,8 +720,16 @@ class BenchmarkToolTests(unittest.TestCase):
             self.assertEqual(report["metrics"]["TP"], 1)
             self.assertEqual(report["metrics"]["TN"], 1)
             self.assertEqual(
-                report["metrics"]["agent_to_mcda_agreement_rate"], 1.0
+                report["metrics"]["agent_to_mcda_agreement_rate"], 0.0
             )
+            self.assertEqual(
+                report["metrics"]["agent_to_mcda_domain_agreement_rate"], 0.5
+            )
+            self.assertEqual(
+                report["metrics"]["mcda_bounded_convergence_rate"], 1.0
+            )
+            self.assertTrue(report["aggregate"]["operational_ready"])
+            self.assertTrue(report["aggregate"]["comparative_ready"])
 
             benign["execution_domains"] = ["domain-0"]
             (root / "01-benign" / "agentic-live-summary.json").write_text(
