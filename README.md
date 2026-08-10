@@ -422,6 +422,50 @@ O limite pode ser alterado explicitamente com
 `AGENTIC_LIVE_CAMPAIGN_MCDA_CONVERGENCE_WINDOW_MS`; o valor usado é gravado no
 manifesto e deve ser idêntico em todos os casos.
 
+### Replicação estatística congelada
+
+Uma campanha live aprovada é um piloto operacional, não uma amostra suficiente
+para concluir repetibilidade. O estágio seguinte executa um protocolo balanceado
+de 18 casos com atuação real:
+
+``` bash
+bash scripts/run_agentic_authority_live_replication.sh \
+  --allow-agentic-mitigation
+```
+
+O padrão repete três vezes cada combinação cenário/fluxo: nove controles
+benignos e nove ataques distribuídos igualmente entre `h1->h8`, `h2->h7` e
+`h3->h6`. As taxas permanecem congeladas em `1M/50M`, `2M/100M` e
+`5M/150M`; cada controle benigno precisa passar antes que seu ataque seja
+liberado. O runner também exige árvore Git rastreada limpa, commit descendente
+do piloto, mesmo SHA-256 do modelo promovido, campanha piloto integralmente
+aprovada e pelo menos 512 MiB livres. Arquivos não rastreados de resultados
+não invalidam o preflight.
+
+O manifesto registra commit, modelo, relatórios ancestrais, durações, janela de
+convergência, desenho amostral e espaço livre inicial. Esses valores são
+definidos antes da primeira execução e reutilizados em todos os casos; não há
+ajuste de pesos, limiares ou taxas entre repetições. O número total de ataques
+pode ser elevado para outro múltiplo de três entre 9 e 18 com
+`AGENTIC_REPLICATION_REPETITIONS`, preservando o balanceamento.
+
+O relatório `replication-summary.json`/`.md`, dentro de
+`experiments/results/agentic-live-replication-*`, contém a matriz de confusão,
+intervalos binomiais de Wilson de 95% para sensibilidade e especificidade,
+distribuições por fluxo e intervalos bootstrap de 95% para as médias de
+latência. `replication_ready=true` exige todos os 18 casos, três repetições por
+cenário e fluxo, TN em todos os controles, TP e mitigação segura em todos os
+ataques, convergência MCDA limitada, um único commit, um único modelo e todos os
+preflights. O intervalo de Wilson permanece largo com nove ataques; ele torna
+explícita a incerteza e evita interpretar uma taxa observada de 100% como prova
+de desempenho perfeito.
+
+Para servidores com pouco armazenamento, o limite de preflight pode ser
+alterado com `AGENTIC_REPLICATION_MIN_FREE_MB`, mas somente depois de medir o
+espaço necessário; o padrão é 512 MiB. O runner não exporta históricos de
+predição e reutiliza imagens Docker depois do primeiro caso, mas conserva logs
+e evidências de cada repetição para auditoria.
+
 A matriz determinística de fault injection pode ser executada sem Mininet,
 containers ou privilégios de administrador:
 

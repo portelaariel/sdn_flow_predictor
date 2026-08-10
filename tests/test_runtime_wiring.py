@@ -37,6 +37,9 @@ class RuntimeWiringTests(unittest.TestCase):
         cls.authority_live_campaign_source = (
             ROOT / "scripts/run_agentic_authority_live_campaign.sh"
         ).read_text(encoding="utf-8")
+        cls.authority_live_replication_source = (
+            ROOT / "scripts/run_agentic_authority_live_replication.sh"
+        ).read_text(encoding="utf-8")
         cls.dockerfile = (ROOT / "Dockerfile.flow_predictor").read_text(
             encoding="utf-8"
         )
@@ -176,6 +179,20 @@ class RuntimeWiringTests(unittest.TestCase):
         self.assertIn("BENCHMARK_BOOTSTRAP_ENV=true", source)
         self.assertIn("agentic-live", source)
         self.assertIn("evaluate_agentic_live_campaign.py", source)
+
+    def test_authority_live_replication_freezes_design_and_checks_preflight(self):
+        source = self.authority_live_replication_source
+        self.assertIn("--allow-agentic-mitigation", source)
+        self.assertIn("campaign_ready == true", source)
+        self.assertIn("operational_ready == true", source)
+        self.assertIn("comparative_ready == true", source)
+        self.assertIn("merge-base --is-ancestor", source)
+        self.assertIn("diff --quiet --ignore-submodules", source)
+        self.assertIn("AGENTIC_REPLICATION_MIN_FREE_MB", source)
+        self.assertIn("AGENTIC_REPLICATION_REPETITIONS:-9", source)
+        self.assertIn("AGENTIC_LIVE_CAMPAIGN_SOURCE_HOSTS=h1,h2,h3", source)
+        self.assertIn("AGENTIC_LIVE_CAMPAIGN_ATTACK_RATES=50M,100M,150M", source)
+        self.assertIn("evaluate_agentic_live_replication.py", source)
 
 
 if __name__ == "__main__":
