@@ -488,6 +488,39 @@ class AgenticShadowManagerTests(unittest.TestCase):
         self.assertTrue(same["available"])
         self.assertTrue(same["matches"])
 
+    def test_mcda_comparison_uses_history_after_current_episode_advances(self):
+        manager = self.bare_manager()
+        flow = "10.0.0.1->10.0.0.8"
+        collaboration = types.SimpleNamespace(
+            lock=threading.RLock(),
+            decisions={flow: {
+                "flow": flow,
+                "decision": "SUSPECT",
+                "score": 0.7,
+                "confirming_domains": ["domain-0"],
+                "evaluated_ns": self.NOW_NS + 2,
+                "window_ids": [3],
+            }},
+            decision_events=deque([{
+                "flow": flow,
+                "decision": "MITIGATE",
+                "score": 0.95,
+                "confirming_domains": ["domain-0", "domain-1"],
+                "evaluated_ns": self.NOW_NS + 1,
+                "window_ids": [2],
+            }], maxlen=200),
+        )
+        manager.engine.collaboration = collaboration
+
+        comparison = manager._legacy_comparison(
+            flow, {"decision": "AGREED", "window_ids": [2]}
+        )
+
+        self.assertTrue(comparison["available"])
+        self.assertTrue(comparison["matches"])
+        self.assertEqual(comparison["matched_window_ids"], [2])
+        self.assertEqual(comparison["mcda"]["decision"], "MITIGATE")
+
 
 if __name__ == "__main__":
     unittest.main()

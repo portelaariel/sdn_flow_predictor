@@ -1,5 +1,7 @@
+import copy
 import unittest
 
+from agent_authority import evaluate_agentic_authority
 from agent_protocol import validate_agent_proposal
 from domain_agent import DomainAgent, domain_role
 
@@ -82,6 +84,79 @@ class DomainAgentTests(unittest.TestCase):
         self.assertEqual(proposal["belief"], "DDOS_LIKELY")
         self.assertGreaterEqual(proposal["confidence"], 0.65)
         self.assertEqual(validate_agent_proposal(proposal), proposal)
+
+    def test_epoch_nanosecond_ttl_does_not_create_false_staleness(self):
+        created_ns = 1_785_956_000_000_000_129
+        observation_ns = created_ns - 500_000_000
+        source = self.proposal(
+            "domain-0", "SOURCE", created_ns=created_ns,
+            ts_ns=observation_ns,
+        )
+        destination = self.proposal(
+            "domain-1", "DESTINATION", created_ns=created_ns + 1,
+            ts_ns=observation_ns + 1,
+        )
+        self.assertEqual(
+            source["expires_ns"] - source["created_ns"], 12_000_000_000
+        )
+        self.assertEqual(
+            destination["expires_ns"] - destination["created_ns"],
+            12_000_000_000,
+        )
+
+        decision = self.agent("domain-0").decide(
+            [source, destination],
+            flow="10.0.0.1->10.0.0.8",
+            now_ns_value=created_ns + 2,
+        )
+        decision["event_id"] = "epoch-ns-regression"
+        authorization = evaluate_agentic_authority(
+            decision,
+            now_ns_value=created_ns + 3,
+            expected_flow="10.0.0.1->10.0.0.8",
+            max_proposal_age_ns=12_000_000_000,
+        )
+        self.assertTrue(authorization["authorized"])
+
+        # Payload legado arredondado em 127 ns continua válido, mas a idade da
+        # observação jamais recebe essa tolerância.
+        rounded = copy.deepcopy(decision)
+        rounded["event_id"] = "legacy-rounded-ttl"
+        rounded["proposals"][0]["expires_ns"] += 127
+        self.assertTrue(evaluate_agentic_authority(
+            rounded,
+            now_ns_value=created_ns + 3,
+            expected_flow="10.0.0.1->10.0.0.8",
+            max_proposal_age_ns=12_000_000_000,
+        )["authorized"])
+
+        oversized_ttl = copy.deepcopy(decision)
+        oversized_ttl["event_id"] = "oversized-proposal-ttl"
+        oversized_ttl["proposals"][0]["expires_ns"] += 1_025
+        oversized_authorization = evaluate_agentic_authority(
+            oversized_ttl,
+            now_ns_value=created_ns + 3,
+            expected_flow="10.0.0.1->10.0.0.8",
+            max_proposal_age_ns=12_000_000_000,
+        )
+        self.assertFalse(oversized_authorization["authorized"])
+        self.assertEqual(
+            oversized_authorization["code"], "proposal_ttl_exceeds_limit"
+        )
+
+        stale = copy.deepcopy(decision)
+        stale["event_id"] = "stale-observation"
+        stale["proposals"][0]["observation_ns"] = (
+            created_ns + 3 - 12_000_000_001
+        )
+        stale_authorization = evaluate_agentic_authority(
+            stale,
+            now_ns_value=created_ns + 3,
+            expected_flow="10.0.0.1->10.0.0.8",
+            max_proposal_age_ns=12_000_000_000,
+        )
+        self.assertFalse(stale_authorization["authorized"])
+        self.assertEqual(stale_authorization["code"], "proposal_stale")
 
     def test_unknown_topology_waits_instead_of_authorizing_action(self):
         proposal = self.agent("domain-0").build_proposal(

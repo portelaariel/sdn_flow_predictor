@@ -61,12 +61,26 @@ def evaluate(run_dir: Path) -> Dict[str, Any]:
     rows = timeline(run_dir / "timeline.ndjson")
     active_domains = set()
     events: Dict[str, Dict[str, Any]] = {}
+    mcda_events: Dict[str, Dict[str, Dict[str, Any]]] = {}
     endpoint_errors = 0
     for row in rows:
         if row.get("error"):
             endpoint_errors += 1
             continue
         cid = str((row.get("status") or {}).get("cid") or row.get("port") or "")
+        collaboration = row.get("collaboration") or {}
+        for mcda in (
+            list(collaboration.get("decision_events") or [])
+            + list(collaboration.get("decisions") or [])
+        ):
+            if not isinstance(mcda, dict) or mcda.get("flow") != flow:
+                continue
+            mcda_cid = str(collaboration.get("cid") or cid)
+            mcda_key = (
+                f"{mcda.get('decision')}:{mcda.get('evaluated_ns')}:"
+                f"{','.join(str(value) for value in mcda.get('window_ids', []))}"
+            )
+            mcda_events.setdefault(mcda_cid, {})[mcda_key] = mcda
         agent = row.get("agentic") or {}
         if (agent.get("requested") is True
                 and agent.get("active") is True
@@ -135,13 +149,33 @@ def evaluate(run_dir: Path) -> Dict[str, Any]:
             for proposal in event.get("proposals", [])
         )
     ]
-    mcda_records = [
-        (event.get("observed_by"), (
-            event.get("legacy_comparison") or {}
-        ).get("matches"))
-        for event in authorized
-        if (event.get("legacy_comparison") or {}).get("available") is True
-    ]
+    mcda_records = []
+    for event in authorized:
+        domain = str(event.get("observed_by") or "")
+        comparison = event.get("legacy_comparison") or {}
+        if comparison.get("available") is True:
+            mcda_records.append((domain, comparison.get("matches")))
+            continue
+        agent_windows = {
+            int(value) for value in event.get("window_ids", [])
+        }
+        matching = [
+            candidate
+            for candidate in mcda_events.get(domain, {}).values()
+            if agent_windows & {
+                int(value) for value in candidate.get("window_ids", [])
+            }
+        ]
+        if matching:
+            mcda = max(
+                matching,
+                key=lambda item: int(item.get("evaluated_ns", 0) or 0),
+            )
+            mcda_records.append((
+                domain,
+                ((event.get("decision") == "AGREED")
+                 == (mcda.get("decision") == "MITIGATE")),
+            ))
     mcda_by_domain = {domain: matches for domain, matches in mcda_records}
     blocker_requests = 0
     for path in run_dir.glob("flow-blocker-*.log"):
