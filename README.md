@@ -233,7 +233,7 @@ queda do ETCD durante o consenso é tratada de forma conservadora: novas
 ações colaborativas aguardam a recuperação, em vez de cada domínio
 bloquear independentemente.
 
-### 2.6 Agentes de domínio: shadow e authority-dry-run
+### 2.6 Agentes de domínio: shadow, authority-dry-run e authority-live
 
 Com `PREDICTOR_AGENTIC_ENABLED=true`, cada FlowPredictor também instancia um
 agente deliberativo associado ao seu domínio. O agente recebe a mesma evidência
@@ -287,17 +287,18 @@ um domínio para a janela seguinte não torna indisponível a decisão equivalen
 do episódio anterior. Esse histórico é somente evidência de avaliação: não
 participa do quórum, do gate de autoridade, do claim nem da mitigação.
 
-Nesta fase, o cluster ETCD é parte do perímetro confiável: a checagem entre
+No testbed, o cluster ETCD é parte do perímetro confiável: a checagem entre
 chave e payload evita inconsistência acidental, mas não é autenticação
-criptográfica de um domínio. Uma fase autoritativa futura deve exigir ACL por
-prefixo e identidade mTLS ou assinatura das propostas antes de permitir que um
-resultado agentic controle mitigação.
+criptográfica de um domínio. Por isso `authority-live` é um canário de
+laboratório, não uma configuração de produção multi-inquilino. Uma implantação
+operacional deve exigir ACL por prefixo e identidade mTLS ou assinatura das
+propostas antes de confiar em domínios administrados separadamente.
 
 O score local do agente é explicável e combina severidade Holt (0,35), razão de
 vazão (0,20), persistência (0,20), confiabilidade do modelo (0,15) e papel
 topológico (0,10). Não há LLM ou aprendizado por reforço no caminho crítico.
 
-#### Gate de segurança e autoridade sem atuação
+#### Gate de segurança, promoção e canário com atuação
 
 `agent_authority.py` adiciona uma segunda validação entre `AGREED` e qualquer
 ação futura. O gate revalida identidade do evento, fluxo, quórum, papéis,
@@ -307,6 +308,19 @@ fechada quando o ETCD está indisponível. Em `shadow`, gate e claim não são
 executados. Em `authority-dry-run`, ambos fazem parte do runtime, mas permanecem
 deliberadamente desconectados do FlowBlocker. A inicialização exige
 `DRY_RUN=true` e a API rejeita a tentativa de desativá-lo durante a execução.
+
+Em `authority-live`, o mesmo gate e o mesmo claim são reexecutados. O MCDA
+continua calculando sua decisão para comparação científica, porém não disputa
+claim e nunca chama o FlowBlocker. Somente o agente autorizado que vencer o
+claim agentic atravessa `mitigate_agentic()`. A fronteira repete as verificações
+de modo, opt-in, kill-switch, fluxo, autorização, claim não degradado e
+coordenador local antes de delegar ao mitigador existente, que ainda aplica
+whitelist, cooldown, tipo de anomalia e par IPv4 inequívoco.
+
+O modo live não pode ser habilitado apenas mudando `DRY_RUN`: ele exige
+simultaneamente `AGENTIC_MODE=authority-live`,
+`AGENTIC_LIVE_ACTUATION=true`, modelo offline obrigatório, adaptação online
+desabilitada, colaboração/ETCD ativos e `AUTO_MITIGATE=true`.
 
 Depois do gate de falhas, execute o piloto autoritativo sem atuação:
 
@@ -342,6 +356,25 @@ Os resultados ficam em
 campo `promotion_ready=true` significa apenas que o estágio dry-run atingiu os
 critérios experimentais configurados; ele não habilita nem conecta
 `authority-live` automaticamente.
+
+Depois de obter `promotion_ready=true`, execute o canário live com consentimento
+explícito:
+
+``` bash
+bash scripts/run_agentic_authority_live_canary.sh \
+  --allow-agentic-mitigation
+```
+
+O runner recria o ambiente e executa primeiro um controle benigno, que exige
+TN, zero acordo, zero request e zero DROP. Só então executa o DDoS, que exige
+dois agentes autorizados, exatamente um claim vencedor, exatamente um executor
+agentic, um pedido ao FlowBlocker, DROP observável e nenhuma atuação ou claim do
+MCDA. Antes de começar, ele também exige uma campanha com
+`promotion_ready=true`, confirma que seu commit é ancestral do código atual e
+que o SHA-256 do modelo offline é exatamente o artefato promovido. O relatório
+final fica em
+`experiments/results/agentic-live-canary-*/canary-summary.json`; somente os dois
+casos aprovados produzem `canary_ready=true`.
 
 A matriz determinística de fault injection pode ser executada sem Mininet,
 containers ou privilégios de administrador:
@@ -804,13 +837,14 @@ tabela agregada dos domínios antes de gerar o baseline. Portanto, não o execut
 junto a outra experiência ativa. Para reutilizar conscientemente um ambiente
 já validado, defina `BENCHMARK_BOOTSTRAP_ENV=false`.
 
-Há três modos:
+Há quatro modos:
 
 | Modo | Colaboração | Mitigação |
 | --- | --- | --- |
 | `local-dry-run` | não | simulada em cada domínio |
 | `collaborative-dry-run` | MCDA + quórum | simulada apenas pelo coordenador |
 | `collaborative-live` | MCDA + quórum | DROP real; exige `--allow-mitigation` |
+| `agentic-live` | agentes + gate + claim; MCDA observacional | DROP real; exige `--allow-agentic-mitigation` |
 
 E dois cenários: `benign`, que mantém UDP estável, e `ddos`, que executa
 um baseline de 1 Mbit/s seguido por um salto de 100 Mbit/s. Uma bateria
@@ -835,6 +869,10 @@ bash scripts/run_agentic_authority_dry_run.sh
 
 # Campanha positiva/negativa antes de considerar autoridade operacional
 bash scripts/run_agentic_authority_campaign.sh
+
+# Canário agentic: benigno sem atuação, depois DDoS com um único executor
+bash scripts/run_agentic_authority_live_canary.sh \
+  --allow-agentic-mitigation
 
 # Após o claim anterior expirar, valida o DROP real
 bash scripts/run_collaborative_benchmark.sh \
@@ -880,12 +918,16 @@ Para selecionar diretamente o segundo estágio no runner genérico, use
 `BENCHMARK_AGENTIC_ENABLED=true` e
 `BENCHMARK_AGENTIC_MODE=authority-dry-run`. Esse modo só aceita
 `collaborative-dry-run`; combiná-lo com mitigação live é erro de configuração.
+O terceiro estágio só é aceito pelo modo dedicado `agentic-live` e exige
+`--allow-agentic-mitigation`; o runner injeta o opt-in no deploy e valida que
+todos os endpoints anunciem `authoritative=true` e `actuation_enabled=true`.
 
 Uma execução sem conexão com os controladores, sem ping mensurável, sem vazão
 do baseline/ataque, sem os dois hosts na tabela de domínios ou com erro nas
 APIs é `INVALID` e faz o runner terminar com status diferente de zero. Em
-`collaborative-live`, uma decisão `MITIGATE` sem confirmação HTTP 200 do
-FlowBlocker também é inválida e conserva o motivo operacional no relatório.
+`collaborative-live` ou `agentic-live`, uma decisão `MITIGATE` sem confirmação
+HTTP 200 do FlowBlocker também é inválida e conserva o motivo operacional no
+relatório.
 O DROP pode encerrar o canal de controle do próprio `iperf3` e fazê-lo retornar
 status 1 antes de produzir o JSON final. Nesse modo, o workload registra
 `attack_disrupted`, continua até o ping final e só aceita a interrupção como
@@ -916,6 +958,7 @@ e `ddos` sob as mesmas taxas, durações, topologia, modelo e commit.
 
 ------------------------------------------------------------------------
 
-**Versão**: 1.8 · **Data**: 2026-08-05 · **Status**: modelo offline,
-consenso MCDA multi-domínio, agentes deliberativos em shadow mode, claim
-distribuído e benchmark reproduzível
+**Versão**: 1.9 · **Data**: 2026-08-10 · **Status**: modelo offline,
+consenso MCDA multi-domínio, agentes em shadow/authority-dry-run, canário
+authority-live com propriedade exclusiva, claim distribuído e benchmark
+reproduzível

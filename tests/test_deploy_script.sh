@@ -47,11 +47,15 @@ curl() {
     */predictor/agent)
       local mode="${PREDICTOR_AGENTIC_MODE:-shadow}"
       local authoritative=false
-      if [[ "$mode" == "authority-dry-run" ]]; then
+      local actuation=false
+      if [[ "$mode" != "shadow" ]]; then
         authoritative=true
       fi
-      printf '{"requested":true,"active":true,"mode":"%s","authoritative":%s,"actuation_enabled":false}\n' \
-        "$mode" "$authoritative"
+      if [[ "$mode" == "authority-live" ]]; then
+        actuation=true
+      fi
+      printf '{"requested":true,"active":true,"mode":"%s","authoritative":%s,"actuation_enabled":%s}\n' \
+        "$mode" "$authoritative" "$actuation"
       ;;
     *)
       printf '%s\n' '{}'
@@ -81,6 +85,7 @@ grep -q -- '-e AGENTIC_SHADOW=true' "$COMMAND_LOG"
 grep -q -- '-e AGENTIC_MODE=shadow' "$COMMAND_LOG"
 grep -q -- '-e AGENT_REQUIRED_VOTES=2' "$COMMAND_LOG"
 grep -q -- '-e AGENT_CLAIM_TTL_S=60' "$COMMAND_LOG"
+grep -q -- '-e AGENTIC_LIVE_ACTUATION=false' "$COMMAND_LOG"
 grep -q -- '-e DRY_RUN=true' "$COMMAND_LOG"
 grep -q -- '-p 6060:6060' "$COMMAND_LOG"
 
@@ -138,6 +143,28 @@ if PREDICTOR_COLLABORATION_ENABLED=true \
   echo "authority-dry-run unexpectedly accepted live mitigation" >&2
   exit 1
 fi
+
+if PREDICTOR_COLLABORATION_ENABLED=true \
+  PREDICTOR_AGENTIC_ENABLED=true \
+  PREDICTOR_AGENTIC_MODE=authority-live \
+  bash "$PROJECT_ROOT/deploy_flow_predictor.sh" 2 false >/dev/null 2>&1; then
+  echo "authority-live unexpectedly accepted missing opt-in/model" >&2
+  exit 1
+fi
+
+PREDICTION_HISTORY_ROOT="$TEST_TMP/history-agentic-live" \
+PREDICTOR_OFFLINE_MODEL="$MODEL_PATH" \
+PREDICTOR_OFFLINE_MODEL_REQUIRED=true \
+PREDICTOR_ONLINE_MODEL_ADAPTATION=false \
+PREDICTOR_COLLABORATION_ENABLED=true \
+PREDICTOR_AGENTIC_ENABLED=true \
+PREDICTOR_AGENTIC_MODE=authority-live \
+PREDICTOR_AGENTIC_LIVE_ACTUATION=true \
+  bash "$PROJECT_ROOT/deploy_flow_predictor.sh" 2 false >/dev/null
+
+grep -q -- '-e AGENTIC_MODE=authority-live' "$COMMAND_LOG"
+grep -q -- '-e AGENTIC_LIVE_ACTUATION=true' "$COMMAND_LOG"
+grep -q -- '-e DRY_RUN=false' "$COMMAND_LOG"
 
 # ETCD continua opcional para o detector local, mas é requisito estrito para
 # colaboração/agentes.

@@ -37,7 +37,7 @@ if [[ "$DRY_RUN" != "true" && "$DRY_RUN" != "false" ]]; then
 fi
 for value in "$PREDICTOR_OFFLINE_MODEL_REQUIRED" "$PREDICTOR_ONLINE_MODEL_ADAPTATION" \
   "$PREDICTOR_COLLABORATION_ENABLED" "$PREDICTOR_AGENTIC_ENABLED" \
-  "$PREDICTOR_AGENTIC_SHADOW"; do
+  "$PREDICTOR_AGENTIC_SHADOW" "$PREDICTOR_AGENTIC_LIVE_ACTUATION"; do
   if [[ "$value" != "true" && "$value" != "false" ]]; then
     echo "predictor boolean settings must be true or false" >&2
     exit 2
@@ -86,11 +86,37 @@ case "$PREDICTOR_AGENTIC_MODE" in
       exit 2
     fi
     ;;
+  authority-live)
+    EFFECTIVE_AGENTIC_SHADOW=false
+    if [[ "$PREDICTOR_AGENTIC_ENABLED" != "true" ]]; then
+      echo "authority-live requires PREDICTOR_AGENTIC_ENABLED=true" >&2
+      exit 2
+    fi
+    if [[ "$PREDICTOR_AGENTIC_LIVE_ACTUATION" != "true" ]]; then
+      echo "authority-live requires explicit live actuation opt-in" >&2
+      exit 2
+    fi
+    if [[ "$DRY_RUN" != "false" || "$PREDICTOR_AUTO_MITIGATE" != "true" ]]; then
+      echo "authority-live requires dry_run=false and auto mitigation" >&2
+      exit 2
+    fi
+    if [[ "$PREDICTOR_OFFLINE_MODEL_REQUIRED" != "true" \
+          || "$PREDICTOR_ONLINE_MODEL_ADAPTATION" != "false" ]]; then
+      echo "authority-live requires a mandatory non-adaptive offline model" >&2
+      exit 2
+    fi
+    ;;
   *)
-    echo "PREDICTOR_AGENTIC_MODE must be shadow or authority-dry-run" >&2
+    echo "PREDICTOR_AGENTIC_MODE must be shadow, authority-dry-run or authority-live" >&2
     exit 2
     ;;
 esac
+if [[ "$PREDICTOR_AGENTIC_ENABLED" == "true" \
+      && "$PREDICTOR_AGENTIC_LIVE_ACTUATION" == "true" \
+      && "$PREDICTOR_AGENTIC_MODE" != "authority-live" ]]; then
+  echo "live actuation opt-in is only valid in authority-live" >&2
+  exit 2
+fi
 if [[ "$PREDICTOR_AGENTIC_ENABLED" == "true" ]] \
   && (( PREDICTOR_AGENT_REQUIRED_VOTES > COLLAB_EXPECTED_DOMAINS )); then
   echo "PREDICTOR_AGENT_REQUIRED_VOTES cannot exceed expected domains" >&2
@@ -149,8 +175,8 @@ elif kind == "agent":
         payload.get("requested") is True
         and payload.get("active") is True
         and payload.get("mode") == expected_mode
-        and payload.get("authoritative") is (expected_mode == "authority-dry-run")
-        and payload.get("actuation_enabled") is False
+        and payload.get("authoritative") is (expected_mode != "shadow")
+        and payload.get("actuation_enabled") is (expected_mode == "authority-live")
     )
 else:
     ready = False
@@ -242,6 +268,7 @@ for ((i=0; i<C; i++)); do
     -e AGENT_PROPOSAL_THRESHOLD="$PREDICTOR_AGENT_PROPOSAL_THRESHOLD" \
     -e AGENT_TOPOLOGY_CACHE_S="$PREDICTOR_AGENT_TOPOLOGY_CACHE_S" \
     -e AGENT_CLAIM_TTL_S="$PREDICTOR_AGENT_CLAIM_TTL_S" \
+    -e AGENTIC_LIVE_ACTUATION="$PREDICTOR_AGENTIC_LIVE_ACTUATION" \
     -p "$PRED_HTTP_PORT:$PRED_HTTP_PORT" \
     "$PRED_IMG" >/dev/null
 
@@ -319,5 +346,8 @@ done
 log ""
 log "📊 CSVs do dataset (1 por fluxo) em: $HISTORY_ROOT/prediction_history_domain<i>/"
 log ""
-log "⚠️  DRY_RUN=$DRY_RUN — para ativar mitigação real:"
-log "    curl -X POST http://127.0.0.1:6060/predictor/config -H 'Content-Type: application/json' -d '{\"dry_run\": false}'"
+if [[ "$PREDICTOR_AGENTIC_MODE" == "authority-live" ]]; then
+  log "⚠️  authority-live ativo: somente o vencedor do claim agentic pode mitigar."
+else
+  log "⚠️  DRY_RUN=$DRY_RUN — mantenha true até concluir os gates de segurança."
+fi

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Guard-rails reutilizáveis para a futura autoridade dos agentes.
+"""Guard-rails reutilizáveis para a autoridade dos agentes.
 
 Este módulo não chama o FlowBlocker. Ele transforma uma decisão deliberativa
 em uma autorização verificável e, separadamente, oferece um claim atômico no
-ETCD. Enquanto o runtime permanecer em shadow mode, nenhuma dessas operações
-é conectada ao plano de dados.
+ETCD. O runtime só conecta o resultado ao plano de dados no canário
+``authority-live``, depois de repetir verificações adicionais.
 """
 
 import json
@@ -41,7 +41,7 @@ def evaluate_agentic_authority(
     A deliberação e a autorização são fronteiras diferentes. Mesmo um payload
     marcado como AGREED precisa provar quórum, topologia, modelo, episódio e
     validade temporal. Isso impede que um estado forjado ou antigo atravesse o
-    caminho de mitigação quando o modo autoritativo for implementado.
+    caminho de mitigação no modo autoritativo.
     """
     if not isinstance(decision, dict):
         return _deny("decision_missing", "decisão agentic ausente")

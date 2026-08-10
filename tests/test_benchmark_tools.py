@@ -10,6 +10,9 @@ from experiments.evaluate_agentic_authority_run import (
 from experiments.evaluate_agentic_authority_campaign import (
     evaluate as evaluate_authority_campaign,
 )
+from experiments.evaluate_agentic_live_run import (
+    evaluate as evaluate_agentic_live_run,
+)
 from experiments.evaluate_agentic_runtime_faults import evaluate
 from experiments.monitor_predictors import (
     flow_anomalies,
@@ -441,6 +444,222 @@ class BenchmarkToolTests(unittest.TestCase):
             self.assertFalse(unsafe["aggregate"]["safe"])
             self.assertFalse(unsafe["checks"]["no_agent_authorization"])
             self.assertFalse(unsafe["checks"]["no_would_execute"])
+
+    def test_agentic_live_canary_requires_exclusive_agent_execution(self):
+        flow = "10.0.0.1->10.0.0.8"
+        attack_ns = 1_000_000_000
+
+        def row(cid, won):
+            execution = {
+                "attempted": won,
+                "executed": won,
+                "would_execute": won,
+                "owner": "agentic",
+                "reason": "FlowBlocker HTTP 200" if won else "peer coordena",
+            }
+            event = {
+                "event_id": f"{cid}:live",
+                "flow": flow,
+                "decision": "AGREED",
+                "state_entered_ns": attack_ns + 500_000_000,
+                "authority": {
+                    "authorized": True,
+                    "claim": {
+                        "won": won,
+                        "degraded": False,
+                        "coordinator": "domain-0",
+                    },
+                },
+                "execution": execution,
+            }
+            return {
+                "sampled_ns": attack_ns + 600_000_000,
+                "status": {"cid": cid},
+                "agentic": {
+                    "requested": True,
+                    "active": True,
+                    "mode": "authority-live",
+                    "authoritative": True,
+                    "actuation_enabled": True,
+                    "cid": cid,
+                    "decisions": [event],
+                    "decision_events": [],
+                },
+                "collaboration": {
+                    "cid": cid,
+                    "decisions": [{
+                        "flow": flow,
+                        "decision": "MITIGATE",
+                        "evaluated_ns": attack_ns + 400_000_000,
+                        "claim": None,
+                        "mitigation": {
+                            "attempted": False,
+                            "executed": False,
+                            "owner": "agentic",
+                        },
+                    }],
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            metadata = {
+                "mode": "agentic-live",
+                "scenario": "ddos",
+                "flow": flow,
+                "controller_sets": 2,
+                "started_ns": attack_ns - 100_000_000,
+                "agentic_enabled": True,
+                "agentic_mode": "authority-live",
+            }
+            (run_dir / "metadata.json").write_text(
+                json.dumps(metadata), encoding="utf-8"
+            )
+            (run_dir / "attack_start_ns.txt").write_text(
+                str(attack_ns), encoding="utf-8"
+            )
+            (run_dir / "workload_status.json").write_text(
+                json.dumps({"valid": True}), encoding="utf-8"
+            )
+            (run_dir / "summary.json").write_text(json.dumps({
+                "runs": [{"classification": "TP", "mitigation_executed": True}],
+            }), encoding="utf-8")
+            rows = [row("domain-0", True), row("domain-1", False)]
+            (run_dir / "timeline.ndjson").write_text(
+                "".join(json.dumps(item) + "\n" for item in rows),
+                encoding="utf-8",
+            )
+            (run_dir / "flow-blocker-0.log").write_text(
+                "Service request to block traffic\n", encoding="utf-8"
+            )
+            (run_dir / "ovs-flows-s1.txt").write_text(
+                "ip,nw_src=10.0.0.1,nw_dst=10.0.0.8 actions=drop\n",
+                encoding="utf-8",
+            )
+
+            report = evaluate_agentic_live_run(run_dir)
+            self.assertTrue(report["aggregate"]["safe"])
+            self.assertEqual(report["winner_domains"], ["domain-0"])
+            self.assertEqual(report["execution_domains"], ["domain-0"])
+
+            rows[0]["collaboration"]["decisions"][0]["claim"] = {
+                "won": True,
+            }
+            (run_dir / "timeline.ndjson").write_text(
+                "".join(json.dumps(item) + "\n" for item in rows),
+                encoding="utf-8",
+            )
+            unsafe = evaluate_agentic_live_run(run_dir)
+            self.assertFalse(unsafe["checks"]["mcda_never_claimed"])
+            self.assertFalse(unsafe["aggregate"]["safe"])
+
+    def test_agentic_live_summary_uses_agent_claim_and_mcda_observation(self):
+        flow = "10.0.0.1->10.0.0.8"
+        attack_ns = 1_000_000_000
+
+        def row(cid, won):
+            event = {
+                "event_id": f"{cid}:live-summary",
+                "flow": flow,
+                "decision": "AGREED",
+                "state_entered_ns": attack_ns + 450_000_000,
+                "authority": {
+                    "authorized": True,
+                    "claim": {
+                        "won": won,
+                        "degraded": False,
+                        "coordinator": "domain-0",
+                        "claimed_ns": attack_ns + 500_000_000,
+                    },
+                },
+                "execution": {
+                    "attempted": won,
+                    "executed": won,
+                    "would_execute": won,
+                    "owner": "agentic",
+                    "reason": "FlowBlocker HTTP 200" if won else "peer coordena",
+                },
+            }
+            return {
+                "sampled_ns": attack_ns + 600_000_000,
+                "status": {"cid": cid},
+                "agentic": {
+                    "requested": True,
+                    "active": True,
+                    "mode": "authority-live",
+                    "authoritative": True,
+                    "actuation_enabled": True,
+                    "cid": cid,
+                    "decisions": [event],
+                    "decision_events": [],
+                },
+                "collaboration": {"decisions": [{
+                    "flow": flow,
+                    "decision": "MITIGATE",
+                    "score": 0.95,
+                    "confirming_domains": ["domain-0", "domain-1"],
+                    "evaluated_ns": attack_ns + 400_000_000,
+                    "claim": None,
+                    "mitigation": {
+                        "attempted": False,
+                        "executed": False,
+                        "owner": "agentic",
+                    },
+                }]},
+                "anomalies": ([{
+                    "anomaly_id": "attack",
+                    "kind": "THROUGHPUT_SPIKE",
+                    "ts_detect_ns": attack_ns + 100_000_000,
+                    "mitigation": {
+                        "attempted": True,
+                        "executed": True,
+                        "reason": "FlowBlocker HTTP 200",
+                    },
+                }] if won else []),
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "metadata.json").write_text(json.dumps({
+                "mode": "agentic-live",
+                "scenario": "ddos",
+                "flow": flow,
+                "controller_sets": 2,
+                "started_ns": attack_ns - 100_000_000,
+                "agentic_enabled": True,
+                "agentic_mode": "authority-live",
+            }), encoding="utf-8")
+            (run_dir / "attack_start_ns.txt").write_text(
+                str(attack_ns), encoding="utf-8"
+            )
+            (run_dir / "workload_status.json").write_text(json.dumps({
+                "valid": True,
+                "attack_disrupted": True,
+            }), encoding="utf-8")
+            self.write_iperf(run_dir / "baseline.json", 1_000_000.0)
+            (run_dir / "ping_before.txt").write_text(
+                "0% packet loss\n", encoding="utf-8"
+            )
+            (run_dir / "ping_after.txt").write_text(
+                "100% packet loss\n", encoding="utf-8"
+            )
+            (run_dir / "timeline.ndjson").write_text(
+                "".join(json.dumps(item) + "\n" for item in (
+                    row("domain-0", True), row("domain-1", False)
+                )),
+                encoding="utf-8",
+            )
+
+            report = summarize_run(run_dir)
+
+            self.assertEqual(report["classification"], "TP")
+            self.assertTrue(report["mitigation_executed"])
+            self.assertEqual(report["coordinator"], "domain-0")
+            self.assertEqual(report["consensus_latency_ms"], 400.0)
+            self.assertEqual(report["mcda_consensus_latency_ms"], 300.0)
+            self.assertEqual(
+                report["agentic_active_domains"], ["domain-0", "domain-1"]
+            )
 
     def test_authority_campaign_requires_positive_and_negative_cases(self):
         flow = "10.0.0.1->10.0.0.8"
