@@ -280,6 +280,13 @@ curtos entre duas consultas HTTP. Durante o benchmark, cada `event_id` é escrit
 uma única vez na linha do tempo, evitando replicar o histórico inteiro a cada
 consulta e mantendo baixo o uso de armazenamento.
 
+O endpoint MCDA preserva, de forma análoga, as 200 transições recentes. A
+comparação agentic–MCDA procura uma decisão com `window_id` em comum, em vez de
+usar cegamente apenas o estado MCDA mais recente. Assim, o avanço assíncrono de
+um domínio para a janela seguinte não torna indisponível a decisão equivalente
+do episódio anterior. Esse histórico é somente evidência de avaliação: não
+participa do quórum, do gate de autoridade, do claim nem da mitigação.
+
 Nesta fase, o cluster ETCD é parte do perímetro confiável: a checagem entre
 chave e payload evita inconsistência acidental, mas não é autenticação
 criptográfica de um domínio. Uma fase autoritativa futura deve exigir ACL por

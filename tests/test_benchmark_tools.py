@@ -15,6 +15,7 @@ from experiments.monitor_predictors import (
     flow_anomalies,
     flow_predictions,
     retain_new_agentic_events,
+    retain_new_decision_events,
 )
 from experiments.run_mininet_workload import (
     domain_table_has_hosts,
@@ -76,6 +77,24 @@ class BenchmarkToolTests(unittest.TestCase):
             [row["event_id"] for row in first["decision_events"]],
             ["event-2", "event-1"],
         )
+        self.assertEqual(second["decision_events"], [])
+        self.assertEqual(second["decisions"], payload["decisions"])
+
+    def test_monitor_writes_each_mcda_transition_only_once(self):
+        seen = set()
+        payload = {
+            "decision_events": [{
+                "event_id": "mcda:domain-0:flow:2:MITIGATE:10",
+                "decision": "MITIGATE",
+                "window_ids": [2],
+            }],
+            "decisions": [{"decision": "SUSPECT", "window_ids": [3]}],
+        }
+
+        first = retain_new_decision_events(payload, seen)
+        second = retain_new_decision_events(payload, seen)
+
+        self.assertEqual(len(first["decision_events"]), 1)
         self.assertEqual(second["decision_events"], [])
         self.assertEqual(second["decisions"], payload["decisions"])
 
@@ -287,6 +306,44 @@ class BenchmarkToolTests(unittest.TestCase):
             self.assertTrue(report["aggregate"]["safe"])
             self.assertEqual(report["claim_winner_domains"], ["domain-0"])
             self.assertEqual(report["would_execute_domains"], ["domain-0"])
+
+            # A comparação é evidência experimental, não parte do gate de
+            # autoridade. Se a decisão corrente do MCDA já avançou, o
+            # avaliador deve correlacionar o episódio preservado no histórico.
+            for item in rows:
+                decision = item["agentic"]["decisions"][0]
+                decision["window_ids"] = [2]
+                decision["legacy_comparison"] = {
+                    "available": False,
+                    "matches": None,
+                    "reason": "decisão MCDA pertence a outro episódio",
+                }
+                cid = item["status"]["cid"]
+                item["collaboration"] = {
+                    "cid": cid,
+                    "decisions": [{
+                        "flow": flow,
+                        "decision": "SUSPECT",
+                        "evaluated_ns": attack_ns + 800_000_000,
+                        "window_ids": [3],
+                    }],
+                    "decision_events": [{
+                        "flow": flow,
+                        "decision": "MITIGATE",
+                        "evaluated_ns": attack_ns + 400_000_000,
+                        "window_ids": [2],
+                    }],
+                }
+            (run_dir / "timeline.ndjson").write_text(
+                "".join(json.dumps(item) + "\n" for item in rows),
+                encoding="utf-8",
+            )
+            historical_mcda = evaluate_authority_run(run_dir)
+            self.assertTrue(historical_mcda["aggregate"]["safe"])
+            self.assertTrue(
+                historical_mcda["checks"]["mcda_comparison_available"]
+            )
+            self.assertTrue(historical_mcda["checks"]["agent_matches_mcda"])
 
             rows[0]["agentic"]["decisions"][0]["execution"]["attempted"] = True
             (run_dir / "timeline.ndjson").write_text(

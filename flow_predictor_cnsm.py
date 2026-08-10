@@ -1173,32 +1173,55 @@ class AgenticShadowManager:
         if collaboration is None:
             return {"available": False, "matches": None}
         with collaboration.lock:
-            legacy = collaboration.decisions.get(flow)
-            legacy_copy = None if legacy is None else {
-                "decision": legacy.get("decision"),
-                "score": legacy.get("score"),
-                "confirming_domains": list(legacy.get("confirming_domains", [])),
-                "evaluated_ns": legacy.get("evaluated_ns"),
-                "window_ids": list(legacy.get("window_ids", [])),
-            }
-        if legacy_copy is None:
+            current = collaboration.decisions.get(flow)
+            history = list(getattr(collaboration, "decision_events", []))
+            candidates = ([current] if isinstance(current, dict) else []) + [
+                row for row in history
+                if isinstance(row, dict) and row.get("flow") == flow
+            ]
+            legacy_rows = [{
+                "decision": row.get("decision"),
+                "score": row.get("score"),
+                "confirming_domains": list(row.get("confirming_domains", [])),
+                "evaluated_ns": row.get("evaluated_ns"),
+                "window_ids": list(row.get("window_ids", [])),
+            } for row in candidates]
+        if not legacy_rows:
             return {"available": False, "matches": None}
         agent_windows = {
             int(value) for value in agent_decision.get("window_ids", [])
         }
-        legacy_windows = {
-            int(value) for value in legacy_copy.get("window_ids", [])
-        }
-        if not agent_windows or not legacy_windows or not (agent_windows & legacy_windows):
+        matching_rows = []
+        for row in legacy_rows:
+            legacy_windows = {
+                int(value) for value in row.get("window_ids", [])
+            }
+            overlap = agent_windows & legacy_windows
+            if overlap:
+                matching_rows.append((row, sorted(overlap)))
+        if not agent_windows or not matching_rows:
+            latest = max(
+                legacy_rows,
+                key=lambda row: int(row.get("evaluated_ns", 0) or 0),
+            )
             return {
                 "available": False,
                 "matches": None,
                 "reason": "decisão MCDA pertence a outro episódio",
-                "mcda": legacy_copy,
+                "mcda": latest,
             }
+        legacy_copy, matched_windows = max(
+            matching_rows,
+            key=lambda item: int(item[0].get("evaluated_ns", 0) or 0),
+        )
         matches = ((agent_decision.get("decision") == "AGREED")
                    == (legacy_copy["decision"] == "MITIGATE"))
-        return {"available": True, "matches": matches, "mcda": legacy_copy}
+        return {
+            "available": True,
+            "matches": matches,
+            "matched_window_ids": matched_windows,
+            "mcda": legacy_copy,
+        }
 
     def _authority_dry_run(self, decision: Dict[str, Any]) -> None:
         """Revalida e elege um agente sem disponibilizar atuação externa."""
@@ -1459,6 +1482,11 @@ class CollaborativeDecisionManager:
         self.local_candidates: Dict[str, Dict[str, Any]] = {}
         self.dirty_flows = set()
         self.decisions: Dict[str, Dict[str, Any]] = {}
+        # O estado corrente muda a cada janela. O histórico limitado mantém a
+        # decisão MCDA do mesmo episódio disponível para a comparação agentic,
+        # mesmo quando o monitor amostra depois do avanço para outra janela.
+        self.decision_events = deque(maxlen=200)
+        self.last_decision_key: Dict[str, Tuple[Any, ...]] = {}
         self.claims: Dict[str, Dict[str, Any]] = {}
         self.mitigation_results: Dict[str, Dict[str, Any]] = {}
         self.claim_leases: Dict[str, Any] = {}
@@ -1686,6 +1714,21 @@ class CollaborativeDecisionManager:
             with self.lock:
                 previous_state = self.last_logged_state.get(flow)
                 self.decisions[flow] = decision
+                decision_key = (
+                    decision.get("decision"),
+                    tuple(decision.get("window_ids", [])),
+                )
+                if self.last_decision_key.get(flow) != decision_key:
+                    event = json.loads(json.dumps(decision))
+                    windows = ",".join(
+                        str(value) for value in decision.get("window_ids", [])
+                    ) or "none"
+                    event["event_id"] = (
+                        f"mcda:{CONTROLLER_ID}:{flow}:{windows}:"
+                        f"{decision.get('decision')}:{decision.get('evaluated_ns')}"
+                    )
+                    self.decision_events.append(event)
+                    self.last_decision_key[flow] = decision_key
                 if previous_state != decision["decision"]:
                     self.last_logged_state[flow] = decision["decision"]
                     _metric("COLLAB_DECISION", f"flow={flow} decision={decision['decision']} "
@@ -1792,6 +1835,7 @@ class CollaborativeDecisionManager:
                     "weights": COLLAB_WEIGHTS,
                 },
                 "decisions": decisions,
+                "decision_events": list(reversed(self.decision_events)),
             }
 
 
