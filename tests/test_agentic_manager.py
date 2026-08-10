@@ -272,6 +272,18 @@ class AgenticShadowManagerTests(unittest.TestCase):
     def test_authority_dry_run_validates_claims_and_never_executes(self):
         manager = self.bare_manager()
         flow = "10.0.0.1->10.0.0.8"
+        manager.engine.collaboration = types.SimpleNamespace(
+            lock=threading.RLock(),
+            decisions={flow: {
+                "flow": flow,
+                "decision": "MITIGATE",
+                "score": 0.95,
+                "confirming_domains": ["domain-0", "domain-1"],
+                "evaluated_ns": self.NOW_NS,
+                "window_ids": [2],
+            }},
+            decision_events=deque(maxlen=200),
+        )
         source = DomainAgent(
             "domain-0", proposal_threshold=0.65,
             persistence_windows=3, rate_ratio_max=10.0,
@@ -319,6 +331,11 @@ class AgenticShadowManagerTests(unittest.TestCase):
         self.assertTrue(decision["execution"]["would_execute"])
         self.assertFalse(decision["execution"]["attempted"])
         self.assertFalse(decision["execution"]["executed"])
+        frozen = decision["authority"]["mcda_comparison"]
+        self.assertTrue(frozen["available"])
+        self.assertTrue(frozen["matches"])
+        self.assertEqual(frozen["basis"], "authority_evaluation")
+        self.assertEqual(frozen["captured_ns"], self.NOW_NS)
         self.assertEqual(manager.authorizations, 1)
         self.assertEqual(manager.claims_won, 1)
 

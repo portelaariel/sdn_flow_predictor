@@ -101,7 +101,10 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
     baseline_mitigate = False
     agentic_decisions = set()
     agentic_mitigate_votes = set()
-    agentic_comparisons: Dict[str, tuple] = {}
+    # Uma comparação pertence a uma transição agentic, não ao estado corrente
+    # da API. Mantemos uma entrada por event_id para que uma atualização do
+    # MCDA posterior à atuação não altere retroativamente o resultado.
+    agentic_comparison_events: Dict[tuple, Dict[str, Any]] = {}
     agentic_active_domains = set()
     agentic_events: Dict[str, Dict[str, Any]] = {}
     agentic_waiting_by_domain: Dict[str, int] = {}
@@ -288,14 +291,6 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
                     )
                     if execution.get("reason"):
                         mitigation_reason = execution["reason"]
-            comparison = decision.get("legacy_comparison", {})
-            if comparison.get("available") and isinstance(comparison.get("matches"), bool):
-                evaluated_ns = int(decision.get("evaluated_ns", row.get("sampled_ns", 0)))
-                previous = agentic_comparisons.get(agent_cid)
-                if previous is None or evaluated_ns >= previous[0]:
-                    agentic_comparisons[agent_cid] = (
-                        evaluated_ns, comparison["matches"]
-                    )
             event_id = decision.get("event_id")
             if not event_id:
                 event_id = (
@@ -303,6 +298,46 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
                     f"{decision.get('state_entered_ns', decision.get('evaluated_ns'))}:"
                     f"{','.join(str(v) for v in decision.get('window_ids', []))}"
                 )
+            frozen_comparison = authority.get("mcda_comparison")
+            comparison_is_frozen = isinstance(frozen_comparison, dict)
+            comparison = (
+                frozen_comparison if comparison_is_frozen
+                else decision.get("legacy_comparison", {})
+            )
+            if (state == "AGREED" and isinstance(comparison, dict)
+                    and comparison.get("available") is True
+                    and isinstance(comparison.get("matches"), bool)):
+                comparison_ns = int(
+                    comparison.get("captured_ns")
+                    or authority.get("evaluated_ns")
+                    or decision.get("evaluated_ns")
+                    or row.get("sampled_ns", 0)
+                )
+                transition_value = decision.get(
+                    "state_entered_ns", decision.get("evaluated_ns")
+                )
+                transition_value = int(transition_value or 0)
+                comparison_key = (agent_cid, str(event_id))
+                candidate = {
+                    "cid": agent_cid,
+                    "event_id": str(event_id),
+                    "transition_ns": transition_value,
+                    "comparison_ns": comparison_ns,
+                    "matches": comparison["matches"],
+                    "basis": (
+                        comparison.get("basis", "authority_evaluation")
+                        if comparison_is_frozen else "first_event_observation"
+                    ),
+                    "mcda": comparison.get("mcda"),
+                }
+                previous = agentic_comparison_events.get(comparison_key)
+                if (previous is None
+                        or (comparison_is_frozen
+                            and previous.get("basis")
+                            != "authority_evaluation")
+                        or (candidate["basis"] == previous.get("basis")
+                            and comparison_ns < previous["comparison_ns"])):
+                    agentic_comparison_events[comparison_key] = candidate
             agentic_events.setdefault(str(event_id), decision)
 
     detection_latency_ms = (
@@ -339,6 +374,20 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
             if int(event.get("state_entered_ns", event.get("evaluated_ns")))
             >= attack_start_ns
         ]
+    comparison_floor_ns = (
+        detection_ns if detection_ns is not None
+        else attack_start_ns if expected_attack else run_started_ns
+    )
+    eligible_comparisons = [
+        item for item in agentic_comparison_events.values()
+        if (comparison_floor_ns is None
+            or item["transition_ns"] >= comparison_floor_ns)
+    ]
+    agentic_comparisons: Dict[str, Dict[str, Any]] = {}
+    for item in sorted(
+            eligible_comparisons,
+            key=lambda value: (value["transition_ns"], value["comparison_ns"])):
+        agentic_comparisons.setdefault(item["cid"], item)
     first_agreement = min(
         agreement_events,
         key=lambda event: int(
@@ -553,8 +602,11 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
         "agentic_would_execute_domains": sorted(agentic_would_execute_domains),
         "agentic_actuation_violation": agentic_actuation_violation,
         "agentic_mcda_comparison_domains": sorted(agentic_comparisons),
+        "agentic_mcda_comparisons": [
+            agentic_comparisons[cid] for cid in sorted(agentic_comparisons)
+        ],
         "agentic_matches_mcda": (
-            all(value[1] for value in agentic_comparisons.values())
+            all(value["matches"] for value in agentic_comparisons.values())
             if agentic_comparisons else None
         ),
     }

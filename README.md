@@ -287,6 +287,14 @@ um domínio para a janela seguinte não torna indisponível a decisão equivalen
 do episódio anterior. Esse histórico é somente evidência de avaliação: não
 participa do quórum, do gate de autoridade, do claim nem da mitigação.
 
+Nos modos autoritativos, `authority.mcda_comparison` congela essa comparação no
+instante em que o gate é avaliado. Isso impede que o DROP executado pelo agente
+reduza a vazão, faça o MCDA avançar de `MITIGATE` para `CORROBORATED` e altere
+retroativamente a taxa agente–MCDA. Para timelines produzidas antes desse
+snapshot explícito, o sumarizador usa a primeira observação preservada do mesmo
+`event_id`. O estado MCDA posterior continua registrado na timeline como efeito
+da atuação, mas não é tratado como a decisão concorrente original.
+
 No testbed, o cluster ETCD é parte do perímetro confiável: a checagem entre
 chave e payload evita inconsistência acidental, mas não é autenticação
 criptográfica de um domínio. Por isso `authority-live` é um canário de
@@ -911,6 +919,9 @@ latência MCDA da latência agentic. Ele registra detecção→primeira proposta
 primeira→última proposta, última proposta→`AGREED`, detecção→`AGREED` e
 ataque→`AGREED`. O agregado informa taxas de concordância agente–agente e
 agente–MCDA, além de propostas expiradas e episódios que aguardaram quórum.
+O campo `agentic_mcda_comparisons` identifica, por domínio, o `event_id`, o
+instante e a base (`authority_evaluation` ou `first_event_observation`) usados
+nessa taxa, permitindo auditoria sem confundir decisão com pós-mitigação.
 Contadores são calculados em relação ao snapshot inicial, portanto a opção
 `BENCHMARK_BOOTSTRAP_ENV=false` não incorpora execuções anteriores.
 
