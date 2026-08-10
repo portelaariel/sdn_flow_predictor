@@ -302,6 +302,29 @@ ETCD e disputa simultânea do claim. O relatório registra explicitamente
 `dataplane_touched=false`; qualquer autorização insegura produz status de saída
 diferente de zero e também faz `scripts/validate_repository.sh` falhar.
 
+Depois que essa matriz offline passar, o gate equivalente pode ser executado no
+testbed real:
+
+``` bash
+bash scripts/run_agentic_runtime_faults.sh
+```
+
+O runner força `shadow=true` e `DRY_RUN=true`, reinicia o ambiente por padrão e
+executa quatro episódios isolados: pausa de um FlowPredictor, recuperação desse
+agente, partição dos dois preditores em relação à rede ETCD e recuperação do
+ETCD. O ataque só começa depois que o runner confirma a falha, por meio de um
+gate de sincronização no workload Mininet. A pausa e a partição são sempre
+desfeitas por um `trap`, inclusive em interrupções.
+
+O relatório `experiments/results/runtime-fault-*/summary.json` exige ausência
+de `AGREED` e de claim novo durante a falha, `WAITING_PROPOSALS` quando um
+agente desaparece, erro observável durante a partição, e um novo `AGREED` dos
+dois agentes após cada restauração. As propostas da recuperação precisam ter
+timestamps posteriores ao novo ataque; consenso antigo não conta. O gate ainda
+confirma zero requests ao FlowBlocker, zero regras DROP e registra as latências
+de falha/recuperação. Ele não substitui o benchmark de TP/TN: mede segurança e
+disponibilidade do protocolo distribuído.
+
 ### 2.7 Mitigação autônoma - guard-rails antes de agir
 
 A resposta automatizada só é segura se for **conservadora por

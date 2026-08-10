@@ -33,6 +33,34 @@ def write_text(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def wait_for_attack_release(gate_dir: Path, timeout_s: float) -> None:
+    """Synchronize a fault injector immediately before attack traffic.
+
+    The hook is opt-in so regular benchmarks keep their original timing.  The
+    workload announces readiness only after the benign baseline succeeds, then
+    waits until the external runner has injected the requested fault.
+    """
+    gate_dir.mkdir(parents=True, exist_ok=True)
+    ready = gate_dir / "attack.ready.json"
+    release = gate_dir / "attack.release"
+    abort = gate_dir / "abort"
+    write_text(ready, json.dumps({"ready_ns": time.time_ns()}) + "\n")
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if abort.exists():
+            raise WorkloadError("injeção de falha cancelou o ataque")
+        if release.exists():
+            write_text(
+                gate_dir / "attack.released.json",
+                json.dumps({"released_ns": time.time_ns()}) + "\n",
+            )
+            return
+        time.sleep(0.1)
+    raise WorkloadError(
+        f"injeção de falha não liberou o ataque em {timeout_s:.1f}s"
+    )
+
+
 def run_host(host: Any, command: list[str]) -> Tuple[str, str, int]:
     """Run a command inside a Mininet host and preserve stdout/stderr/status."""
     stdout, stderr, status = host.pexec(command)
@@ -202,6 +230,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="aceita interrupção do iperf de ataque; a mitigação será correlacionada no resumo",
     )
+    parser.add_argument(
+        "--attack-gate-dir",
+        type=Path,
+        help="diretório opcional para sincronizar uma falha antes do ataque",
+    )
+    parser.add_argument("--attack-gate-timeout-s", type=float, default=90.0)
     parser.add_argument("--output", type=Path, required=True)
     return parser
 
@@ -294,6 +328,12 @@ def main() -> int:
             )
 
         if args.scenario == "ddos":
+            if args.attack_gate_dir is not None:
+                if args.attack_gate_timeout_s <= 0:
+                    raise WorkloadError("timeout do gate deve ser positivo")
+                wait_for_attack_release(
+                    args.attack_gate_dir, args.attack_gate_timeout_s
+                )
             # Não introduzir um intervalo ocioso: uma transição alinhada ao
             # polling poderia reinicializar somente parte dos domínios.
             write_text(args.output / "attack_start_ns.txt", f"{time.time_ns()}\n")
