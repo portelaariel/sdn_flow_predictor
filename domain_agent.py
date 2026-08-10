@@ -118,6 +118,11 @@ class DomainAgent:
         ))
         z_score = float(evidence.get("z_score", 0.0))
         threshold = float(evidence.get("threshold", 1.0))
+        created_ns = int(created_ns)
+        # Somar float a um epoch em nanos (~1e18) perde os bits menos
+        # significativos e pode alongar o TTL em centenas de nanos. Converta a
+        # duração primeiro e mantenha a soma integral de ponta a ponta.
+        proposal_ttl_ns = int(self.proposal_ttl_s * 1e9)
 
         if veto_reason:
             proposal, belief, reason = "VETO", "POLICY_CONFLICT", veto_reason
@@ -169,14 +174,14 @@ class DomainAgent:
             "persistence_windows": int(evidence.get("persistence_windows", 1)),
             "relevant_domains": relevant_domains,
             "observation_ns": int(evidence.get("ts_ns", created_ns)),
-            "created_ns": int(created_ns),
-            "expires_ns": int(created_ns + self.proposal_ttl_s * 1e9),
+            "created_ns": created_ns,
+            "expires_ns": created_ns + proposal_ttl_ns,
             "reason": reason,
         })
         with self.lock:
             self.states[flow] = {
                 "state": "PROPOSING",
-                "updated_ns": int(created_ns),
+                "updated_ns": created_ns,
                 "proposal": proposal,
                 "belief": belief,
                 "confidence": proposal_payload["confidence"],

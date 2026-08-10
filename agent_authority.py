@@ -14,6 +14,13 @@ from typing import Any, Dict, Iterable, Optional
 from agent_protocol import agent_flow_hash
 
 
+# Compatibilidade com propostas geradas antes da soma integral do TTL. Ao
+# adicionar uma duração float a epoch_ns, o Python podia arredondar até centenas
+# de nanos. A tolerância só vale para a duração declarada; a idade real da
+# observação continua limitada sem qualquer margem.
+PROPOSAL_TTL_ROUNDING_TOLERANCE_NS = 1024
+
+
 def _deny(code: str, reason: str, *, flow: Optional[str] = None) -> Dict[str, Any]:
     return {
         "authorized": False,
@@ -157,9 +164,17 @@ def evaluate_agentic_authority(
             return _deny("invalid_proposal_time", "TTL da proposta é inválido", flow=flow)
         if expires_ns <= int(now_ns_value):
             return _deny("proposal_expired", "proposta expirada", flow=flow)
-        if (int(now_ns_value) - observation_ns > int(max_proposal_age_ns)
-                or expires_ns - created_ns > int(max_proposal_age_ns)):
-            return _deny("proposal_stale", "observação ou TTL excede o limite", flow=flow)
+        if int(now_ns_value) - observation_ns > int(max_proposal_age_ns):
+            return _deny(
+                "proposal_stale", "idade da observação excede o limite", flow=flow
+            )
+        if (expires_ns - created_ns
+                > int(max_proposal_age_ns) + PROPOSAL_TTL_ROUNDING_TOLERANCE_NS):
+            return _deny(
+                "proposal_ttl_exceeds_limit",
+                "TTL declarado excede o limite",
+                flow=flow,
+            )
         expirations.append(expires_ns)
         model_id = proposal.get("model_id")
         if not isinstance(model_id, str) or not model_id:

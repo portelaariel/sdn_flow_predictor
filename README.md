@@ -254,6 +254,12 @@ um domínio gera `WAITING_PROPOSALS`; topologias divergentes,
 `VETOED`. Um fluxo inteiramente local exige apenas o agente do seu único domínio
 responsável.
 
+Timestamps e TTLs do protocolo são calculados integralmente em nanossegundos.
+Isso evita a perda de precisão que ocorre ao somar uma duração `float` a um
+epoch na ordem de `10^18`. O gate mantém a idade da observação estritamente
+limitada e reserva apenas 1.024 ns de compatibilidade para o arredondamento do
+TTL declarado por propostas produzidas antes dessa correção.
+
 O modo padrão **shadow** anexa a decisão agentic à anomalia e a compara com a
 decisão MCDA, sem disputar claim nem chamar o FlowBlocker. O estágio seguinte,
 **authority-dry-run**, revalida cada novo `AGREED` em uma fronteira separada de
