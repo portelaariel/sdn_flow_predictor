@@ -10,6 +10,8 @@ MODE:
   local-dry-run          Detectores independentes; mitigação apenas simulada
   collaborative-dry-run Consenso MCDA; mitigação apenas simulada
   collaborative-live    Consenso MCDA; DROP real (exige --allow-mitigation)
+  agentic-live           Agentes autoritativos; DROP real
+                         (exige --allow-agentic-mitigation)
 
 SCENARIO:
   benign                 Vazão UDP estável, sem salto de ataque
@@ -47,6 +49,14 @@ case "$MODE" in
       exit 2
     fi
     ;;
+  agentic-live)
+    COLLABORATION=true
+    DRY_RUN=false
+    if [[ "$CONFIRMATION" != "--allow-agentic-mitigation" ]]; then
+      echo "agentic-live exige --allow-agentic-mitigation" >&2
+      exit 2
+    fi
+    ;;
   *)
     echo "modo inválido: $MODE" >&2
     usage >&2
@@ -77,8 +87,15 @@ POLL_S="${BENCHMARK_POLL_S:-0.5}"
 BUILD_IMAGE="${BENCHMARK_BUILD_IMAGE:-true}"
 BOOTSTRAP_ENV="${BENCHMARK_BOOTSTRAP_ENV:-true}"
 EXPORT_HISTORY="${BENCHMARK_EXPORT_HISTORY:-false}"
-AGENTIC="${BENCHMARK_AGENTIC_ENABLED:-false}"
-AGENTIC_MODE="${BENCHMARK_AGENTIC_MODE:-shadow}"
+if [[ "$MODE" == "agentic-live" ]]; then
+  AGENTIC=true
+  AGENTIC_MODE=authority-live
+  AGENTIC_LIVE_ACTUATION=true
+else
+  AGENTIC="${BENCHMARK_AGENTIC_ENABLED:-false}"
+  AGENTIC_MODE="${BENCHMARK_AGENTIC_MODE:-shadow}"
+  AGENTIC_LIVE_ACTUATION=false
+fi
 RESULTS_ROOT="${BENCHMARK_RESULTS_ROOT:-$PROJECT_ROOT/experiments/results}"
 MODEL_PATH="${PREDICTOR_OFFLINE_MODEL:-$PROJECT_ROOT/models/cic2019-drddos-udp-holt.json}"
 
@@ -106,8 +123,9 @@ if [[ "$AGENTIC" == "true" && "$COLLABORATION" != "true" ]]; then
   echo "BENCHMARK_AGENTIC_ENABLED requer um modo collaborative-*" >&2
   exit 2
 fi
-if [[ "$AGENTIC_MODE" != "shadow" && "$AGENTIC_MODE" != "authority-dry-run" ]]; then
-  echo "BENCHMARK_AGENTIC_MODE deve ser shadow ou authority-dry-run" >&2
+if [[ "$AGENTIC_MODE" != "shadow" && "$AGENTIC_MODE" != "authority-dry-run" \
+      && "$AGENTIC_MODE" != "authority-live" ]]; then
+  echo "BENCHMARK_AGENTIC_MODE deve ser shadow, authority-dry-run ou authority-live" >&2
   exit 2
 fi
 if [[ "$AGENTIC" != "true" && "$AGENTIC_MODE" != "shadow" ]]; then
@@ -116,6 +134,10 @@ if [[ "$AGENTIC" != "true" && "$AGENTIC_MODE" != "shadow" ]]; then
 fi
 if [[ "$AGENTIC_MODE" == "authority-dry-run" && "$DRY_RUN" != "true" ]]; then
   echo "authority-dry-run não pode ser combinado com mitigação live" >&2
+  exit 2
+fi
+if [[ "$AGENTIC_MODE" == "authority-live" && "$MODE" != "agentic-live" ]]; then
+  echo "authority-live só pode ser executado pelo modo agentic-live" >&2
   exit 2
 fi
 AGENTIC_SHADOW_SETTING=false
@@ -274,6 +296,7 @@ PREDICTOR_COLLAB_MIN_DOMAINS=2 \
 PREDICTOR_AGENTIC_ENABLED="$AGENTIC" \
 PREDICTOR_AGENTIC_MODE="$AGENTIC_MODE" \
 PREDICTOR_AGENTIC_SHADOW="$AGENTIC_SHADOW_SETTING" \
+PREDICTOR_AGENTIC_LIVE_ACTUATION="$AGENTIC_LIVE_ACTUATION" \
 PREDICTOR_AGENT_REQUIRED_VOTES=2 \
 PREDICTOR_EXPORT_ENABLED="$EXPORT_HISTORY" \
   bash "$PROJECT_ROOT/deploy_flow_predictor.sh" "$CSETS" "$DRY_RUN"
@@ -289,8 +312,8 @@ if [[ "$AGENTIC" == "true" ]]; then
       .requested == true and
       .active == true and
       .mode == $mode and
-      .authoritative == ($mode == "authority-dry-run") and
-      .actuation_enabled == false and
+      .authoritative == ($mode != "shadow") and
+      .actuation_enabled == ($mode == "authority-live") and
       (.agent_id | type == "string" and length > 0) and
       (.cid | type == "string" and length > 0)
     ' >/dev/null 2>&1 <<< "$agent_payload"; then
@@ -368,7 +391,7 @@ MONITOR_PID=$!
 
 echo "[benchmark] executando topologia e tráfego"
 WORKLOAD_MODE_ARGS=()
-if [[ "$MODE" == "collaborative-live" ]]; then
+if [[ "$MODE" == "collaborative-live" || "$MODE" == "agentic-live" ]]; then
   WORKLOAD_MODE_ARGS+=(--expect-disruption)
 fi
 set +e

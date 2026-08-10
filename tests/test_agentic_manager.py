@@ -115,6 +115,9 @@ class AgenticShadowManagerTests(unittest.TestCase):
             "AGENTIC_ENABLED": True,
             "AGENTIC_SHADOW": True,
             "AGENTIC_MODE": "shadow",
+            "AGENTIC_LIVE_ACTUATION": False,
+            "AUTO_MITIGATE": True,
+            "DRY_RUN": True,
             "AGENT_CLAIM_TTL_S": 60.0,
             "evaluate_agentic_authority": evaluate_agentic_authority,
             "claim_agentic_mitigation": claim_agentic_mitigation,
@@ -159,9 +162,18 @@ class AgenticShadowManagerTests(unittest.TestCase):
 
             def __init__(self):
                 self.applied = []
+                self.live_calls = []
 
             def apply_agentic_decision(self, flow, decision):
                 self.applied.append((flow, decision))
+
+            def mitigate_agentic(self, flow, decision):
+                self.live_calls.append((flow, decision.get("event_id")))
+                return {
+                    "attempted": True,
+                    "executed": True,
+                    "reason": "FlowBlocker HTTP 200",
+                }
 
         manager.engine = Engine()
         manager.agent = DomainAgent(
@@ -194,6 +206,9 @@ class AgenticShadowManagerTests(unittest.TestCase):
         manager.authority_denials = 0
         manager.claims_won = 0
         manager.claims_lost = 0
+        manager.live_attempts = 0
+        manager.live_executions = 0
+        manager.live_failures = 0
         manager.started_ns = self.NOW_NS
         return manager
 
@@ -306,6 +321,61 @@ class AgenticShadowManagerTests(unittest.TestCase):
         self.assertFalse(decision["execution"]["executed"])
         self.assertEqual(manager.authorizations, 1)
         self.assertEqual(manager.claims_won, 1)
+
+    def test_authority_live_executes_only_once_for_the_claim_winner(self):
+        manager = self.bare_manager()
+        flow = "10.0.0.1->10.0.0.8"
+        for cid, role in (("domain-0", "SOURCE"),
+                          ("domain-1", "DESTINATION")):
+            proposal = DomainAgent(
+                cid, proposal_threshold=0.65,
+                persistence_windows=3, rate_ratio_max=10.0,
+                proposal_ttl_s=12.0, required_votes=2,
+                negotiation_window_s=4.0,
+            ).build_proposal(
+                self.evidence(cid), role=role,
+                relevant_domains=["domain-0", "domain-1"],
+                source_cid="domain-0", destination_cid="domain-1",
+                created_ns=self.NOW_NS,
+            )
+            key = (
+                f"flowpredictor/agent-proposal/{agent_flow_hash(flow)}/"
+                f"2/{cid}"
+            )
+            self.etcd.put(key, json.dumps(proposal))
+            if cid == "domain-0":
+                manager.local_proposals[flow] = proposal
+
+        globals_dict = self.manager_class._evaluate_negotiations.__globals__
+        original = {
+            name: globals_dict[name]
+            for name in ("AGENTIC_MODE", "AGENTIC_LIVE_ACTUATION",
+                         "AUTO_MITIGATE", "DRY_RUN")
+        }
+        globals_dict.update({
+            "AGENTIC_MODE": "authority-live",
+            "AGENTIC_LIVE_ACTUATION": True,
+            "AUTO_MITIGATE": True,
+            "DRY_RUN": False,
+        })
+        try:
+            manager._evaluate_negotiations()
+            manager._evaluate_negotiations()
+        finally:
+            globals_dict.update(original)
+
+        decision = manager.decisions[flow]
+        self.assertTrue(decision["authoritative"])
+        self.assertTrue(decision["actuation_enabled"])
+        self.assertTrue(decision["authority"]["authorized"])
+        self.assertTrue(decision["authority"]["claim"]["won"])
+        self.assertTrue(decision["execution"]["attempted"])
+        self.assertTrue(decision["execution"]["executed"])
+        self.assertEqual(decision["execution"]["owner"], "agentic")
+        self.assertEqual(len(manager.engine.live_calls), 1)
+        self.assertEqual(manager.live_attempts, 1)
+        self.assertEqual(manager.live_executions, 1)
+        self.assertEqual(manager.live_failures, 0)
 
     def test_expired_proposal_does_not_delete_new_dirty_evidence(self):
         manager = self.bare_manager()

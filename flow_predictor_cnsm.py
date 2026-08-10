@@ -48,7 +48,8 @@ ENV (mesmo padrão dos demais serviços):
   # Agente deliberativo por domínio:
   AGENTIC_ENABLED        false
   AGENTIC_SHADOW         true
-  AGENTIC_MODE           shadow|authority-dry-run
+  AGENTIC_MODE           shadow|authority-dry-run|authority-live
+  AGENTIC_LIVE_ACTUATION true|false (opt-in adicional do authority-live)
   AGENT_REQUIRED_VOTES   2
   AGENT_PROPOSAL_TTL_S   12
   AGENT_NEGOTIATION_WINDOW_S 4
@@ -155,6 +156,9 @@ AGENT_PROPOSAL_THRESHOLD = float(
 )
 AGENT_TOPOLOGY_CACHE_S = float(os.environ.get("AGENT_TOPOLOGY_CACHE_S", "5.0"))
 AGENT_CLAIM_TTL_S = float(os.environ.get("AGENT_CLAIM_TTL_S", "60.0"))
+AGENTIC_LIVE_ACTUATION = (
+    os.environ.get("AGENTIC_LIVE_ACTUATION", "false").lower() == "true"
+)
 
 if not math.isfinite(EVENT_COOLDOWN_S) or EVENT_COOLDOWN_S < 0.0:
     raise ValueError("ANOMALY_EVENT_COOLDOWN_S deve ser não negativo e finito")
@@ -191,12 +195,31 @@ if AGENT_REQUIRED_VOTES < 1:
     raise ValueError("AGENT_REQUIRED_VOTES deve ser positivo")
 if AGENTIC_ENABLED and not COLLABORATION_ENABLED:
     raise ValueError("AGENTIC_ENABLED requer COLLABORATION_ENABLED=true")
+if AGENTIC_MODE == "authority-live" and not AGENTIC_ENABLED:
+    raise ValueError("authority-live requer AGENTIC_ENABLED=true")
 if AGENTIC_ENABLED and AGENT_REQUIRED_VOTES > COLLAB_EXPECTED_DOMAINS:
     raise ValueError("AGENT_REQUIRED_VOTES não pode exceder os domínios esperados")
-if AGENTIC_ENABLED and AGENTIC_MODE not in {"shadow", "authority-dry-run"}:
-    raise ValueError("AGENTIC_MODE deve ser shadow ou authority-dry-run")
+if AGENTIC_ENABLED and AGENTIC_MODE not in {
+        "shadow", "authority-dry-run", "authority-live"}:
+    raise ValueError(
+        "AGENTIC_MODE deve ser shadow, authority-dry-run ou authority-live"
+    )
 if AGENTIC_ENABLED and AGENTIC_MODE == "authority-dry-run" and not DRY_RUN:
     raise ValueError("authority-dry-run requer DRY_RUN=true")
+if AGENTIC_ENABLED and AGENTIC_LIVE_ACTUATION and AGENTIC_MODE != "authority-live":
+    raise ValueError("AGENTIC_LIVE_ACTUATION só é válido em authority-live")
+if AGENTIC_ENABLED and AGENTIC_MODE == "authority-live":
+    if not AGENTIC_LIVE_ACTUATION:
+        raise ValueError("authority-live requer AGENTIC_LIVE_ACTUATION=true")
+    if DRY_RUN:
+        raise ValueError("authority-live requer DRY_RUN=false")
+    if not AUTO_MITIGATE:
+        raise ValueError("authority-live requer AUTO_MITIGATE=true")
+    if (not OFFLINE_MODEL_REQUIRED or not OFFLINE_MODEL_PATH
+            or ONLINE_MODEL_ADAPTATION):
+        raise ValueError(
+            "authority-live requer modelo offline obrigatório e sem adaptação online"
+        )
 
 # --- Persistência do histórico de predição (aditivo; não afeta a lógica online) ---
 EXPORT_ENABLED     = os.environ.get("EXPORT_ENABLED", "true").lower() == "true"
@@ -892,12 +915,13 @@ class Mitigator:
 
 
 class AgenticShadowManager:
-    """Executa um agente por domínio em shadow ou authority-dry-run.
+    """Executa um agente por domínio em shadow ou em modo autoritativo.
 
     A entrada é exatamente a evidência local já agregada pelo caminho MCDA. O
     agente publica proposta efêmera e negocia com os pares. Em shadow, apenas
-    observa. Em authority-dry-run, revalida AGREED e disputa um claim dedicado,
-    mas nenhum método desta classe chama o FlowBlocker.
+    observa. Nos modos autoritativos, revalida AGREED e disputa um claim
+    dedicado. Somente authority-live, com opt-in adicional, conecta o vencedor
+    ao método de mitigação protegido do motor.
     """
 
     def __init__(self, engine: Any):
@@ -938,6 +962,9 @@ class AgenticShadowManager:
         self.authority_denials = 0
         self.claims_won = 0
         self.claims_lost = 0
+        self.live_attempts = 0
+        self.live_executions = 0
+        self.live_failures = 0
         self.started_ns = now_ns()
         self.thread = threading.Thread(
             target=self._run,
@@ -1223,8 +1250,8 @@ class AgenticShadowManager:
             "mcda": legacy_copy,
         }
 
-    def _authority_dry_run(self, decision: Dict[str, Any]) -> None:
-        """Revalida e elege um agente sem disponibilizar atuação externa."""
+    def _evaluate_authority(self, decision: Dict[str, Any]) -> None:
+        """Revalida, elege e opcionalmente executa o agente vencedor."""
         if decision.get("decision") != "AGREED":
             decision["authority"] = {
                 "evaluated": False,
@@ -1268,20 +1295,47 @@ class AgenticShadowManager:
             "authorization": authorization,
             "claim": claim,
         }
-        decision["execution"] = {
-            "attempted": False,
-            "executed": False,
-            "would_execute": won,
-            "reason": (
-                "authority-dry-run: claim adquirido; FlowBlocker desconectado"
-                if won else
-                "authority-dry-run: decisão autorizada, mas outro agente coordena"
-                if authorization.get("authorized") and not degraded else
-                "authority-dry-run: claim falhou fechado"
-                if degraded else
-                "authority-dry-run: gate negou autoridade"
-            ),
-        }
+        if (AGENTIC_MODE == "authority-live" and won and not degraded
+                and AGENTIC_LIVE_ACTUATION and not DRY_RUN and AUTO_MITIGATE):
+            try:
+                result = self.engine.mitigate_agentic(decision["flow"], decision)
+            except Exception as exc:
+                self.record_error("mitigação authority-live", exc)
+                result = {
+                    "attempted": False,
+                    "executed": False,
+                    "reason": f"authority-live falhou fechado: {exc}",
+                }
+            decision["execution"] = {
+                **result,
+                "would_execute": True,
+                "owner": "agentic",
+            }
+            with self.lock:
+                if result.get("attempted"):
+                    self.live_attempts += 1
+                if result.get("executed"):
+                    self.live_executions += 1
+                else:
+                    self.live_failures += 1
+        else:
+            decision["execution"] = {
+                "attempted": False,
+                "executed": False,
+                "would_execute": won,
+                "owner": "agentic",
+                "reason": (
+                    "authority-dry-run: claim adquirido; FlowBlocker desconectado"
+                    if AGENTIC_MODE == "authority-dry-run" and won else
+                    "authority-live: kill-switch de atuação desabilitado"
+                    if AGENTIC_MODE == "authority-live" and won else
+                    f"{AGENTIC_MODE}: decisão autorizada, mas outro agente coordena"
+                    if authorization.get("authorized") and not degraded else
+                    f"{AGENTIC_MODE}: claim falhou fechado"
+                    if degraded else
+                    f"{AGENTIC_MODE}: gate negou autoridade"
+                ),
+            }
 
     def _evaluate_negotiations(self):
         current_ns = now_ns()
@@ -1326,8 +1380,13 @@ class AgenticShadowManager:
             )
             decision.update({
                 "mode": AGENTIC_MODE,
-                "authoritative": AGENTIC_MODE == "authority-dry-run",
-                "actuation_enabled": False,
+                "authoritative": AGENTIC_MODE in {
+                    "authority-dry-run", "authority-live"
+                },
+                "actuation_enabled": (
+                    AGENTIC_MODE == "authority-live"
+                    and AGENTIC_LIVE_ACTUATION and not DRY_RUN and AUTO_MITIGATE
+                ),
             })
             decision["legacy_comparison"] = self._legacy_comparison(flow, decision)
             with self.lock:
@@ -1362,8 +1421,8 @@ class AgenticShadowManager:
                     new_event = True
 
             if new_event:
-                if AGENTIC_MODE == "authority-dry-run":
-                    self._authority_dry_run(decision)
+                if AGENTIC_MODE in {"authority-dry-run", "authority-live"}:
+                    self._evaluate_authority(decision)
                 else:
                     decision["execution"] = {
                         "attempted": False,
@@ -1431,8 +1490,13 @@ class AgenticShadowManager:
                 "requested": AGENTIC_ENABLED,
                 "active": True,
                 "mode": AGENTIC_MODE,
-                "authoritative": AGENTIC_MODE == "authority-dry-run",
-                "actuation_enabled": False,
+                "authoritative": AGENTIC_MODE in {
+                    "authority-dry-run", "authority-live"
+                },
+                "actuation_enabled": (
+                    AGENTIC_MODE == "authority-live"
+                    and AGENTIC_LIVE_ACTUATION and not DRY_RUN and AUTO_MITIGATE
+                ),
                 "agent_id": self.agent.agent_id,
                 "cid": CONTROLLER_ID,
                 "uptime_s": round((now_ns() - self.started_ns) / 1e9, 1),
@@ -1447,6 +1511,9 @@ class AgenticShadowManager:
                 "authority_denials": self.authority_denials,
                 "claims_won": self.claims_won,
                 "claims_lost": self.claims_lost,
+                "live_attempts": self.live_attempts,
+                "live_executions": self.live_executions,
+                "live_failures": self.live_failures,
                 "errors": self.errors,
                 "topology_errors": self.topology_errors,
                 "topology_retries_pending": len(self.topology_retry_at),
@@ -1458,6 +1525,7 @@ class AgenticShadowManager:
                     "negotiation_window_s": AGENT_NEGOTIATION_WINDOW_S,
                     "topology_cache_s": AGENT_TOPOLOGY_CACHE_S,
                     "claim_ttl_s": AGENT_CLAIM_TTL_S,
+                    "live_actuation_opt_in": AGENTIC_LIVE_ACTUATION,
                     "weights": self.agent.weights,
                 },
                 "states": self.agent.snapshot_states(),
@@ -1690,26 +1758,38 @@ class CollaborativeDecisionManager:
             )
             decision.update({"flow": flow, "evaluated_ns": evaluated_ns})
             if decision["decision"] == "MITIGATE":
-                claim = self._claim_mitigation(flow, decision)
-                decision["claim"] = claim
-                if claim.get("won"):
-                    previous_action = self.mitigation_results.get(flow)
-                    if (previous_action is None
-                            or previous_action.get("claimed_ns") != claim.get("claimed_ns")):
-                        result = self.engine.mitigate_collaborative(flow, decision)
-                        previous_action = {
-                            "claimed_ns": claim.get("claimed_ns"),
-                            "result": result,
-                        }
-                        self.mitigation_results[flow] = previous_action
-                    decision["mitigation"] = previous_action["result"]
-                else:
+                if AGENTIC_ENABLED and AGENTIC_MODE == "authority-live":
+                    # O MCDA permanece um comparador independente, mas não pode
+                    # disputar claim nem acessar o plano de dados quando a
+                    # autoridade pertence aos agentes.
+                    decision["claim"] = None
                     decision["mitigation"] = {
                         "attempted": False,
                         "executed": False,
-                        "reason": ("decisão executada pelo coordenador "
-                                   f"{claim.get('coordinator', 'desconhecido')}"),
+                        "owner": "agentic",
+                        "reason": "MCDA observacional durante authority-live",
                     }
+                else:
+                    claim = self._claim_mitigation(flow, decision)
+                    decision["claim"] = claim
+                    if claim.get("won"):
+                        previous_action = self.mitigation_results.get(flow)
+                        if (previous_action is None
+                                or previous_action.get("claimed_ns") != claim.get("claimed_ns")):
+                            result = self.engine.mitigate_collaborative(flow, decision)
+                            previous_action = {
+                                "claimed_ns": claim.get("claimed_ns"),
+                                "result": result,
+                            }
+                            self.mitigation_results[flow] = previous_action
+                        decision["mitigation"] = previous_action["result"]
+                    else:
+                        decision["mitigation"] = {
+                            "attempted": False,
+                            "executed": False,
+                            "reason": ("decisão executada pelo coordenador "
+                                       f"{claim.get('coordinator', 'desconhecido')}"),
+                        }
 
             with self.lock:
                 previous_state = self.last_logged_state.get(flow)
@@ -1858,7 +1938,9 @@ class PredictorEngine:
                               if COLLABORATION_ENABLED and _etcd is not None else None)
         self.agentic = (AgenticShadowManager(self)
                         if (AGENTIC_ENABLED
-                            and AGENTIC_MODE in {"shadow", "authority-dry-run"}
+                            and AGENTIC_MODE in {
+                                "shadow", "authority-dry-run", "authority-live"
+                            }
                             and self.collaboration is not None)
                         else None)
         if COLLABORATION_ENABLED and self.collaboration is None:
@@ -1991,6 +2073,51 @@ class PredictorEngine:
                                       f"executed={result.get('executed')}")
         return result
 
+    def mitigate_agentic(self, flow: str,
+                         decision: Dict[str, Any]) -> Dict[str, Any]:
+        """Única fronteira que conecta authority-live ao FlowBlocker."""
+        authority = decision.get("authority") or {}
+        claim = authority.get("claim") or {}
+        authorization = authority.get("authorization") or {}
+        if not (AGENTIC_ENABLED and AGENTIC_MODE == "authority-live"
+                and AGENTIC_LIVE_ACTUATION and AUTO_MITIGATE and not DRY_RUN):
+            return {
+                "attempted": False,
+                "executed": False,
+                "reason": "authority-live não está integralmente habilitado",
+            }
+        if (authority.get("authorized") is not True
+                or authorization.get("authorized") is not True
+                or authorization.get("flow") != flow
+                or claim.get("won") is not True
+                or claim.get("degraded") is True
+                or claim.get("coordinator") != CONTROLLER_ID):
+            return {
+                "attempted": False,
+                "executed": False,
+                "reason": "gate/claim agentic não autoriza atuação local",
+            }
+        with self.lock:
+            target = next((item for item in self.anomalies
+                           if canonical_flow_key(item) == flow), None)
+        if target is None:
+            return {
+                "attempted": False,
+                "executed": False,
+                "reason": "evento local não encontrado para authority-live",
+            }
+        result = self.mitigator.maybe_mitigate(target)
+        with self.lock:
+            for item in self.anomalies:
+                if canonical_flow_key(item) == flow:
+                    item["mitigation"] = result
+        _metric(
+            "AGENT_MITIGATION_APPLY",
+            f"flow={flow} coordinator={CONTROLLER_ID} "
+            f"attempted={result.get('attempted')} executed={result.get('executed')}",
+        )
+        return result
+
     def apply_collaborative_decision(self, flow: str,
                                      decision: Dict[str, Any]) -> None:
         """Anexa a justificativa MCDA aos eventos locais correspondentes."""
@@ -1998,7 +2125,9 @@ class PredictorEngine:
             for item in self.anomalies:
                 if canonical_flow_key(item) == flow:
                     item["collaboration"] = decision
-                    if "mitigation" in decision:
+                    if ("mitigation" in decision
+                            and not (AGENTIC_ENABLED
+                                     and AGENTIC_MODE == "authority-live")):
                         item["mitigation"] = decision["mitigation"]
 
     def apply_agentic_decision(self, flow: str,
@@ -2059,7 +2188,9 @@ class PredictorEngine:
             "requested": AGENTIC_ENABLED,
             "active": False,
             "mode": AGENTIC_MODE,
-            "authoritative": AGENTIC_MODE == "authority-dry-run",
+            "authoritative": AGENTIC_MODE in {
+                "authority-dry-run", "authority-live"
+            },
             "actuation_enabled": False,
             "cid": CONTROLLER_ID,
             "reason": reason,
@@ -2205,6 +2336,9 @@ def status():
                 "authority_denials": agentic.get("authority_denials", 0),
                 "claims_won": agentic.get("claims_won", 0),
                 "claims_lost": agentic.get("claims_lost", 0),
+                "live_attempts": agentic.get("live_attempts", 0),
+                "live_executions": agentic.get("live_executions", 0),
+                "live_failures": agentic.get("live_failures", 0),
                 "errors": agentic.get("errors", 0),
             },
             "config": {
@@ -2228,6 +2362,7 @@ def status():
                 "agentic_shadow": AGENTIC_SHADOW,
                 "agentic_mode": AGENTIC_MODE,
                 "agentic_active": engine.agentic is not None,
+                "agentic_live_actuation_opt_in": AGENTIC_LIVE_ACTUATION,
             },
         }), 200
 

@@ -64,8 +64,11 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
     run_started_ns = metadata.get("started_ns")
     if not isinstance(run_started_ns, int):
         run_started_ns = None
-    collaborative = str(metadata.get("mode", "")).startswith("collaborative-")
-    live_mode = metadata.get("mode") == "collaborative-live"
+    collaborative = (
+        str(metadata.get("mode", "")).startswith("collaborative-")
+        or metadata.get("mode") == "agentic-live"
+    )
+    live_mode = metadata.get("mode") in {"collaborative-live", "agentic-live"}
     agentic_enabled = (
         metadata.get("agentic_enabled") is True
         or metadata.get("agentic_shadow") is True
@@ -83,7 +86,9 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
     action_domains = set()
     baseline_action_domains = set()
     coordinator = None
-    claimed_ns = None
+    mcda_claimed_ns = None
+    mcda_mitigate_ns = None
+    agentic_claimed_ns = None
     mitigation_attempted = False
     mitigation_executed = False
     mitigation_reason = None
@@ -129,12 +134,15 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
         agentic = row.get("agentic", {})
         if not isinstance(agentic, dict):
             agentic = {}
-        expected_authoritative = agentic_mode == "authority-dry-run"
+        expected_authoritative = agentic_mode in {
+            "authority-dry-run", "authority-live"
+        }
+        expected_actuation = agentic_mode == "authority-live"
         if (agentic.get("requested") is True
                 and agentic.get("active") is True
                 and agentic.get("mode") == agentic_mode
                 and agentic.get("authoritative") is expected_authoritative
-                and agentic.get("actuation_enabled", False) is False):
+                and agentic.get("actuation_enabled", False) is expected_actuation):
             agent_cid = agentic.get("cid") or cid
             if agent_cid is not None:
                 agentic_active_domains.add(str(agent_cid))
@@ -204,11 +212,18 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
             if isinstance(score, (int, float)):
                 max_score = score if max_score is None else max(max_score, score)
             confirming_domains.update(decision.get("confirming_domains", []))
+            if state == "MITIGATE" and isinstance(decision_ts, int):
+                mcda_mitigate_ns = (
+                    decision_ts if mcda_mitigate_ns is None
+                    else min(mcda_mitigate_ns, decision_ts)
+                )
             if claim.get("coordinator"):
                 coordinator = claim["coordinator"]
             if isinstance(claim.get("claimed_ns"), int):
-                claimed_ns = (claim["claimed_ns"] if claimed_ns is None
-                              else min(claimed_ns, claim["claimed_ns"]))
+                mcda_claimed_ns = (
+                    claim["claimed_ns"] if mcda_claimed_ns is None
+                    else min(mcda_claimed_ns, claim["claimed_ns"])
+                )
             mitigation = decision.get("mitigation") or {}
             if mitigation.get("attempted"):
                 mitigation_attempted = True
@@ -249,11 +264,30 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
             authority_claim = authority.get("claim") or {}
             if authority_claim.get("won"):
                 agentic_claim_winners.add(agent_cid)
+                if authority_claim.get("coordinator"):
+                    coordinator = authority_claim["coordinator"]
+                if isinstance(authority_claim.get("claimed_ns"), int):
+                    agentic_claimed_ns = (
+                        authority_claim["claimed_ns"]
+                        if agentic_claimed_ns is None
+                        else min(agentic_claimed_ns,
+                                 authority_claim["claimed_ns"])
+                    )
             execution = decision.get("execution") or {}
             if execution.get("would_execute"):
                 agentic_would_execute_domains.add(agent_cid)
             if execution.get("attempted") or execution.get("executed"):
                 agentic_actuation_violation = True
+                if agentic_mode == "authority-live":
+                    action_domains.add(agent_cid)
+                    mitigation_attempted = (
+                        mitigation_attempted or bool(execution.get("attempted"))
+                    )
+                    mitigation_executed = (
+                        mitigation_executed or bool(execution.get("executed"))
+                    )
+                    if execution.get("reason"):
+                        mitigation_reason = execution["reason"]
             comparison = decision.get("legacy_comparison", {})
             if comparison.get("available") and isinstance(comparison.get("matches"), bool):
                 evaluated_ns = int(decision.get("evaluated_ns", row.get("sampled_ns", 0)))
@@ -275,9 +309,18 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
         round((detection_ns - attack_start_ns) / 1e6, 3)
         if detection_ns is not None and attack_start_ns is not None else None
     )
+    primary_claimed_ns = (
+        agentic_claimed_ns if agentic_mode == "authority-live"
+        else mcda_claimed_ns
+    )
     consensus_latency_ms = (
-        round((claimed_ns - detection_ns) / 1e6, 3)
-        if claimed_ns is not None and detection_ns is not None else None
+        round((primary_claimed_ns - detection_ns) / 1e6, 3)
+        if primary_claimed_ns is not None and detection_ns is not None else None
+    )
+    mcda_endpoint_ns = mcda_claimed_ns or mcda_mitigate_ns
+    mcda_consensus_latency_ms = (
+        round((mcda_endpoint_ns - detection_ns) / 1e6, 3)
+        if mcda_endpoint_ns is not None and detection_ns is not None else None
     )
     agreement_events = [
         event for event in agentic_events.values()
@@ -449,7 +492,7 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
         "attack_spike_anomalies": len(attack_spikes),
         "detection_latency_ms": detection_latency_ms,
         "consensus_latency_ms": consensus_latency_ms,
-        "mcda_consensus_latency_ms": consensus_latency_ms,
+        "mcda_consensus_latency_ms": mcda_consensus_latency_ms,
         "ping_before_loss_percent": ping_before_loss,
         "ping_after_loss_percent": ping_after_loss,
         "baseline_bps": baseline_bps,

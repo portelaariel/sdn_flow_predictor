@@ -415,6 +415,124 @@ class PredictorTests(unittest.TestCase):
         self.assertEqual(current_event["agentic_shadow"], decision)
         self.assertNotIn("agentic_shadow", old_event)
 
+    def test_agentic_live_boundary_requires_local_non_degraded_winner(self):
+        class FakeMitigator:
+            def __init__(self):
+                self.calls = 0
+
+            def maybe_mitigate(self, _anomaly):
+                self.calls += 1
+                return {
+                    "attempted": True,
+                    "executed": True,
+                    "reason": "FlowBlocker HTTP 200",
+                }
+
+        def canonical(anomaly):
+            meta = anomaly.get("meta", {})
+            return f"{meta.get('nw_src')}->{meta.get('nw_dst')}"
+
+        symbols = load_definitions(
+            "flow_predictor_cnsm.py",
+            {"PredictorEngine"},
+            {
+                "Any": Any, "Dict": Dict, "List": List,
+                "Optional": Optional, "Tuple": Tuple,
+                "OfflineModel": OfflineModel,
+                "canonical_flow_key": canonical,
+                "AGENTIC_ENABLED": True,
+                "AGENTIC_MODE": "authority-live",
+                "AGENTIC_LIVE_ACTUATION": True,
+                "AUTO_MITIGATE": True,
+                "DRY_RUN": False,
+                "CONTROLLER_ID": "domain-0",
+                "_metric": lambda *_args: None,
+            },
+        )
+        engine = object.__new__(symbols["PredictorEngine"])
+        engine.lock = __import__("threading").RLock()
+        engine.mitigator = FakeMitigator()
+        event = {
+            "meta": {
+                "type": "flow",
+                "nw_src": "10.0.0.1",
+                "nw_dst": "10.0.0.8",
+            },
+        }
+        engine.anomalies = deque([event])
+        decision = {
+            "authority": {
+                "authorized": True,
+                "authorization": {
+                    "authorized": True,
+                    "flow": "10.0.0.1->10.0.0.8",
+                },
+                "claim": {
+                    "won": True,
+                    "degraded": False,
+                    "coordinator": "domain-0",
+                },
+            },
+        }
+
+        result = engine.mitigate_agentic(
+            "10.0.0.1->10.0.0.8", decision
+        )
+        self.assertTrue(result["executed"])
+        self.assertEqual(engine.mitigator.calls, 1)
+
+        decision["authority"]["claim"]["degraded"] = True
+        denied = engine.mitigate_agentic(
+            "10.0.0.1->10.0.0.8", decision
+        )
+        self.assertFalse(denied["attempted"])
+        self.assertEqual(engine.mitigator.calls, 1)
+
+    def test_mcda_observation_preserves_agentic_live_result(self):
+        def canonical(anomaly):
+            meta = anomaly.get("meta", {})
+            return f"{meta.get('nw_src')}->{meta.get('nw_dst')}"
+
+        symbols = load_definitions(
+            "flow_predictor_cnsm.py",
+            {"PredictorEngine"},
+            {
+                "Any": Any, "Dict": Dict, "List": List,
+                "Optional": Optional, "Tuple": Tuple,
+                "OfflineModel": OfflineModel,
+                "canonical_flow_key": canonical,
+                "AGENTIC_ENABLED": True,
+                "AGENTIC_MODE": "authority-live",
+            },
+        )
+        engine = object.__new__(symbols["PredictorEngine"])
+        engine.lock = __import__("threading").RLock()
+        live_result = {
+            "attempted": True,
+            "executed": True,
+            "reason": "FlowBlocker HTTP 200",
+        }
+        event = {
+            "meta": {"nw_src": "10.0.0.1", "nw_dst": "10.0.0.8"},
+            "mitigation": live_result,
+        }
+        engine.anomalies = deque([event])
+        mcda = {
+            "decision": "MITIGATE",
+            "mitigation": {
+                "attempted": False,
+                "executed": False,
+                "reason": "MCDA observacional durante authority-live",
+            },
+        }
+
+        engine.apply_collaborative_decision(
+            "10.0.0.1->10.0.0.8", mcda
+        )
+
+        self.assertEqual(event["mitigation"], live_result)
+        self.assertEqual(event["collaboration"], mcda)
+
 
 class FlowRuleTests(unittest.TestCase):
     def test_flowblocker_builds_openflow10_drop(self):
@@ -555,19 +673,83 @@ class CollaborativeManagerTests(unittest.TestCase):
 
     def bare_manager(self):
         manager = object.__new__(self.namespace["CollaborativeDecisionManager"])
-        manager.engine = type("Engine", (), {
-            "offline_model": None,
-            "detection_mode": "offline",
-        })()
+
+        class Engine:
+            offline_model = None
+            detection_mode = "offline"
+
+            def __init__(self):
+                self.applied = []
+
+            def apply_collaborative_decision(self, flow, decision):
+                self.applied.append((flow, decision))
+
+        manager.engine = Engine()
         manager.lock = __import__("threading").RLock()
         manager.wake = __import__("threading").Event()
         manager.local_candidates = {}
         manager.dirty_flows = set()
+        manager.decisions = {}
+        manager.decision_events = deque(maxlen=200)
+        manager.last_decision_key = {}
+        manager.last_logged_state = {}
+        manager.mitigation_results = {}
         manager.claims = {}
         manager.claim_leases = {}
         manager.claims_won = 0
         manager.claims_lost = 0
         return manager
+
+    def test_authority_live_keeps_mcda_observational(self):
+        manager = self.bare_manager()
+        flow = "10.0.0.1->10.0.0.8"
+        manager.local_candidates[flow] = {
+            "window_id": 2,
+            "evidence": {"ts_ns": 9_500_000_000},
+        }
+        manager._read_evidence = lambda _flow: []
+        manager._claim_mitigation = lambda *_args, **_kwargs: self.fail(
+            "MCDA não deve disputar claim em authority-live"
+        )
+        globals_dict = manager._evaluate_candidates.__globals__
+        replacements = {
+            "COLLAB_EVIDENCE_TTL_S": 12.0,
+            "COLLAB_EXPECTED_DOMAINS": 2,
+            "COLLAB_MIN_DOMAINS": 2,
+            "COLLAB_WEIGHTS": {},
+            "COLLAB_PERSISTENCE_WINDOWS": 3,
+            "COLLAB_RATE_RATIO_MAX": 10.0,
+            "COLLAB_SUSPECT_THRESHOLD": 0.4,
+            "COLLAB_ALERT_THRESHOLD": 0.6,
+            "COLLAB_DECISION_THRESHOLD": 0.8,
+            "AGENTIC_ENABLED": True,
+            "AGENTIC_MODE": "authority-live",
+            "score_collaborative_evidence": lambda *_args, **_kwargs: {
+                "decision": "MITIGATE",
+                "score": 0.95,
+                "confirming_domains": ["domain-0", "domain-1"],
+                "window_ids": [2],
+            },
+        }
+        missing = object()
+        original = {
+            name: globals_dict.get(name, missing) for name in replacements
+        }
+        globals_dict.update(replacements)
+        try:
+            manager._evaluate_candidates()
+        finally:
+            for name, value in original.items():
+                if value is missing:
+                    globals_dict.pop(name, None)
+                else:
+                    globals_dict[name] = value
+
+        decision = manager.decisions[flow]
+        self.assertIsNone(decision["claim"])
+        self.assertFalse(decision["mitigation"]["attempted"])
+        self.assertEqual(decision["mitigation"]["owner"], "agentic")
+        self.assertEqual(len(manager.engine.applied), 1)
 
     def test_local_switch_views_are_aggregated_without_summing_rates(self):
         manager = self.bare_manager()

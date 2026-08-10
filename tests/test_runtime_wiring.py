@@ -31,6 +31,9 @@ class RuntimeWiringTests(unittest.TestCase):
         cls.authority_campaign_source = (
             ROOT / "scripts/run_agentic_authority_campaign.sh"
         ).read_text(encoding="utf-8")
+        cls.authority_live_source = (
+            ROOT / "scripts/run_agentic_authority_live_canary.sh"
+        ).read_text(encoding="utf-8")
         cls.dockerfile = (ROOT / "Dockerfile.flow_predictor").read_text(
             encoding="utf-8"
         )
@@ -144,6 +147,21 @@ class RuntimeWiringTests(unittest.TestCase):
             "collaborative-dry-run", self.authority_campaign_source
         )
         self.assertNotIn("collaborative-live", self.authority_campaign_source)
+
+    def test_authority_live_canary_requires_opt_in_and_negative_control(self):
+        self.assertIn(
+            "--allow-agentic-mitigation", self.authority_live_source
+        )
+        self.assertIn("run_case benign", self.authority_live_source)
+        self.assertIn("run_case ddos", self.authority_live_source)
+        self.assertIn("promotion_ready == true", self.authority_live_source)
+        self.assertIn("merge-base --is-ancestor", self.authority_live_source)
+        self.assertIn("PROMOTION_MODEL", self.authority_live_source)
+        self.assertIn("agentic-live", self.benchmark_source)
+        self.assertIn(
+            'PREDICTOR_AGENTIC_LIVE_ACTUATION="$AGENTIC_LIVE_ACTUATION"',
+            self.benchmark_source,
+        )
 
 
 if __name__ == "__main__":
