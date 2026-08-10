@@ -1268,6 +1268,19 @@ class AgenticShadowManager:
             return
 
         evaluation_ns = now_ns()
+        # A comparação com o MCDA é evidência experimental, não um requisito
+        # do gate agentic. Ela precisa, porém, representar o instante em que a
+        # autoridade foi avaliada. O estado corrente do MCDA pode mudar depois
+        # do DROP e não deve reescrever retroativamente essa observação.
+        authority_mcda_comparison = json.loads(json.dumps(
+            decision.get("legacy_comparison")
+            if isinstance(decision.get("legacy_comparison"), dict)
+            else {"available": False, "matches": None}
+        ))
+        authority_mcda_comparison.update({
+            "captured_ns": evaluation_ns,
+            "basis": "authority_evaluation",
+        })
         authorization = evaluate_agentic_authority(
             decision,
             now_ns_value=evaluation_ns,
@@ -1294,6 +1307,7 @@ class AgenticShadowManager:
             "reason": authorization.get("reason"),
             "authorization": authorization,
             "claim": claim,
+            "mcda_comparison": authority_mcda_comparison,
         }
         if (AGENTIC_MODE == "authority-live" and won and not degraded
                 and AGENTIC_LIVE_ACTUATION and not DRY_RUN and AUTO_MITIGATE):

@@ -562,6 +562,7 @@ class BenchmarkToolTests(unittest.TestCase):
                 "event_id": f"{cid}:live-summary",
                 "flow": flow,
                 "decision": "AGREED",
+                "evaluated_ns": attack_ns + 450_000_000,
                 "state_entered_ns": attack_ns + 450_000_000,
                 "authority": {
                     "authorized": True,
@@ -578,6 +579,14 @@ class BenchmarkToolTests(unittest.TestCase):
                     "would_execute": won,
                     "owner": "agentic",
                     "reason": "FlowBlocker HTTP 200" if won else "peer coordena",
+                },
+                "legacy_comparison": {
+                    "available": True,
+                    "matches": True,
+                    "mcda": {
+                        "decision": "MITIGATE",
+                        "evaluated_ns": attack_ns + 400_000_000,
+                    },
                 },
             }
             return {
@@ -643,9 +652,25 @@ class BenchmarkToolTests(unittest.TestCase):
             (run_dir / "ping_after.txt").write_text(
                 "100% packet loss\n", encoding="utf-8"
             )
+            initial_rows = [row("domain-0", True), row("domain-1", False)]
+            post_drop_rows = json.loads(json.dumps(initial_rows))
+            for item in post_drop_rows:
+                item["sampled_ns"] = attack_ns + 900_000_000
+                current = item["agentic"]["decisions"][0]
+                preserved = json.loads(json.dumps(current))
+                item["agentic"]["decision_events"] = [preserved]
+                current["evaluated_ns"] = attack_ns + 900_000_000
+                current["legacy_comparison"] = {
+                    "available": True,
+                    "matches": False,
+                    "mcda": {
+                        "decision": "CORROBORATED",
+                        "evaluated_ns": attack_ns + 850_000_000,
+                    },
+                }
             (run_dir / "timeline.ndjson").write_text(
                 "".join(json.dumps(item) + "\n" for item in (
-                    row("domain-0", True), row("domain-1", False)
+                    initial_rows + post_drop_rows
                 )),
                 encoding="utf-8",
             )
@@ -659,6 +684,11 @@ class BenchmarkToolTests(unittest.TestCase):
             self.assertEqual(report["mcda_consensus_latency_ms"], 300.0)
             self.assertEqual(
                 report["agentic_active_domains"], ["domain-0", "domain-1"]
+            )
+            self.assertTrue(report["agentic_matches_mcda"])
+            self.assertEqual(
+                {item["basis"] for item in report["agentic_mcda_comparisons"]},
+                {"first_event_observation"},
             )
 
     def test_authority_campaign_requires_positive_and_negative_cases(self):

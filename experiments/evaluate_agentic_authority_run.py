@@ -152,7 +152,12 @@ def evaluate(run_dir: Path) -> Dict[str, Any]:
     mcda_records = []
     for event in authorized:
         domain = str(event.get("observed_by") or "")
-        comparison = event.get("legacy_comparison") or {}
+        authority = event.get("authority") or {}
+        frozen_comparison = authority.get("mcda_comparison")
+        comparison = (
+            frozen_comparison if isinstance(frozen_comparison, dict)
+            else event.get("legacy_comparison") or {}
+        )
         if comparison.get("available") is True:
             mcda_records.append((domain, comparison.get("matches")))
             continue
@@ -166,6 +171,20 @@ def evaluate(run_dir: Path) -> Dict[str, Any]:
                 int(value) for value in candidate.get("window_ids", [])
             }
         ]
+        comparison_cutoff_ns = int(
+            authority.get("evaluated_ns")
+            or event.get("state_entered_ns")
+            or event.get("evaluated_ns")
+            or 0
+        )
+        if comparison_cutoff_ns:
+            matching_before_authority = [
+                candidate for candidate in matching
+                if int(candidate.get("evaluated_ns", 0) or 0)
+                <= comparison_cutoff_ns
+            ]
+            if matching_before_authority:
+                matching = matching_before_authority
         if matching:
             mcda = max(
                 matching,
