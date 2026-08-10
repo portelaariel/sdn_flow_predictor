@@ -22,6 +22,12 @@ class RuntimeWiringTests(unittest.TestCase):
         cls.workload_source = (
             ROOT / "experiments/run_mininet_workload.py"
         ).read_text(encoding="utf-8")
+        cls.mininet_source = (
+            ROOT / "eMSN_ENV/setup_mininet.py"
+        ).read_text(encoding="utf-8")
+        cls.runtime_fault_source = (
+            ROOT / "scripts/run_agentic_runtime_faults.sh"
+        ).read_text(encoding="utf-8")
         cls.dockerfile = (ROOT / "Dockerfile.flow_predictor").read_text(
             encoding="utf-8"
         )
@@ -107,6 +113,13 @@ class RuntimeWiringTests(unittest.TestCase):
         self.assertIn('/predictor/agent', self.monitor_source)
         self.assertIn('"agentic": agentic', self.monitor_source)
         self.assertIn('PREDICTOR_AGENTIC_ENABLED="$AGENTIC"', self.benchmark_source)
+
+    def test_runtime_fault_gate_uses_preflighted_published_openflow_ports(self):
+        self.assertIn('MININET_CONTROLLER_HOST', self.mininet_source)
+        self.assertIn('wait_tcp 127.0.0.1 "$controller_port"', self.runtime_fault_source)
+        self.assertIn(
+            'MININET_CONTROLLER_HOST=127.0.0.1', self.runtime_fault_source
+        )
 
 
 if __name__ == "__main__":

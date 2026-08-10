@@ -316,6 +316,12 @@ ETCD. O ataque só começa depois que o runner confirma a falha, por meio de um
 gate de sincronização no workload Mininet. A pausa e a partição são sempre
 desfeitas por um `trap`, inclusive em interrupções.
 
+Antes de criar a topologia, o runner valida separadamente REST e OpenFlow em
+cada Ryu. O Mininet usa as portas OpenFlow publicadas em `127.0.0.1`, evitando
+que uma política de firewall do host contra a bridge Docker seja confundida com
+falha dos agentes. Se um listener realmente não subir, o teste para antes do
+baseline e salva `ryu-core-*-openflow-preflight.log`.
+
 O relatório `experiments/results/runtime-fault-*/summary.json` exige ausência
 de `AGREED` e de claim novo durante a falha, `WAITING_PROPOSALS` quando um
 agente desaparece, erro observável durante a partição, e um novo `AGREED` dos
