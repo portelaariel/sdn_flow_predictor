@@ -401,12 +401,26 @@ promovido e o mesmo SHA-256 do modelo offline.
 
 O agregado exige TN sem autorização/claim/DROP nos controles; TP, dois agentes
 autorizados, um único claim, um único executor, exatamente um request ao
-FlowBlocker, DROP observável e concordância agente–MCDA nos ataques. Também
-exige um único commit e modelo em toda a campanha. Os relatórios ficam em
+FlowBlocker e DROP observável nos ataques. A igualdade agente–MCDA no instante
+da autoridade é mantida como métrica, não como invariante de segurança: os dois
+métodos têm ciclos assíncronos e o MCDA é apenas observacional em
+`authority-live`. O gate comparativo exige que cada MCDA alcance `MITIGATE` na
+mesma `window_id` em até 1.000 ms. Assim, uma passagem transitória por
+`CORROBORATED` não é escondida nem confundida com falha de mitigação.
+
+O resumo separa `operational_ready` (segurança e atuação), `comparative_ready`
+(convergência limitada do observador) e `campaign_ready` (ambos). Ele informa
+concordância exata por execução e por domínio, taxa de convergência e latência
+até a convergência. A campanha também exige um único commit e modelo em todos
+os casos. Os relatórios ficam em
 `experiments/results/agentic-live-campaign-*/campaign-summary.json` e `.md`;
 `campaign_ready=true` indica que todos os casos e invariantes configurados
 passaram. Como há mitigação real, o consentimento da linha de comando não é
 opcional.
+
+O limite pode ser alterado explicitamente com
+`AGENTIC_LIVE_CAMPAIGN_MCDA_CONVERGENCE_WINDOW_MS`; o valor usado é gravado no
+manifesto e deve ser idêntico em todos os casos.
 
 A matriz determinística de fault injection pode ser executada sem Mininet,
 containers ou privilégios de administrador:

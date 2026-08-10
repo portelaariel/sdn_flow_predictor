@@ -38,7 +38,9 @@ def timeline(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
-def evaluate(run_dir: Path) -> Dict[str, Any]:
+def evaluate(
+    run_dir: Path, mcda_convergence_window_ms: float = 1000.0
+) -> Dict[str, Any]:
     metadata = read_json(run_dir / "metadata.json", {}) or {}
     workload = read_json(run_dir / "workload_status.json", {}) or {}
     summary = read_json(run_dir / "summary.json", {}) or {}
@@ -55,6 +57,7 @@ def evaluate(run_dir: Path) -> Dict[str, Any]:
     endpoint_errors = 0
     mcda_actions = []
     mcda_claims = []
+    mcda_events: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
     for row in timeline(run_dir / "timeline.ndjson"):
         if row.get("error"):
@@ -86,6 +89,7 @@ def evaluate(run_dir: Path) -> Dict[str, Any]:
             events[event_id] = copy
 
         collaboration = row.get("collaboration") or {}
+        mcda_cid = str(collaboration.get("cid") or cid)
         for decision in (
             list(collaboration.get("decision_events") or [])
             + list(collaboration.get("decisions") or [])
@@ -95,6 +99,11 @@ def evaluate(run_dir: Path) -> Dict[str, Any]:
             evaluated_ns = int(decision.get("evaluated_ns", 0) or 0)
             if evaluated_ns < start_ns:
                 continue
+            mcda_key = (
+                f"{decision.get('decision')}:{evaluated_ns}:"
+                f"{','.join(str(value) for value in decision.get('window_ids', []))}"
+            )
+            mcda_events.setdefault(mcda_cid, {})[mcda_key] = decision
             mitigation = decision.get("mitigation") or {}
             if mitigation.get("attempted") or mitigation.get("executed"):
                 mcda_actions.append(decision)
@@ -132,8 +141,63 @@ def evaluate(run_dir: Path) -> Dict[str, Any]:
                 "matches": comparison["matches"],
                 "basis": comparison.get("basis", "legacy_comparison"),
                 "captured_ns": comparison.get("captured_ns"),
+                "window_ids": list(event.get("window_ids") or []),
                 "mcda": comparison.get("mcda"),
             }
+
+    convergence_window_ns = max(1, int(mcda_convergence_window_ms * 1e6))
+    mcda_convergence = {}
+    for event in authorized:
+        domain = str(event.get("observed_by") or "")
+        comparison = mcda_comparisons.get(domain)
+        if not comparison:
+            continue
+        authority = event.get("authority") or {}
+        authority_ns = int(
+            authority.get("evaluated_ns")
+            or comparison.get("captured_ns")
+            or event.get("state_entered_ns")
+            or event.get("evaluated_ns")
+            or 0
+        )
+        agent_windows = {
+            int(value) for value in event.get("window_ids", [])
+        }
+        converged_ns = authority_ns if comparison["matches"] else None
+        converged_decision = comparison.get("mcda") if converged_ns else None
+        if converged_ns is None and authority_ns and agent_windows:
+            candidates = [
+                candidate
+                for candidate in mcda_events.get(domain, {}).values()
+                if candidate.get("decision") == "MITIGATE"
+                and authority_ns <= int(candidate.get("evaluated_ns", 0) or 0)
+                <= authority_ns + convergence_window_ns
+                and agent_windows & {
+                    int(value) for value in candidate.get("window_ids", [])
+                }
+            ]
+            if candidates:
+                converged_decision = min(
+                    candidates,
+                    key=lambda item: int(item.get("evaluated_ns", 0) or 0),
+                )
+                converged_ns = int(converged_decision["evaluated_ns"])
+        mcda_convergence[domain] = {
+            "matches_at_authority": comparison["matches"],
+            "authority_ns": authority_ns,
+            "window_ids": sorted(agent_windows),
+            "converged": converged_ns is not None,
+            "converged_ns": converged_ns,
+            "latency_ms": (
+                round((converged_ns - authority_ns) / 1e6, 3)
+                if converged_ns is not None else None
+            ),
+            "mcda": converged_decision,
+        }
+    mcda_converged_within_bound = (
+        len(mcda_convergence) == expected_domains
+        and all(item["converged"] for item in mcda_convergence.values())
+    )
 
     blocker_requests = 0
     for path in run_dir.glob("flow-blocker-*.log"):
@@ -181,12 +245,17 @@ def evaluate(run_dir: Path) -> Dict[str, Any]:
             "one_flowblocker_request": blocker_requests == 1,
             "drop_rule_present": bool(drop_files),
             "summary_confirms_execution": result.get("mitigation_executed") is True,
+        }
+        observational_checks = {
             "decision_time_mcda_available": (
                 len(mcda_comparisons) == expected_domains
             ),
-            "agent_matches_mcda": (
+            "agent_matches_mcda_at_authority": (
                 len(mcda_comparisons) == expected_domains
                 and all(item["matches"] for item in mcda_comparisons.values())
+            ),
+            "mcda_converged_same_episode_within_bound": (
+                mcda_converged_within_bound
             ),
         }
     else:
@@ -198,6 +267,7 @@ def evaluate(run_dir: Path) -> Dict[str, Any]:
             "no_flowblocker_request": blocker_requests == 0,
             "no_drop_rule": not drop_files,
         }
+        observational_checks = {}
     checks = {**common, **scenario_checks}
     return {
         "schema_version": 1,
@@ -223,6 +293,21 @@ def evaluate(run_dir: Path) -> Dict[str, Any]:
             domain: mcda_comparisons[domain]
             for domain in sorted(mcda_comparisons)
         },
+        "mcda_convergence_window_ms": round(
+            convergence_window_ns / 1e6, 3
+        ),
+        "mcda_converged_within_bound": mcda_converged_within_bound,
+        "mcda_convergence": {
+            domain: mcda_convergence[domain]
+            for domain in sorted(mcda_convergence)
+        },
+        "mcda_max_convergence_latency_ms": max(
+            (
+                item["latency_ms"] for item in mcda_convergence.values()
+                if isinstance(item.get("latency_ms"), (int, float))
+            ),
+            default=None,
+        ),
         "active_domains": sorted(active_domains),
         "authorized_domains": sorted(str(value) for value in authorized_domains),
         "winner_domains": sorted(str(value) for value in winner_domains),
@@ -230,11 +315,14 @@ def evaluate(run_dir: Path) -> Dict[str, Any]:
         "flowblocker_requests": blocker_requests,
         "drop_rule_files": drop_files,
         "checks": checks,
+        "observational_checks": observational_checks,
         "aggregate": {
             "passed": sum(checks.values()),
             "total": len(checks),
             "failed": sum(not value for value in checks.values()),
             "safe": all(checks.values()),
+            "observational_passed": sum(observational_checks.values()),
+            "observational_total": len(observational_checks),
         },
     }
 
@@ -243,8 +331,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_dir", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--mcda-convergence-window-ms", type=float, default=1000.0
+    )
     args = parser.parse_args()
-    report = evaluate(args.run_dir)
+    if args.mcda_convergence_window_ms <= 0:
+        parser.error("--mcda-convergence-window-ms deve ser positivo")
+    report = evaluate(args.run_dir, args.mcda_convergence_window_ms)
     output = args.output or (args.run_dir / "agentic-live-summary.json")
     output.write_text(
         json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
@@ -259,6 +352,8 @@ def main() -> int:
         "execution_domains": report["execution_domains"],
         "flowblocker_requests": report["flowblocker_requests"],
         "drop_rules": len(report["drop_rule_files"]),
+        "agentic_matches_mcda": report["agentic_matches_mcda"],
+        "mcda_converged_within_bound": report["mcda_converged_within_bound"],
         "aggregate": report["aggregate"],
     }, indent=2, sort_keys=True, ensure_ascii=False))
     return 0 if report["aggregate"]["safe"] else 1
