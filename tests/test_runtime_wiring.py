@@ -28,6 +28,9 @@ class RuntimeWiringTests(unittest.TestCase):
         cls.runtime_fault_source = (
             ROOT / "scripts/run_agentic_runtime_faults.sh"
         ).read_text(encoding="utf-8")
+        cls.authority_campaign_source = (
+            ROOT / "scripts/run_agentic_authority_campaign.sh"
+        ).read_text(encoding="utf-8")
         cls.dockerfile = (ROOT / "Dockerfile.flow_predictor").read_text(
             encoding="utf-8"
         )
@@ -125,6 +128,22 @@ class RuntimeWiringTests(unittest.TestCase):
         )[1].split("run_episode missing-agent", 1)[0]
         self.assertNotIn("sudo mn -c", run_episode)
         self.assertIn('preflight_openflow "$name"', run_episode)
+
+    def test_authority_campaign_is_isolated_and_cannot_enable_actuation(self):
+        self.assertIn(
+            "BENCHMARK_AGENTIC_MODE=authority-dry-run",
+            self.authority_campaign_source,
+        )
+        self.assertIn(
+            "BENCHMARK_BOOTSTRAP_ENV=true", self.authority_campaign_source
+        )
+        self.assertIn(
+            "BENCHMARK_EXPORT_HISTORY=false", self.authority_campaign_source
+        )
+        self.assertIn(
+            "collaborative-dry-run", self.authority_campaign_source
+        )
+        self.assertNotIn("collaborative-live", self.authority_campaign_source)
 
 
 if __name__ == "__main__":

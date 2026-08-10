@@ -7,6 +7,9 @@ from pathlib import Path
 from experiments.evaluate_agentic_authority_run import (
     evaluate as evaluate_authority_run,
 )
+from experiments.evaluate_agentic_authority_campaign import (
+    evaluate as evaluate_authority_campaign,
+)
 from experiments.evaluate_agentic_runtime_faults import evaluate
 from experiments.monitor_predictors import (
     flow_anomalies,
@@ -305,6 +308,149 @@ class BenchmarkToolTests(unittest.TestCase):
             split_brain = evaluate_authority_run(run_dir)
             self.assertFalse(split_brain["aggregate"]["safe"])
             self.assertFalse(split_brain["checks"]["claim_owner_consistent"])
+
+    def test_authority_dry_run_benign_forbids_authorization(self):
+        flow = "10.0.0.1->10.0.0.8"
+        started_ns = 1_000_000_000
+
+        def agent_row(cid):
+            return {
+                "sampled_ns": started_ns + 100_000_000,
+                "status": {"cid": cid},
+                "agentic": {
+                    "requested": True,
+                    "active": True,
+                    "mode": "authority-dry-run",
+                    "authoritative": True,
+                    "actuation_enabled": False,
+                    "cid": cid,
+                    "decisions": [],
+                    "decision_events": [],
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "metadata.json").write_text(json.dumps({
+                "mode": "collaborative-dry-run",
+                "scenario": "benign",
+                "flow": flow,
+                "controller_sets": 2,
+                "started_ns": started_ns,
+                "agentic_enabled": True,
+                "agentic_mode": "authority-dry-run",
+            }), encoding="utf-8")
+            (run_dir / "workload_status.json").write_text(
+                json.dumps({"valid": True}), encoding="utf-8"
+            )
+            (run_dir / "summary.json").write_text(json.dumps({
+                "runs": [{"classification": "TN"}],
+            }), encoding="utf-8")
+            rows = [agent_row("domain-0"), agent_row("domain-1")]
+            (run_dir / "timeline.ndjson").write_text(
+                "".join(json.dumps(item) + "\n" for item in rows),
+                encoding="utf-8",
+            )
+            (run_dir / "ovs-flows-s1.txt").write_text(
+                "actions=NORMAL\n", encoding="utf-8"
+            )
+
+            report = evaluate_authority_run(run_dir)
+            self.assertTrue(report["aggregate"]["safe"])
+            self.assertTrue(report["checks"]["benchmark_tn"])
+            self.assertTrue(report["checks"]["no_agent_authorization"])
+
+            forged = {
+                "event_id": "forged-benign-agreement",
+                "flow": flow,
+                "decision": "AGREED",
+                "state_entered_ns": started_ns + 50_000_000,
+                "authority": {
+                    "authorized": True,
+                    "claim": {"won": True, "coordinator": "domain-0"},
+                },
+                "execution": {
+                    "attempted": False,
+                    "executed": False,
+                    "would_execute": True,
+                },
+            }
+            rows[0]["agentic"]["decisions"] = [forged]
+            (run_dir / "timeline.ndjson").write_text(
+                "".join(json.dumps(item) + "\n" for item in rows),
+                encoding="utf-8",
+            )
+            unsafe = evaluate_authority_run(run_dir)
+            self.assertFalse(unsafe["aggregate"]["safe"])
+            self.assertFalse(unsafe["checks"]["no_agent_authorization"])
+            self.assertFalse(unsafe["checks"]["no_would_execute"])
+
+    def test_authority_campaign_requires_positive_and_negative_cases(self):
+        flow = "10.0.0.1->10.0.0.8"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = {
+                "minimums": {"ddos": 1, "benign": 1, "distinct_flows": 1},
+                "cases": [
+                    {"case_id": "01-ddos", "scenario": "ddos", "flow": flow},
+                    {"case_id": "01-benign", "scenario": "benign", "flow": flow},
+                ],
+            }
+            (root / "campaign-manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            ddos = {
+                "scenario": "ddos",
+                "flow": flow,
+                "classification": "TP",
+                "authorized_domains": ["domain-0", "domain-1"],
+                "claim_winner_domains": ["domain-0"],
+                "would_execute_domains": ["domain-0"],
+                "flowblocker_requests": 0,
+                "drop_rule_files": [],
+                "git_commit": "commit-a",
+                "model_sha256": "model-a",
+                "detection_latency_ms": 500.0,
+                "agentic_consensus_latency_ms": 1000.0,
+                "checks": {"agent_never_actuated": True},
+                "aggregate": {"safe": True},
+            }
+            benign = {
+                **ddos,
+                "scenario": "benign",
+                "classification": "TN",
+                "authorized_domains": [],
+                "claim_winner_domains": [],
+                "would_execute_domains": [],
+                "detection_latency_ms": None,
+                "agentic_consensus_latency_ms": None,
+            }
+            for case_id, payload in (("01-ddos", ddos), ("01-benign", benign)):
+                case_dir = root / case_id
+                case_dir.mkdir()
+                (case_dir / "authority-summary.json").write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+                (case_dir / "benchmark-exit-code.txt").write_text(
+                    "0\n", encoding="utf-8"
+                )
+                (case_dir / "evaluator-exit-code.txt").write_text(
+                    "0\n", encoding="utf-8"
+                )
+
+            report = evaluate_authority_campaign(root)
+            self.assertTrue(report["aggregate"]["promotion_ready"])
+            self.assertEqual(report["metrics"]["TP"], 1)
+            self.assertEqual(report["metrics"]["TN"], 1)
+            self.assertEqual(report["metrics"]["f1"], 1.0)
+
+            benign["authorized_domains"] = ["domain-0"]
+            (root / "01-benign" / "authority-summary.json").write_text(
+                json.dumps(benign), encoding="utf-8"
+            )
+            unsafe = evaluate_authority_campaign(root)
+            self.assertFalse(unsafe["aggregate"]["promotion_ready"])
+            self.assertFalse(unsafe["checks"]["all_benign_rejected"])
 
     def test_agentic_run_is_invalid_when_agents_or_decisions_are_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
