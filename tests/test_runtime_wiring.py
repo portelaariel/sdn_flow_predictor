@@ -120,6 +120,11 @@ class RuntimeWiringTests(unittest.TestCase):
         self.assertIn(
             'MININET_CONTROLLER_HOST=127.0.0.1', self.runtime_fault_source
         )
+        run_episode = self.runtime_fault_source.split(
+            "run_episode() {", 1
+        )[1].split("run_episode missing-agent", 1)[0]
+        self.assertNotIn("sudo mn -c", run_episode)
+        self.assertIn('preflight_openflow "$name"', run_episode)
 
 
 if __name__ == "__main__":
