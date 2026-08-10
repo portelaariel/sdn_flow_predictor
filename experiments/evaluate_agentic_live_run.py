@@ -117,6 +117,23 @@ def evaluate(run_dir: Path) -> Dict[str, Any]:
         (event.get("authority") or {}).get("claim") or {}
         for event in winners
     ]
+    mcda_comparisons = {}
+    for event in authorized:
+        domain = str(event.get("observed_by") or "")
+        authority = event.get("authority") or {}
+        frozen = authority.get("mcda_comparison")
+        comparison = (
+            frozen if isinstance(frozen, dict)
+            else event.get("legacy_comparison") or {}
+        )
+        if (comparison.get("available") is True
+                and isinstance(comparison.get("matches"), bool)):
+            mcda_comparisons[domain] = {
+                "matches": comparison["matches"],
+                "basis": comparison.get("basis", "legacy_comparison"),
+                "captured_ns": comparison.get("captured_ns"),
+                "mcda": comparison.get("mcda"),
+            }
 
     blocker_requests = 0
     for path in run_dir.glob("flow-blocker-*.log"):
@@ -164,6 +181,13 @@ def evaluate(run_dir: Path) -> Dict[str, Any]:
             "one_flowblocker_request": blocker_requests == 1,
             "drop_rule_present": bool(drop_files),
             "summary_confirms_execution": result.get("mitigation_executed") is True,
+            "decision_time_mcda_available": (
+                len(mcda_comparisons) == expected_domains
+            ),
+            "agent_matches_mcda": (
+                len(mcda_comparisons) == expected_domains
+                and all(item["matches"] for item in mcda_comparisons.values())
+            ),
         }
     else:
         scenario_checks = {
@@ -183,6 +207,22 @@ def evaluate(run_dir: Path) -> Dict[str, Any]:
         "scenario": scenario,
         "flow": flow,
         "classification": result.get("classification"),
+        "git_commit": metadata.get("git_commit"),
+        "model_sha256": metadata.get("model_sha256"),
+        "detection_latency_ms": result.get("detection_latency_ms"),
+        "mcda_consensus_latency_ms": result.get("mcda_consensus_latency_ms"),
+        "agentic_consensus_latency_ms": result.get(
+            "agentic_consensus_latency_ms"
+        ),
+        "ping_after_loss_percent": result.get("ping_after_loss_percent"),
+        "agentic_matches_mcda": (
+            all(item["matches"] for item in mcda_comparisons.values())
+            if mcda_comparisons else None
+        ),
+        "agentic_mcda_comparisons": {
+            domain: mcda_comparisons[domain]
+            for domain in sorted(mcda_comparisons)
+        },
         "active_domains": sorted(active_domains),
         "authorized_domains": sorted(str(value) for value in authorized_domains),
         "winner_domains": sorted(str(value) for value in winner_domains),

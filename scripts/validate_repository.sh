@@ -47,11 +47,13 @@ required_files=(
   experiments/evaluate_agentic_authority_run.py
   experiments/evaluate_agentic_authority_campaign.py
   experiments/evaluate_agentic_live_run.py
+  experiments/evaluate_agentic_live_campaign.py
   scripts/run_collaborative_benchmark.sh
   scripts/run_agentic_runtime_faults.sh
   scripts/run_agentic_authority_dry_run.sh
   scripts/run_agentic_authority_campaign.sh
   scripts/run_agentic_authority_live_canary.sh
+  scripts/run_agentic_authority_live_campaign.sh
 )
 for path in "${required_files[@]}"; do
   [[ -f "$path" ]] || { echo "missing required file: $path" >&2; exit 1; }
@@ -121,6 +123,7 @@ expect_invalid_input bash scripts/run_collaborative_benchmark.sh invalid ddos
 expect_invalid_input bash scripts/run_collaborative_benchmark.sh collaborative-live ddos
 expect_invalid_input bash scripts/run_collaborative_benchmark.sh agentic-live ddos
 expect_invalid_input bash scripts/run_agentic_authority_live_canary.sh
+expect_invalid_input bash scripts/run_agentic_authority_live_campaign.sh
 expect_invalid_input env BENCHMARK_AGENTIC_ENABLED=true \
   bash scripts/run_collaborative_benchmark.sh local-dry-run ddos
 expect_invalid_input bash scripts/run_agentic_runtime_faults.sh invalid

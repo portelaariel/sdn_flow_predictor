@@ -34,6 +34,9 @@ class RuntimeWiringTests(unittest.TestCase):
         cls.authority_live_source = (
             ROOT / "scripts/run_agentic_authority_live_canary.sh"
         ).read_text(encoding="utf-8")
+        cls.authority_live_campaign_source = (
+            ROOT / "scripts/run_agentic_authority_live_campaign.sh"
+        ).read_text(encoding="utf-8")
         cls.dockerfile = (ROOT / "Dockerfile.flow_predictor").read_text(
             encoding="utf-8"
         )
@@ -162,6 +165,17 @@ class RuntimeWiringTests(unittest.TestCase):
             'PREDICTOR_AGENTIC_LIVE_ACTUATION="$AGENTIC_LIVE_ACTUATION"',
             self.benchmark_source,
         )
+
+    def test_authority_live_campaign_is_guarded_per_flow(self):
+        source = self.authority_live_campaign_source
+        self.assertIn("--allow-agentic-mitigation", source)
+        self.assertIn("promotion_ready == true", source)
+        self.assertIn("canary_ready == true", source)
+        self.assertIn("control_marker", source)
+        self.assertIn('scenario" == "ddos"', source)
+        self.assertIn("BENCHMARK_BOOTSTRAP_ENV=true", source)
+        self.assertIn("agentic-live", source)
+        self.assertIn("evaluate_agentic_live_campaign.py", source)
 
 
 if __name__ == "__main__":

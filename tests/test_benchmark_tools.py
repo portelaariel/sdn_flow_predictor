@@ -13,6 +13,9 @@ from experiments.evaluate_agentic_authority_campaign import (
 from experiments.evaluate_agentic_live_run import (
     evaluate as evaluate_agentic_live_run,
 )
+from experiments.evaluate_agentic_live_campaign import (
+    evaluate as evaluate_agentic_live_campaign,
+)
 from experiments.evaluate_agentic_runtime_faults import evaluate
 from experiments.monitor_predictors import (
     flow_anomalies,
@@ -249,6 +252,16 @@ class BenchmarkToolTests(unittest.TestCase):
                         "degraded": False,
                         "coordinator": "domain-0",
                     },
+                    "mcda_comparison": {
+                        "available": True,
+                        "matches": True,
+                        "basis": "authority_evaluation",
+                        "captured_ns": attack_ns + 450_000_000,
+                        "mcda": {
+                            "decision": "MITIGATE",
+                            "evaluated_ns": attack_ns + 400_000_000,
+                        },
+                    },
                 },
                 "execution": {
                     "attempted": False,
@@ -469,6 +482,16 @@ class BenchmarkToolTests(unittest.TestCase):
                         "degraded": False,
                         "coordinator": "domain-0",
                     },
+                    "mcda_comparison": {
+                        "available": True,
+                        "matches": True,
+                        "basis": "authority_evaluation",
+                        "captured_ns": attack_ns + 450_000_000,
+                        "mcda": {
+                            "decision": "MITIGATE",
+                            "evaluated_ns": attack_ns + 400_000_000,
+                        },
+                    },
                 },
                 "execution": execution,
             }
@@ -541,6 +564,7 @@ class BenchmarkToolTests(unittest.TestCase):
             self.assertTrue(report["aggregate"]["safe"])
             self.assertEqual(report["winner_domains"], ["domain-0"])
             self.assertEqual(report["execution_domains"], ["domain-0"])
+            self.assertTrue(report["agentic_matches_mcda"])
 
             rows[0]["collaboration"]["decisions"][0]["claim"] = {
                 "won": True,
@@ -552,6 +576,95 @@ class BenchmarkToolTests(unittest.TestCase):
             unsafe = evaluate_agentic_live_run(run_dir)
             self.assertFalse(unsafe["checks"]["mcda_never_claimed"])
             self.assertFalse(unsafe["aggregate"]["safe"])
+
+    def test_agentic_live_campaign_requires_paired_safe_cases(self):
+        flow = "10.0.0.1->10.0.0.8"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = {
+                "minimums": {"ddos": 1, "benign": 1, "distinct_flows": 1},
+                "prerequisites": {
+                    "promotion_ready": True,
+                    "canary_ready": True,
+                    "promotion_commit": "commit-a",
+                    "model_sha256": "model-a",
+                },
+                "cases": [
+                    {"case_id": "01-benign", "pair_id": "01-h1-h8",
+                     "scenario": "benign", "flow": flow},
+                    {"case_id": "01-ddos", "pair_id": "01-h1-h8",
+                     "scenario": "ddos", "flow": flow},
+                ],
+            }
+            (root / "campaign-manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            common = {
+                "flow": flow,
+                "active_domains": ["domain-0", "domain-1"],
+                "git_commit": "commit-a",
+                "model_sha256": "model-a",
+                "flowblocker_requests": 0,
+                "drop_rule_files": [],
+                "detection_latency_ms": None,
+                "mcda_consensus_latency_ms": None,
+                "agentic_consensus_latency_ms": None,
+                "ping_after_loss_percent": 0.0,
+                "agentic_matches_mcda": None,
+                "checks": {},
+                "aggregate": {"safe": True},
+            }
+            benign = {
+                **common,
+                "scenario": "benign",
+                "classification": "TN",
+                "authorized_domains": [],
+                "winner_domains": [],
+                "execution_domains": [],
+            }
+            ddos = {
+                **common,
+                "scenario": "ddos",
+                "classification": "TP",
+                "authorized_domains": ["domain-0", "domain-1"],
+                "winner_domains": ["domain-0"],
+                "execution_domains": ["domain-0"],
+                "flowblocker_requests": 1,
+                "drop_rule_files": ["ovs-flows-s1.txt", "ovs-flows-s4.txt"],
+                "detection_latency_ms": 500.0,
+                "mcda_consensus_latency_ms": 900.0,
+                "agentic_consensus_latency_ms": 1200.0,
+                "ping_after_loss_percent": 100.0,
+                "agentic_matches_mcda": True,
+            }
+            for case_id, payload in (("01-benign", benign), ("01-ddos", ddos)):
+                case_dir = root / case_id
+                case_dir.mkdir()
+                (case_dir / "agentic-live-summary.json").write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+                (case_dir / "benchmark-exit-code.txt").write_text(
+                    "0\n", encoding="utf-8"
+                )
+                (case_dir / "evaluator-exit-code.txt").write_text(
+                    "0\n", encoding="utf-8"
+                )
+
+            report = evaluate_agentic_live_campaign(root)
+            self.assertTrue(report["aggregate"]["campaign_ready"])
+            self.assertEqual(report["metrics"]["TP"], 1)
+            self.assertEqual(report["metrics"]["TN"], 1)
+            self.assertEqual(
+                report["metrics"]["agent_to_mcda_agreement_rate"], 1.0
+            )
+
+            benign["execution_domains"] = ["domain-0"]
+            (root / "01-benign" / "agentic-live-summary.json").write_text(
+                json.dumps(benign), encoding="utf-8"
+            )
+            unsafe = evaluate_agentic_live_campaign(root)
+            self.assertFalse(unsafe["aggregate"]["campaign_ready"])
+            self.assertFalse(unsafe["checks"]["all_benign_rejected"])
 
     def test_agentic_live_summary_uses_agent_claim_and_mcda_observation(self):
         flow = "10.0.0.1->10.0.0.8"

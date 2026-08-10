@@ -384,6 +384,30 @@ final fica em
 `experiments/results/agentic-live-canary-*/canary-summary.json`; somente os dois
 casos aprovados produzem `canary_ready=true`.
 
+Depois do canário, a campanha live multi-fluxo mede repetibilidade com atuação
+real:
+
+``` bash
+bash scripts/run_agentic_authority_live_campaign.sh \
+  --allow-agentic-mitigation
+```
+
+O padrão executa `h1->h8`, `h2->h7` e `h3->h6`, com um controle benigno antes
+do DDoS de cada par. Se o controle de um par falhar, seu ataque é bloqueado e
+registrado como não executado. Cada caso recria ETCD, controladores, serviços e
+Mininet; somente as imagens Docker podem ser reutilizadas. O runner exige tanto
+`promotion_ready=true` quanto `canary_ready=true`, ancestralidade do commit
+promovido e o mesmo SHA-256 do modelo offline.
+
+O agregado exige TN sem autorização/claim/DROP nos controles; TP, dois agentes
+autorizados, um único claim, um único executor, exatamente um request ao
+FlowBlocker, DROP observável e concordância agente–MCDA nos ataques. Também
+exige um único commit e modelo em toda a campanha. Os relatórios ficam em
+`experiments/results/agentic-live-campaign-*/campaign-summary.json` e `.md`;
+`campaign_ready=true` indica que todos os casos e invariantes configurados
+passaram. Como há mitigação real, o consentimento da linha de comando não é
+opcional.
+
 A matriz determinística de fault injection pode ser executada sem Mininet,
 containers ou privilégios de administrador:
 
