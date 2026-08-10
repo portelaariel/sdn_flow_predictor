@@ -44,8 +44,10 @@ required_files=(
   experiments/summarize_benchmark.py
   experiments/run_agentic_fault_suite.py
   experiments/evaluate_agentic_runtime_faults.py
+  experiments/evaluate_agentic_authority_run.py
   scripts/run_collaborative_benchmark.sh
   scripts/run_agentic_runtime_faults.sh
+  scripts/run_agentic_authority_dry_run.sh
 )
 for path in "${required_files[@]}"; do
   [[ -f "$path" ]] || { echo "missing required file: $path" >&2; exit 1; }
@@ -67,8 +69,10 @@ source config/runtime.env
 [[ "$PREDICTOR_COLLAB_MIN_DOMAINS" == "2" ]]
 [[ "$PREDICTOR_AGENTIC_ENABLED" == "false" ]]
 [[ "$PREDICTOR_AGENTIC_SHADOW" == "true" ]]
+[[ "$PREDICTOR_AGENTIC_MODE" == "shadow" ]]
 [[ "$PREDICTOR_AGENT_REQUIRED_VOTES" == "2" ]]
 [[ "$PREDICTOR_AGENT_PROPOSAL_THRESHOLD" == "0.65" ]]
+[[ "$PREDICTOR_AGENT_CLAIM_TTL_S" == "60" ]]
 
 override_config="$(ETCD_SUBNET=250 ETCD_NODES=2 bash -c '
   source config/runtime.env
@@ -97,6 +101,13 @@ expect_invalid_input env PREDICTOR_AGENTIC_ENABLED=true \
 expect_invalid_input env PREDICTOR_AGENTIC_ENABLED=true \
   PREDICTOR_COLLABORATION_ENABLED=true PREDICTOR_AGENTIC_SHADOW=false \
   bash deploy_flow_predictor.sh 2 true
+expect_invalid_input env PREDICTOR_AGENTIC_ENABLED=true \
+  PREDICTOR_COLLABORATION_ENABLED=true PREDICTOR_AGENTIC_MODE=invalid \
+  bash deploy_flow_predictor.sh 2 true
+expect_invalid_input env PREDICTOR_AGENTIC_ENABLED=true \
+  PREDICTOR_COLLABORATION_ENABLED=true \
+  PREDICTOR_AGENTIC_MODE=authority-dry-run \
+  bash deploy_flow_predictor.sh 2 false
 expect_invalid_input env PREDICTOR_AGENTIC_ENABLED=true \
   PREDICTOR_COLLABORATION_ENABLED=true PREDICTOR_AGENT_REQUIRED_VOTES=3 \
   bash deploy_flow_predictor.sh 2 true

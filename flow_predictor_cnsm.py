@@ -45,12 +45,14 @@ ENV (mesmo padrão dos demais serviços):
   COLLAB_EVIDENCE_TTL_S  12
   COLLAB_CLAIM_TTL_S     60
 
-  # Agente deliberativo por domínio (fase inicial sem autoridade):
+  # Agente deliberativo por domínio:
   AGENTIC_ENABLED        false
   AGENTIC_SHADOW         true
+  AGENTIC_MODE           shadow|authority-dry-run
   AGENT_REQUIRED_VOTES   2
   AGENT_PROPOSAL_TTL_S   12
   AGENT_NEGOTIATION_WINDOW_S 4
+  AGENT_CLAIM_TTL_S      60
 
   # Persistência do histórico (dataset offline p/ LSTM/GRU, RMSE/MAE, gráficos):
   EXPORT_ENABLED        true|false (default true)
@@ -77,6 +79,10 @@ import requests
 from flask import Flask, jsonify, request
 
 from agent_protocol import agent_flow_hash
+from agent_authority import (
+    claim_agentic_mitigation,
+    evaluate_agentic_authority,
+)
 from collaborative_decision import (
     canonical_flow_key,
     clip01,
@@ -132,9 +138,13 @@ COLLAB_RATE_RATIO_MAX = float(os.environ.get("COLLAB_RATE_RATIO_MAX", "10.0"))
 
 COLLAB_WEIGHTS = load_collaboration_weights(os.environ.get("COLLAB_WEIGHTS_JSON", ""))
 
-# --- Agente deliberativo por domínio (primeira fase: somente shadow mode) ---
+# --- Agente deliberativo por domínio ---
 AGENTIC_ENABLED = os.environ.get("AGENTIC_ENABLED", "false").lower() == "true"
-AGENTIC_SHADOW = os.environ.get("AGENTIC_SHADOW", "true").lower() == "true"
+_AGENTIC_SHADOW_ENV = os.environ.get("AGENTIC_SHADOW", "true").lower() == "true"
+AGENTIC_MODE = os.environ.get(
+    "AGENTIC_MODE", "shadow" if _AGENTIC_SHADOW_ENV else "unsupported"
+).strip().lower()
+AGENTIC_SHADOW = AGENTIC_MODE == "shadow"
 AGENT_REQUIRED_VOTES = int(os.environ.get("AGENT_REQUIRED_VOTES", "2"))
 AGENT_PROPOSAL_TTL_S = float(os.environ.get("AGENT_PROPOSAL_TTL_S", "12.0"))
 AGENT_NEGOTIATION_WINDOW_S = float(
@@ -144,6 +154,7 @@ AGENT_PROPOSAL_THRESHOLD = float(
     os.environ.get("AGENT_PROPOSAL_THRESHOLD", "0.65")
 )
 AGENT_TOPOLOGY_CACHE_S = float(os.environ.get("AGENT_TOPOLOGY_CACHE_S", "5.0"))
+AGENT_CLAIM_TTL_S = float(os.environ.get("AGENT_CLAIM_TTL_S", "60.0"))
 
 if not math.isfinite(EVENT_COOLDOWN_S) or EVENT_COOLDOWN_S < 0.0:
     raise ValueError("ANOMALY_EVENT_COOLDOWN_S deve ser não negativo e finito")
@@ -171,7 +182,8 @@ if (not math.isfinite(AGENT_PROPOSAL_TTL_S) or AGENT_PROPOSAL_TTL_S <= 0.0
         or AGENT_NEGOTIATION_WINDOW_S <= 0.0
         or AGENT_PROPOSAL_TTL_S < AGENT_NEGOTIATION_WINDOW_S
         or not math.isfinite(AGENT_TOPOLOGY_CACHE_S)
-        or AGENT_TOPOLOGY_CACHE_S <= 0.0):
+        or AGENT_TOPOLOGY_CACHE_S <= 0.0
+        or not math.isfinite(AGENT_CLAIM_TTL_S) or AGENT_CLAIM_TTL_S <= 0.0):
     raise ValueError("janelas/TTLs do agente são inválidos")
 if not 0.0 <= AGENT_PROPOSAL_THRESHOLD <= 1.0:
     raise ValueError("AGENT_PROPOSAL_THRESHOLD deve estar em [0, 1]")
@@ -181,8 +193,10 @@ if AGENTIC_ENABLED and not COLLABORATION_ENABLED:
     raise ValueError("AGENTIC_ENABLED requer COLLABORATION_ENABLED=true")
 if AGENTIC_ENABLED and AGENT_REQUIRED_VOTES > COLLAB_EXPECTED_DOMAINS:
     raise ValueError("AGENT_REQUIRED_VOTES não pode exceder os domínios esperados")
-if AGENTIC_ENABLED and not AGENTIC_SHADOW:
-    raise ValueError("a fase agentic atual suporta somente AGENTIC_SHADOW=true")
+if AGENTIC_ENABLED and AGENTIC_MODE not in {"shadow", "authority-dry-run"}:
+    raise ValueError("AGENTIC_MODE deve ser shadow ou authority-dry-run")
+if AGENTIC_ENABLED and AGENTIC_MODE == "authority-dry-run" and not DRY_RUN:
+    raise ValueError("authority-dry-run requer DRY_RUN=true")
 
 # --- Persistência do histórico de predição (aditivo; não afeta a lógica online) ---
 EXPORT_ENABLED     = os.environ.get("EXPORT_ENABLED", "true").lower() == "true"
@@ -878,12 +892,12 @@ class Mitigator:
 
 
 class AgenticShadowManager:
-    """Executa um agente deliberativo por domínio sem autoridade de mitigação.
+    """Executa um agente por domínio em shadow ou authority-dry-run.
 
     A entrada é exatamente a evidência local já agregada pelo caminho MCDA. O
-    agente publica uma proposta efêmera no ETCD, lê propostas dos pares e
-    registra se haveria concordância. Nenhum método desta classe chama o
-    FlowBlocker ou disputa o claim de mitigação.
+    agente publica proposta efêmera e negocia com os pares. Em shadow, apenas
+    observa. Em authority-dry-run, revalida AGREED e disputa um claim dedicado,
+    mas nenhum método desta classe chama o FlowBlocker.
     """
 
     def __init__(self, engine: Any):
@@ -919,10 +933,15 @@ class AgenticShadowManager:
         self.disagreements = 0
         self.waiting_events = 0
         self.expired_proposals = 0
+        self.authority_evaluations = 0
+        self.authorizations = 0
+        self.authority_denials = 0
+        self.claims_won = 0
+        self.claims_lost = 0
         self.started_ns = now_ns()
         self.thread = threading.Thread(
             target=self._run,
-            name=f"domain-agent-shadow-{CONTROLLER_ID}",
+            name=f"domain-agent-{AGENTIC_MODE}-{CONTROLLER_ID}",
             daemon=True,
         )
         self.thread.start()
@@ -981,8 +1000,8 @@ class AgenticShadowManager:
         """Registra falha observacional sem propagá-la ao caminho MCDA."""
         with self.lock:
             self.errors += 1
-        logger.error("Falha no agente shadow de %s (%s): %s",
-                     CONTROLLER_ID, context, exc)
+        logger.error("Falha no agente %s de %s (%s): %s",
+                     AGENTIC_MODE, CONTROLLER_ID, context, exc)
 
     def _load_domain_hosts(self) -> Dict[str, Dict[str, Any]]:
         monotonic_now = time.monotonic()
@@ -1181,6 +1200,66 @@ class AgenticShadowManager:
                    == (legacy_copy["decision"] == "MITIGATE"))
         return {"available": True, "matches": matches, "mcda": legacy_copy}
 
+    def _authority_dry_run(self, decision: Dict[str, Any]) -> None:
+        """Revalida e elege um agente sem disponibilizar atuação externa."""
+        if decision.get("decision") != "AGREED":
+            decision["authority"] = {
+                "evaluated": False,
+                "authorized": False,
+                "code": "decision_not_agreed",
+                "claim": None,
+            }
+            decision["execution"] = {
+                "attempted": False,
+                "executed": False,
+                "would_execute": False,
+                "reason": "decisão agentic ainda não atingiu AGREED",
+            }
+            return
+
+        evaluation_ns = now_ns()
+        authorization = evaluate_agentic_authority(
+            decision,
+            now_ns_value=evaluation_ns,
+            expected_flow=decision.get("flow"),
+            expected_window_ids=decision.get("window_ids", []),
+            max_proposal_age_ns=int(AGENT_PROPOSAL_TTL_S * 1e9),
+        )
+        claim = None
+        if authorization.get("authorized"):
+            claim = claim_agentic_mitigation(
+                _etcd,
+                authorization,
+                coordinator=CONTROLLER_ID,
+                now_ns_value=now_ns(),
+                ttl_s=AGENT_CLAIM_TTL_S,
+            )
+        won = bool((claim or {}).get("won"))
+        degraded = bool((claim or {}).get("degraded"))
+        decision["authority"] = {
+            "evaluated": True,
+            "evaluated_ns": evaluation_ns,
+            "authorized": bool(authorization.get("authorized")),
+            "code": authorization.get("code"),
+            "reason": authorization.get("reason"),
+            "authorization": authorization,
+            "claim": claim,
+        }
+        decision["execution"] = {
+            "attempted": False,
+            "executed": False,
+            "would_execute": won,
+            "reason": (
+                "authority-dry-run: claim adquirido; FlowBlocker desconectado"
+                if won else
+                "authority-dry-run: decisão autorizada, mas outro agente coordena"
+                if authorization.get("authorized") and not degraded else
+                "authority-dry-run: claim falhou fechado"
+                if degraded else
+                "authority-dry-run: gate negou autoridade"
+            ),
+        }
+
     def _evaluate_negotiations(self):
         current_ns = now_ns()
         with self.lock:
@@ -1223,13 +1302,9 @@ class AgenticShadowManager:
                 self._read_proposals(flow), flow=flow, now_ns_value=now_ns()
             )
             decision.update({
-                "mode": "shadow",
-                "authoritative": False,
-                "execution": {
-                    "attempted": False,
-                    "executed": False,
-                    "reason": "shadow mode: decisão agentic não controla o FlowBlocker",
-                },
+                "mode": AGENTIC_MODE,
+                "authoritative": AGENTIC_MODE == "authority-dry-run",
+                "actuation_enabled": False,
             })
             decision["legacy_comparison"] = self._legacy_comparison(flow, decision)
             with self.lock:
@@ -1246,6 +1321,11 @@ class AgenticShadowManager:
                         prior_decision.get("state_entered_ns", decision["evaluated_ns"])
                     )
                     decision["event_id"] = prior_decision.get("event_id")
+                    if "authority" in prior_decision:
+                        decision["authority"] = prior_decision["authority"]
+                    if "execution" in prior_decision:
+                        decision["execution"] = prior_decision["execution"]
+                    new_event = False
                 else:
                     decision["state_entered_ns"] = int(decision["evaluated_ns"])
                     windows = ",".join(
@@ -1256,6 +1336,21 @@ class AgenticShadowManager:
                         f"{decision['decision']}:{decision['state_entered_ns']}"
                     )
                     self.last_event_key[flow] = event_key
+                    new_event = True
+
+            if new_event:
+                if AGENTIC_MODE == "authority-dry-run":
+                    self._authority_dry_run(decision)
+                else:
+                    decision["execution"] = {
+                        "attempted": False,
+                        "executed": False,
+                        "would_execute": False,
+                        "reason": "shadow mode: decisão agentic não controla o FlowBlocker",
+                    }
+
+            with self.lock:
+                if new_event:
                     # Cópia JSON: impede que atualizações posteriores do estado
                     # corrente alterem retroativamente o evento auditável.
                     self.decision_events.append(json.loads(json.dumps(decision)))
@@ -1268,12 +1363,31 @@ class AgenticShadowManager:
                         self.disagreements += 1
                     elif decision["decision"].startswith("WAITING"):
                         self.waiting_events += 1
+                    authority = decision.get("authority", {})
+                    if authority.get("evaluated"):
+                        self.authority_evaluations += 1
+                        if authority.get("authorized"):
+                            self.authorizations += 1
+                        else:
+                            self.authority_denials += 1
+                        claim = authority.get("claim") or {}
+                        if claim.get("won"):
+                            self.claims_won += 1
+                        elif claim:
+                            self.claims_lost += 1
                     _metric(
                         "AGENT_CONSENSUS",
                         f"flow={flow} decision={decision['decision']} "
                         f"votes={decision['mitigate_votes']} "
-                        f"relevant={decision['relevant_domains']} shadow=true",
+                        f"relevant={decision['relevant_domains']} mode={AGENTIC_MODE}",
                     )
+                    if authority.get("evaluated"):
+                        _metric(
+                            "AGENT_AUTHORITY_DRYRUN",
+                            f"flow={flow} authorized={authority.get('authorized')} "
+                            f"claim_won={(authority.get('claim') or {}).get('won', False)} "
+                            "executed=false",
+                        )
                 self.decisions[flow] = decision
                 self.last_logged_state[flow] = decision["decision"]
             self.engine.apply_agentic_decision(flow, decision)
@@ -1293,8 +1407,9 @@ class AgenticShadowManager:
             return {
                 "requested": AGENTIC_ENABLED,
                 "active": True,
-                "mode": "shadow",
-                "authoritative": False,
+                "mode": AGENTIC_MODE,
+                "authoritative": AGENTIC_MODE == "authority-dry-run",
+                "actuation_enabled": False,
                 "agent_id": self.agent.agent_id,
                 "cid": CONTROLLER_ID,
                 "uptime_s": round((now_ns() - self.started_ns) / 1e9, 1),
@@ -1304,6 +1419,11 @@ class AgenticShadowManager:
                 "disagreements": self.disagreements,
                 "waiting_events": self.waiting_events,
                 "expired_proposals": self.expired_proposals,
+                "authority_evaluations": self.authority_evaluations,
+                "authorizations": self.authorizations,
+                "authority_denials": self.authority_denials,
+                "claims_won": self.claims_won,
+                "claims_lost": self.claims_lost,
                 "errors": self.errors,
                 "topology_errors": self.topology_errors,
                 "topology_retries_pending": len(self.topology_retry_at),
@@ -1314,6 +1434,7 @@ class AgenticShadowManager:
                     "proposal_ttl_s": AGENT_PROPOSAL_TTL_S,
                     "negotiation_window_s": AGENT_NEGOTIATION_WINDOW_S,
                     "topology_cache_s": AGENT_TOPOLOGY_CACHE_S,
+                    "claim_ttl_s": AGENT_CLAIM_TTL_S,
                     "weights": self.agent.weights,
                 },
                 "states": self.agent.snapshot_states(),
@@ -1692,7 +1813,8 @@ class PredictorEngine:
         self.collaboration = (CollaborativeDecisionManager(self)
                               if COLLABORATION_ENABLED and _etcd is not None else None)
         self.agentic = (AgenticShadowManager(self)
-                        if (AGENTIC_ENABLED and AGENTIC_SHADOW
+                        if (AGENTIC_ENABLED
+                            and AGENTIC_MODE in {"shadow", "authority-dry-run"}
                             and self.collaboration is not None)
                         else None)
         if COLLABORATION_ENABLED and self.collaboration is None:
@@ -1837,7 +1959,7 @@ class PredictorEngine:
 
     def apply_agentic_decision(self, flow: str,
                                decision: Dict[str, Any]) -> None:
-        """Anexa a decisão shadow ao evento sem alterar sua mitigação."""
+        """Anexa a decisão agentic ao evento sem alterar sua mitigação."""
         decision_windows = {
             int(value) for value in decision.get("window_ids", [])
         }
@@ -1860,7 +1982,11 @@ class PredictorEngine:
                 )
                 if (canonical_flow_key(item) == flow
                         and same_episode):
-                    item["agentic_shadow"] = decision
+                    item["agentic"] = decision
+                    if AGENTIC_MODE == "shadow":
+                        item["agentic_shadow"] = decision
+                    else:
+                        item["agentic_authority_dry_run"] = decision
 
     def collaboration_snapshot(self) -> Dict[str, Any]:
         if self.collaboration is not None:
@@ -1888,8 +2014,9 @@ class PredictorEngine:
         return {
             "requested": AGENTIC_ENABLED,
             "active": False,
-            "mode": "shadow" if AGENTIC_SHADOW else "unsupported",
-            "authoritative": False,
+            "mode": AGENTIC_MODE,
+            "authoritative": AGENTIC_MODE == "authority-dry-run",
+            "actuation_enabled": False,
             "cid": CONTROLLER_ID,
             "reason": reason,
             "waiting_events": 0,
@@ -1974,7 +2101,8 @@ class PredictorEngine:
                 "agentic": {
                     "requested": AGENTIC_ENABLED,
                     "active": self.agentic is not None,
-                    "mode": "shadow" if AGENTIC_SHADOW else "unsupported",
+                    "mode": AGENTIC_MODE,
+                    "actuation_enabled": False,
                 },
             }
             _etcd.put(f"flowpredictor/state/{CONTROLLER_ID}", json.dumps(state, default=str))
@@ -2024,10 +2152,15 @@ def status():
                 "active": agentic["active"],
                 "mode": agentic.get("mode"),
                 "authoritative": agentic.get("authoritative", False),
+                "actuation_enabled": agentic.get("actuation_enabled", False),
                 "reason": agentic.get("reason"),
                 "proposals_published": agentic.get("proposals_published", 0),
                 "agreements": agentic.get("agreements", 0),
                 "disagreements": agentic.get("disagreements", 0),
+                "authorizations": agentic.get("authorizations", 0),
+                "authority_denials": agentic.get("authority_denials", 0),
+                "claims_won": agentic.get("claims_won", 0),
+                "claims_lost": agentic.get("claims_lost", 0),
                 "errors": agentic.get("errors", 0),
             },
             "config": {
@@ -2049,6 +2182,7 @@ def status():
                 "collaboration_active": engine.collaboration is not None,
                 "agentic_enabled": AGENTIC_ENABLED,
                 "agentic_shadow": AGENTIC_SHADOW,
+                "agentic_mode": AGENTIC_MODE,
                 "agentic_active": engine.agentic is not None,
             },
         }), 200
@@ -2112,7 +2246,7 @@ def collaboration_status():
 
 @app.route("/predictor/agent", methods=["GET"])
 def agentic_status():
-    """Estado, propostas e decisões do agente deliberativo em shadow mode."""
+    """Estado, propostas, autoridade dry-run e decisões do agente."""
     return jsonify(engine.agentic_snapshot()), 200
 
 
@@ -2158,7 +2292,12 @@ def update_config():
     if "auto_mitigate" in payload:
         AUTO_MITIGATE = bool(payload["auto_mitigate"]); changed["auto_mitigate"] = AUTO_MITIGATE
     if "dry_run" in payload:
-        DRY_RUN = bool(payload["dry_run"]); changed["dry_run"] = DRY_RUN
+        requested_dry_run = bool(payload["dry_run"])
+        if AGENTIC_MODE == "authority-dry-run" and not requested_dry_run:
+            return jsonify({
+                "error": "authority-dry-run impede desativar dry_run em runtime"
+            }), 400
+        DRY_RUN = requested_dry_run; changed["dry_run"] = DRY_RUN
     if "min_rate_bps" in payload:
         MIN_RATE_BPS = float(payload["min_rate_bps"]); changed["min_rate_bps"] = MIN_RATE_BPS
     if "cooldown_s" in payload:
@@ -2177,6 +2316,6 @@ if __name__ == "__main__":
                 f"auto_mitigate={AUTO_MITIGATE}, dry_run={DRY_RUN}, "
                 f"collaboration_active={engine.collaboration is not None}, "
                 f"agentic_active={engine.agentic is not None}, "
-                f"agentic_shadow={AGENTIC_SHADOW})")
+                f"agentic_mode={AGENTIC_MODE})")
     collector.start()
     app.run(host="0.0.0.0", port=PORT, debug=False)

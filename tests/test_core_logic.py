@@ -231,6 +231,7 @@ class PredictorTests(unittest.TestCase):
                 "COLLABORATION_ENABLED": False,
                 "AGENTIC_ENABLED": False,
                 "AGENTIC_SHADOW": True,
+                "AGENTIC_MODE": "shadow",
             },
         )
         engine = symbols["PredictorEngine"]()
@@ -355,6 +356,7 @@ class PredictorTests(unittest.TestCase):
                 "COLLABORATION_ENABLED": True,
                 "AGENTIC_ENABLED": False,
                 "AGENTIC_SHADOW": True,
+                "AGENTIC_MODE": "shadow",
             },
         )
         engine = symbols["PredictorEngine"]()
@@ -390,6 +392,7 @@ class PredictorTests(unittest.TestCase):
                 "OfflineModel": OfflineModel,
                 "canonical_flow_key": canonical,
                 "COLLAB_WINDOW_S": 4.0,
+                "AGENTIC_MODE": "shadow",
             },
         )
         engine = object.__new__(symbols["PredictorEngine"])

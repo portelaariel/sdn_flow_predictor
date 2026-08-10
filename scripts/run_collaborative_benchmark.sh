@@ -78,6 +78,7 @@ BUILD_IMAGE="${BENCHMARK_BUILD_IMAGE:-true}"
 BOOTSTRAP_ENV="${BENCHMARK_BOOTSTRAP_ENV:-true}"
 EXPORT_HISTORY="${BENCHMARK_EXPORT_HISTORY:-false}"
 AGENTIC="${BENCHMARK_AGENTIC_ENABLED:-false}"
+AGENTIC_MODE="${BENCHMARK_AGENTIC_MODE:-shadow}"
 RESULTS_ROOT="${BENCHMARK_RESULTS_ROOT:-$PROJECT_ROOT/experiments/results}"
 MODEL_PATH="${PREDICTOR_OFFLINE_MODEL:-$PROJECT_ROOT/models/cic2019-drddos-udp-holt.json}"
 
@@ -104,6 +105,22 @@ done
 if [[ "$AGENTIC" == "true" && "$COLLABORATION" != "true" ]]; then
   echo "BENCHMARK_AGENTIC_ENABLED requer um modo collaborative-*" >&2
   exit 2
+fi
+if [[ "$AGENTIC_MODE" != "shadow" && "$AGENTIC_MODE" != "authority-dry-run" ]]; then
+  echo "BENCHMARK_AGENTIC_MODE deve ser shadow ou authority-dry-run" >&2
+  exit 2
+fi
+if [[ "$AGENTIC" != "true" && "$AGENTIC_MODE" != "shadow" ]]; then
+  echo "BENCHMARK_AGENTIC_MODE requer BENCHMARK_AGENTIC_ENABLED=true" >&2
+  exit 2
+fi
+if [[ "$AGENTIC_MODE" == "authority-dry-run" && "$DRY_RUN" != "true" ]]; then
+  echo "authority-dry-run não pode ser combinado com mitigação live" >&2
+  exit 2
+fi
+AGENTIC_SHADOW_SETTING=false
+if [[ "$AGENTIC_MODE" == "shadow" ]]; then
+  AGENTIC_SHADOW_SETTING=true
 fi
 [[ -r "$MODEL_PATH" ]] || { echo "modelo offline não encontrado: $MODEL_PATH" >&2; exit 2; }
 
@@ -247,7 +264,7 @@ for ((i=0; i<CSETS; i++)); do
   }
 done
 
-echo "[benchmark] implantando preditores (collaboration=$COLLABORATION agentic=$AGENTIC dry_run=$DRY_RUN)"
+echo "[benchmark] implantando preditores (collaboration=$COLLABORATION agentic=$AGENTIC mode=$AGENTIC_MODE dry_run=$DRY_RUN)"
 PREDICTOR_OFFLINE_MODEL="$MODEL_PATH" \
 PREDICTOR_OFFLINE_MODEL_REQUIRED=true \
 PREDICTOR_ONLINE_MODEL_ADAPTATION=false \
@@ -255,28 +272,30 @@ PREDICTOR_COLLABORATION_ENABLED="$COLLABORATION" \
 PREDICTOR_COLLAB_EXPECTED_DOMAINS="$CSETS" \
 PREDICTOR_COLLAB_MIN_DOMAINS=2 \
 PREDICTOR_AGENTIC_ENABLED="$AGENTIC" \
-PREDICTOR_AGENTIC_SHADOW=true \
+PREDICTOR_AGENTIC_MODE="$AGENTIC_MODE" \
+PREDICTOR_AGENTIC_SHADOW="$AGENTIC_SHADOW_SETTING" \
 PREDICTOR_AGENT_REQUIRED_VOTES=2 \
 PREDICTOR_EXPORT_ENABLED="$EXPORT_HISTORY" \
   bash "$PROJECT_ROOT/deploy_flow_predictor.sh" "$CSETS" "$DRY_RUN"
 
 if [[ "$AGENTIC" == "true" ]]; then
-  echo "[benchmark] validando agentes shadow por domínio"
+  echo "[benchmark] validando agentes em modo $AGENTIC_MODE por domínio"
   for ((i=0; i<CSETS; i++)); do
     port=$((PREDICTOR_PORT_BASE + i))
     agent_payload="$(
       curl -fsS "http://127.0.0.1:${port}/predictor/agent" 2>/dev/null || true
     )"
-    if ! jq -e '
+    if ! jq -e --arg mode "$AGENTIC_MODE" '
       .requested == true and
       .active == true and
-      .mode == "shadow" and
-      .authoritative == false and
+      .mode == $mode and
+      .authoritative == ($mode == "authority-dry-run") and
+      .actuation_enabled == false and
       (.agent_id | type == "string" and length > 0) and
       (.cid | type == "string" and length > 0)
     ' >/dev/null 2>&1 <<< "$agent_payload"; then
       printf '%s\n' "$agent_payload" > "$OUTDIR/agent-preflight-${port}.json"
-      echo "agente shadow inativo ou inválido na porta ${port}" >&2
+      echo "agente $AGENTIC_MODE inativo ou inválido na porta ${port}" >&2
       exit 1
     fi
   done
@@ -300,7 +319,7 @@ RUN_BASELINE_RATE="$BASELINE_RATE" RUN_ATTACK_RATE="$ATTACK_RATE" \
 RUN_BASELINE_DURATION="$BASELINE_DURATION_S" RUN_ATTACK_DURATION="$ATTACK_DURATION_S" \
 RUN_CSETS="$CSETS" RUN_SPER="$SPER" RUN_STARTED_NS="$RUN_STARTED_NS" \
 RUN_GIT_COMMIT="$GIT_COMMIT" RUN_MODEL_SHA256="$MODEL_SHA256" \
-RUN_AGENTIC="$AGENTIC" \
+RUN_AGENTIC="$AGENTIC" RUN_AGENTIC_MODE="$AGENTIC_MODE" \
 python3 - <<'PY'
 import json
 import os
@@ -321,7 +340,12 @@ payload = {
     "started_ns": int(os.environ["RUN_STARTED_NS"]),
     "git_commit": os.environ["RUN_GIT_COMMIT"],
     "model_sha256": os.environ["RUN_MODEL_SHA256"],
-    "agentic_shadow": os.environ["RUN_AGENTIC"] == "true",
+    "agentic_enabled": os.environ["RUN_AGENTIC"] == "true",
+    "agentic_mode": os.environ["RUN_AGENTIC_MODE"],
+    "agentic_shadow": (
+        os.environ["RUN_AGENTIC"] == "true"
+        and os.environ["RUN_AGENTIC_MODE"] == "shadow"
+    ),
 }
 Path(os.environ["RUN_METADATA_PATH"]).write_text(
     json.dumps(payload, indent=2, sort_keys=True) + "\n",

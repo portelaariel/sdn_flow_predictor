@@ -4,6 +4,9 @@ import threading
 import unittest
 from pathlib import Path
 
+from experiments.evaluate_agentic_authority_run import (
+    evaluate as evaluate_authority_run,
+)
 from experiments.evaluate_agentic_runtime_faults import evaluate
 from experiments.monitor_predictors import (
     flow_anomalies,
@@ -193,6 +196,115 @@ class BenchmarkToolTests(unittest.TestCase):
             )
             unsafe = evaluate(root, flow, 2)
             self.assertFalse(unsafe["aggregate"]["safe"])
+
+    def test_authority_dry_run_requires_one_claim_and_zero_actuation(self):
+        flow = "10.0.0.1->10.0.0.8"
+        attack_ns = 1_000_000_000
+        domains = ("domain-0", "domain-1")
+        proposals = [
+            {
+                "cid": cid,
+                "observation_ns": attack_ns + 100_000_000,
+                "created_ns": attack_ns + 200_000_000,
+            }
+            for cid in domains
+        ]
+
+        def row(cid, won):
+            decision = {
+                "event_id": f"{cid}:agreement",
+                "flow": flow,
+                "decision": "AGREED",
+                "state_entered_ns": attack_ns + 500_000_000,
+                "proposals": proposals,
+                "authority": {
+                    "authorized": True,
+                    "claim": {
+                        "won": won,
+                        "degraded": False,
+                        "coordinator": "domain-0",
+                    },
+                },
+                "execution": {
+                    "attempted": False,
+                    "executed": False,
+                    "would_execute": won,
+                },
+                "legacy_comparison": {
+                    "available": True,
+                    "matches": True,
+                },
+            }
+            return {
+                "sampled_ns": attack_ns + 600_000_000,
+                "status": {"cid": cid},
+                "agentic": {
+                    "requested": True,
+                    "active": True,
+                    "mode": "authority-dry-run",
+                    "authoritative": True,
+                    "actuation_enabled": False,
+                    "cid": cid,
+                    "decisions": [decision],
+                    "decision_events": [],
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "metadata.json").write_text(json.dumps({
+                "mode": "collaborative-dry-run",
+                "scenario": "ddos",
+                "flow": flow,
+                "controller_sets": 2,
+                "agentic_enabled": True,
+                "agentic_mode": "authority-dry-run",
+            }), encoding="utf-8")
+            (run_dir / "attack_start_ns.txt").write_text(
+                f"{attack_ns}\n", encoding="utf-8"
+            )
+            (run_dir / "workload_status.json").write_text(
+                json.dumps({"valid": True}), encoding="utf-8"
+            )
+            (run_dir / "summary.json").write_text(json.dumps({
+                "runs": [{"classification": "TP"}],
+            }), encoding="utf-8")
+            rows = [row("domain-0", True), row("domain-1", False)]
+            (run_dir / "timeline.ndjson").write_text(
+                "".join(json.dumps(item) + "\n" for item in rows),
+                encoding="utf-8",
+            )
+            for switch in ("s1", "s2", "s3", "s4"):
+                (run_dir / f"ovs-flows-{switch}.txt").write_text(
+                    "actions=NORMAL\n", encoding="utf-8"
+                )
+            (run_dir / "flow-blocker-0.log").write_text("", encoding="utf-8")
+
+            report = evaluate_authority_run(run_dir)
+            self.assertTrue(report["aggregate"]["safe"])
+            self.assertEqual(report["claim_winner_domains"], ["domain-0"])
+            self.assertEqual(report["would_execute_domains"], ["domain-0"])
+
+            rows[0]["agentic"]["decisions"][0]["execution"]["attempted"] = True
+            (run_dir / "timeline.ndjson").write_text(
+                "".join(json.dumps(item) + "\n" for item in rows),
+                encoding="utf-8",
+            )
+            unsafe = evaluate_authority_run(run_dir)
+            self.assertFalse(unsafe["aggregate"]["safe"])
+            self.assertFalse(unsafe["checks"]["agent_never_actuated"])
+
+            rows[0]["agentic"]["decisions"][0]["execution"]["attempted"] = False
+            rows[1]["agentic"]["decisions"][0]["authority"]["claim"][
+                "coordinator"
+            ] = "domain-1"
+            (run_dir / "timeline.ndjson").write_text(
+                "".join(json.dumps(item) + "\n" for item in rows),
+                encoding="utf-8",
+            )
+            split_brain = evaluate_authority_run(run_dir)
+            self.assertFalse(split_brain["aggregate"]["safe"])
+            self.assertFalse(split_brain["checks"]["claim_owner_consistent"])
 
     def test_agentic_run_is_invalid_when_agents_or_decisions_are_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
