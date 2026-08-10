@@ -204,6 +204,7 @@ class DomainAgent:
             "mitigate_votes": [],
             "proposals": [
                 {
+                    "flow": item["flow"],
                     "cid": item["cid"],
                     "role": item["role"],
                     "proposal": item["proposal"],
@@ -214,7 +215,10 @@ class DomainAgent:
                     "destination_cid": item["destination_cid"],
                     "observation_ns": item["observation_ns"],
                     "window_id": item["window_id"],
+                    "model_id": item["model_id"],
                     "created_ns": item["created_ns"],
+                    "expires_ns": item["expires_ns"],
+                    "relevant_domains": list(item["relevant_domains"]),
                 }
                 for item in current
             ],
