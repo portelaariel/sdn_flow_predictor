@@ -91,7 +91,7 @@ for rate in "$BASELINE_RATE" "$ATTACK_RATE"; do
   [[ "$rate" =~ ^[1-9][0-9]*([KMG])?$ ]] || { echo "taxa inválida: $rate" >&2; exit 2; }
 done
 [[ -r "$MODEL_PATH" ]] || { echo "modelo offline não encontrado: $MODEL_PATH" >&2; exit 2; }
-for command in python3 curl jq sudo docker mn; do
+for command in python3 curl jq sudo docker mn ovs-vsctl; do
   command -v "$command" >/dev/null || { echo "comando obrigatório ausente: $command" >&2; exit 2; }
 done
 
@@ -124,6 +124,7 @@ restore_faults() {
 }
 
 cleanup() {
+  local force_mininet_cleanup=false
   if [[ -n "$ACTIVE_GATE_DIR" ]]; then
     touch "$ACTIVE_GATE_DIR/abort" 2>/dev/null || true
   fi
@@ -135,9 +136,20 @@ cleanup() {
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
+      if [[ "$pid" == "$ACTIVE_WORKLOAD_PID" ]]; then
+        force_mininet_cleanup=true
+      fi
     fi
   done
-  sudo mn -c >/dev/null 2>&1 || true
+  if [[ "$force_mininet_cleanup" == "true" ]]; then
+    # Em algumas versões, mn -c usa killall no namespace de PIDs do host e
+    # também encerra ryu-manager dentro dos containers. Só é necessário se o
+    # workload foi morto antes de executar net.stop(); depois restauramos Ryu.
+    sudo mn -c >/dev/null 2>&1 || true
+    for ((i=0; i<CSETS; i++)); do
+      sudo docker start "ryu-core-${i}" >/dev/null 2>&1 || true
+    done
+  fi
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -180,7 +192,13 @@ wait_gate() {
 
 echo "[runtime-fault] fluxo=$FLOW saída=$OUTDIR"
 echo "[runtime-fault] segurança: agentic=shadow dry_run=true"
-sudo mn -c >/dev/null 2>&1 || true
+if [[ "$BOOTSTRAP_ENV" == "true" ]]; then
+  # Seguro antes do bootstrap: quaisquer Ryu afetados serão recriados abaixo.
+  sudo mn -c >/dev/null 2>&1 || true
+elif sudo ovs-vsctl list-br 2>/dev/null | grep -Eq '^s[1-9][0-9]*$'; then
+  echo "há uma topologia Mininet ativa; finalize-a antes de reutilizar o ambiente" >&2
+  exit 1
+fi
 
 if [[ "$BUILD_IMAGE" == "true" ]]; then
   echo "[runtime-fault] construindo imagens do commit atual"
@@ -205,22 +223,27 @@ fi
 # Mininet, porém, o listener OpenFlow é obrigatório. Usamos as portas publicadas
 # no host para não depender de uma rota direta host -> bridge Docker, que pode
 # ser bloqueada por firewall mesmo quando os containers estão saudáveis.
-echo "[runtime-fault] validando listeners OpenFlow publicados"
-for ((i=0; i<CSETS; i++)); do
-  controller_port=$((CTRL_OF_PORT_BASE + i))
-  controller_api_port=$((CTRL_API_PORT_BASE + i))
-  if ! wait_tcp 127.0.0.1 "$controller_port" 30; then
-    sudo docker logs --tail 120 "ryu-core-${i}" \
-      > "$OUTDIR/ryu-core-${i}-openflow-preflight.log" 2>&1 || true
-    echo "Ryu do domínio $i não escuta OpenFlow em 127.0.0.1:${controller_port}" >&2
-    echo "consulte $OUTDIR/ryu-core-${i}-openflow-preflight.log" >&2
-    exit 1
-  fi
-  wait_http "http://127.0.0.1:${controller_api_port}/stats/switches" 30 || {
-    echo "API Ryu indisponível na porta ${controller_api_port}" >&2
-    exit 1
-  }
-done
+preflight_openflow() {
+  local label="$1"
+  echo "[runtime-fault] validando OpenFlow antes de $label"
+  for ((i=0; i<CSETS; i++)); do
+    local controller_port=$((CTRL_OF_PORT_BASE + i))
+    local controller_api_port=$((CTRL_API_PORT_BASE + i))
+    if ! wait_tcp 127.0.0.1 "$controller_port" 30; then
+      sudo docker logs --tail 120 "ryu-core-${i}" \
+        > "$OUTDIR/ryu-core-${i}-openflow-preflight.log" 2>&1 || true
+      echo "Ryu do domínio $i não escuta OpenFlow em 127.0.0.1:${controller_port}" >&2
+      echo "consulte $OUTDIR/ryu-core-${i}-openflow-preflight.log" >&2
+      return 1
+    fi
+    wait_http "http://127.0.0.1:${controller_api_port}/stats/switches" 30 || {
+      echo "API Ryu indisponível na porta ${controller_api_port}" >&2
+      return 1
+    }
+  done
+}
+
+preflight_openflow deploy
 
 PREDICTOR_OFFLINE_MODEL="$MODEL_PATH" \
 PREDICTOR_OFFLINE_MODEL_REQUIRED=true \
@@ -264,7 +287,9 @@ run_episode() {
   local gate="$episode/gate"
   local stop_file="$episode/monitor.stop"
   mkdir -p "$gate"
-  sudo mn -c >/dev/null 2>&1 || true
+  # O workload anterior sempre chama net.stop(). Não usar mn -c aqui: no host
+  # do testbed ele também mata ryu-manager dentro dos containers Docker.
+  preflight_openflow "$name"
   echo "[runtime-fault] episódio=$name falha=$fault"
 
   python3 "$PROJECT_ROOT/experiments/monitor_predictors.py" \

@@ -322,6 +322,12 @@ que uma política de firewall do host contra a bridge Docker seja confundida com
 falha dos agentes. Se um listener realmente não subir, o teste para antes do
 baseline e salva `ryu-core-*-openflow-preflight.log`.
 
+Cada workload encerra sua própria topologia com `net.stop()`. O runner não usa
+`mn -c` entre episódios porque algumas instalações executam `killall` no
+namespace de PIDs do host e terminam também o `ryu-manager` dos containers. Uma
+limpeza forçada só ocorre se um workload precisar ser abortado; nesse caso os
+containers Ryu são iniciados novamente pelo cleanup de emergência.
+
 O relatório `experiments/results/runtime-fault-*/summary.json` exige ausência
 de `AGREED` e de claim novo durante a falha, `WAITING_PROPOSALS` quando um
 agente desaparece, erro observável durante a partição, e um novo `AGREED` dos
