@@ -45,7 +45,13 @@ curl() {
       printf '%s\n' '{"requested":true,"active":true}'
       ;;
     */predictor/agent)
-      printf '%s\n' '{"requested":true,"active":true,"mode":"shadow","authoritative":false}'
+      local mode="${PREDICTOR_AGENTIC_MODE:-shadow}"
+      local authoritative=false
+      if [[ "$mode" == "authority-dry-run" ]]; then
+        authoritative=true
+      fi
+      printf '{"requested":true,"active":true,"mode":"%s","authoritative":%s,"actuation_enabled":false}\n' \
+        "$mode" "$authoritative"
       ;;
     *)
       printf '%s\n' '{}'
@@ -72,7 +78,9 @@ grep -q -- '-e COLLAB_EXPECTED_DOMAINS=1' "$COMMAND_LOG"
 grep -q -- '-e COLLAB_MIN_DOMAINS=2' "$COMMAND_LOG"
 grep -q -- '-e AGENTIC_ENABLED=false' "$COMMAND_LOG"
 grep -q -- '-e AGENTIC_SHADOW=true' "$COMMAND_LOG"
+grep -q -- '-e AGENTIC_MODE=shadow' "$COMMAND_LOG"
 grep -q -- '-e AGENT_REQUIRED_VOTES=2' "$COMMAND_LOG"
+grep -q -- '-e AGENT_CLAIM_TTL_S=60' "$COMMAND_LOG"
 grep -q -- '-e DRY_RUN=true' "$COMMAND_LOG"
 grep -q -- '-p 6060:6060' "$COMMAND_LOG"
 
@@ -113,6 +121,23 @@ grep -q -- '-e AGENTIC_ENABLED=true' "$COMMAND_LOG"
 grep -q -- '-e AGENTIC_SHADOW=true' "$COMMAND_LOG"
 grep -q -- '-e AGENT_REQUIRED_VOTES=2' "$COMMAND_LOG"
 grep -q -- '-e AGENT_PROPOSAL_THRESHOLD=0.65' "$COMMAND_LOG"
+
+PREDICTION_HISTORY_ROOT="$TEST_TMP/history-agentic-authority" \
+PREDICTOR_COLLABORATION_ENABLED=true \
+PREDICTOR_AGENTIC_ENABLED=true \
+PREDICTOR_AGENTIC_MODE=authority-dry-run \
+  bash "$PROJECT_ROOT/deploy_flow_predictor.sh" 2 true >/dev/null
+
+grep -q -- '-e AGENTIC_MODE=authority-dry-run' "$COMMAND_LOG"
+grep -q -- '-e AGENTIC_SHADOW=false' "$COMMAND_LOG"
+
+if PREDICTOR_COLLABORATION_ENABLED=true \
+  PREDICTOR_AGENTIC_ENABLED=true \
+  PREDICTOR_AGENTIC_MODE=authority-dry-run \
+  bash "$PROJECT_ROOT/deploy_flow_predictor.sh" 2 false >/dev/null 2>&1; then
+  echo "authority-dry-run unexpectedly accepted live mitigation" >&2
+  exit 1
+fi
 
 # ETCD continua opcional para o detector local, mas é requisito estrito para
 # colaboração/agentes.

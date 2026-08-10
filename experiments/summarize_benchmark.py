@@ -66,6 +66,13 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
         run_started_ns = None
     collaborative = str(metadata.get("mode", "")).startswith("collaborative-")
     live_mode = metadata.get("mode") == "collaborative-live"
+    agentic_enabled = (
+        metadata.get("agentic_enabled") is True
+        or metadata.get("agentic_shadow") is True
+    )
+    agentic_mode = str(metadata.get(
+        "agentic_mode", "shadow" if metadata.get("agentic_shadow") else "disabled"
+    ))
     attack_disrupted = workload.get("attack_disrupted") is True
     attack_start_ns = read_timestamp(run_dir / "attack_start_ns.txt")
     detection_ns = None
@@ -94,6 +101,10 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
     agentic_events: Dict[str, Dict[str, Any]] = {}
     agentic_waiting_by_domain: Dict[str, int] = {}
     agentic_expired_by_domain: Dict[str, int] = {}
+    agentic_authorized_domains = set()
+    agentic_would_execute_domains = set()
+    agentic_claim_winners = set()
+    agentic_actuation_violation = False
     initial_waiting_by_domain: Dict[str, int] = {}
     initial_expired_by_domain: Dict[str, int] = {}
 
@@ -118,10 +129,12 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
         agentic = row.get("agentic", {})
         if not isinstance(agentic, dict):
             agentic = {}
+        expected_authoritative = agentic_mode == "authority-dry-run"
         if (agentic.get("requested") is True
                 and agentic.get("active") is True
-                and agentic.get("mode") == "shadow"
-                and agentic.get("authoritative") is False):
+                and agentic.get("mode") == agentic_mode
+                and agentic.get("authoritative") is expected_authoritative
+                and agentic.get("actuation_enabled", False) is False):
             agent_cid = agentic.get("cid") or cid
             if agent_cid is not None:
                 agentic_active_domains.add(str(agent_cid))
@@ -230,6 +243,17 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
             if state:
                 agentic_decisions.add(state)
             agentic_mitigate_votes.update(decision.get("mitigate_votes", []))
+            authority = decision.get("authority") or {}
+            if authority.get("authorized"):
+                agentic_authorized_domains.add(agent_cid)
+            authority_claim = authority.get("claim") or {}
+            if authority_claim.get("won"):
+                agentic_claim_winners.add(agent_cid)
+            execution = decision.get("execution") or {}
+            if execution.get("would_execute"):
+                agentic_would_execute_domains.add(agent_cid)
+            if execution.get("attempted") or execution.get("executed"):
+                agentic_actuation_violation = True
             comparison = decision.get("legacy_comparison", {})
             if comparison.get("available") and isinstance(comparison.get("matches"), bool):
                 evaluated_ns = int(decision.get("evaluated_ns", row.get("sampled_ns", 0)))
@@ -365,21 +389,23 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
         invalid_reasons.append(
             "FlowBlocker confirmou execução, mas o ping não observou perda"
         )
-    agentic_shadow = metadata.get("agentic_shadow") is True
+    agentic_shadow = agentic_enabled and agentic_mode == "shadow"
     try:
         expected_agent_domains = max(1, int(metadata.get("controller_sets", 1)))
     except (TypeError, ValueError):
         expected_agent_domains = 1
-    if agentic_shadow and len(agentic_active_domains) < expected_agent_domains:
+    if agentic_enabled and len(agentic_active_domains) < expected_agent_domains:
         invalid_reasons.append(
-            "agentes shadow ativos em "
+            f"agentes {agentic_mode} ativos em "
             f"{len(agentic_active_domains)}/{expected_agent_domains} domínio(s)"
         )
-    if (agentic_shadow and expected_attack and attack_spikes
+    if (agentic_enabled and expected_attack and attack_spikes
             and not agentic_decisions):
         invalid_reasons.append(
-            "anomalia de ataque sem decisão registrada pelos agentes shadow"
+            f"anomalia de ataque sem decisão registrada pelos agentes {agentic_mode}"
         )
+    if agentic_mode == "authority-dry-run" and agentic_actuation_violation:
+        invalid_reasons.append("authority-dry-run tentou ou executou atuação")
     measurement_valid = not invalid_reasons
     contamination_reasons = []
     if expected_attack and baseline_spikes:
@@ -437,6 +463,8 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
         "contamination_reasons": contamination_reasons,
         "classification": classification,
         "agentic_shadow": agentic_shadow,
+        "agentic_enabled": agentic_enabled,
+        "agentic_mode": agentic_mode,
         "agentic_active_domains": sorted(agentic_active_domains),
         "agentic_expected_domains": expected_agent_domains,
         "agentic_decisions": sorted(agentic_decisions),
@@ -477,6 +505,10 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
             for cid, value in agentic_expired_by_domain.items()
         ),
         "agentic_agent_agreement": bool(first_agreement),
+        "agentic_authorized_domains": sorted(agentic_authorized_domains),
+        "agentic_claim_winners": sorted(agentic_claim_winners),
+        "agentic_would_execute_domains": sorted(agentic_would_execute_domains),
+        "agentic_actuation_violation": agentic_actuation_violation,
         "agentic_mcda_comparison_domains": sorted(agentic_comparisons),
         "agentic_matches_mcda": (
             all(value[1] for value in agentic_comparisons.values())
@@ -497,7 +529,7 @@ def aggregate_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
           if precision is not None and recall is not None and precision + recall else None)
     agentic_candidates = [
         row for row in rows
-        if row.get("agentic_shadow")
+        if row.get("agentic_enabled") or row.get("agentic_shadow")
         and row.get("measurement_valid")
         and not row.get("contamination_reasons")
         and row.get("attack_spike_anomalies", 0) > 0

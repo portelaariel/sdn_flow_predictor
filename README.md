@@ -41,8 +41,9 @@ coordenação entre domínios.
 | --- | --- | --- |
 | FlowPredictor | `flow_predictor_cnsm.py` | `Dockerfile.flow_predictor` |
 | Decisão colaborativa | `collaborative_decision.py` | critérios MCDA puros e reproduzíveis |
-| Agente de domínio | `domain_agent.py` | deliberação local e negociação shadow |
+| Agente de domínio | `domain_agent.py` | deliberação local e negociação distribuída |
 | Protocolo dos agentes | `agent_protocol.py` | contrato JSON estrito e validação de propostas |
+| Gate de autoridade | `agent_authority.py` | revalidação fail-closed e claim agentic exclusivo |
 | Contrato do modelo | `offline_model.py` | valida o artefato JSON no treino e no runtime |
 | Treinamento offline | `train_offline_model.py` | converte CSVs rotulados em um modelo versionável |
 | Preparação CIC-DDoS2019 | `prepare_cicddos2019.py` | agrega CSVs grandes em janelas temporais compactas |
@@ -232,7 +233,7 @@ queda do ETCD durante o consenso é tratada de forma conservadora: novas
 ações colaborativas aguardam a recuperação, em vez de cada domínio
 bloquear independentemente.
 
-### 2.6 Agentes de domínio em shadow mode
+### 2.6 Agentes de domínio: shadow e authority-dry-run
 
 Com `PREDICTOR_AGENTIC_ENABLED=true`, cada FlowPredictor também instancia um
 agente deliberativo associado ao seu domínio. O agente recebe a mesma evidência
@@ -253,11 +254,15 @@ um domínio gera `WAITING_PROPOSALS`; topologias divergentes,
 `VETOED`. Um fluxo inteiramente local exige apenas o agente do seu único domínio
 responsável.
 
-Esta primeira fase é obrigatoriamente **shadow**: a decisão agentic é anexada à
-anomalia e comparada com a decisão MCDA, mas nunca disputa claim nem chama o
-FlowBlocker. Essa separação permite medir concordâncias e divergências antes de
-delegar autoridade operacional. Os logs usam `[METRICS][AGENT_PROPOSAL]` e
-`[METRICS][AGENT_CONSENSUS]`; o estado completo fica em
+O modo padrão **shadow** anexa a decisão agentic à anomalia e a compara com a
+decisão MCDA, sem disputar claim nem chamar o FlowBlocker. O estágio seguinte,
+**authority-dry-run**, revalida cada novo `AGREED` em uma fronteira separada de
+autorização e disputa um claim agentic exclusivo no ETCD. O vencedor registra
+`would_execute=true`, mas tanto `attempted` quanto `executed` permanecem falsos:
+o caminho agentic não possui chamada ao FlowBlocker. O MCDA continua operando em
+dry-run como comparador independente. Os logs usam
+`[METRICS][AGENT_PROPOSAL]`, `[METRICS][AGENT_CONSENSUS]` e
+`[METRICS][AGENT_AUTHORITY_DRYRUN]`; o estado completo fica em
 `GET /predictor/agent`.
 
 A API também mantém os 200 eventos de transição mais recentes em
@@ -279,14 +284,29 @@ O score local do agente é explicável e combina severidade Holt (0,35), razão 
 vazão (0,20), persistência (0,20), confiabilidade do modelo (0,15) e papel
 topológico (0,10). Não há LLM ou aprendizado por reforço no caminho crítico.
 
-#### Gate de segurança para autoridade futura
+#### Gate de segurança e autoridade sem atuação
 
 `agent_authority.py` adiciona uma segunda validação entre `AGREED` e qualquer
 ação futura. O gate revalida identidade do evento, fluxo, quórum, papéis,
 topologia, modelo, janela e TTL. Um claim separado em
 `flowpredictor/agent-mitigation-claim/<hash>` garante um único vencedor e falha
-fechada quando o ETCD está indisponível. Nesta versão o gate e o claim são
-testados, mas permanecem deliberadamente desconectados do FlowBlocker.
+fechada quando o ETCD está indisponível. Em `shadow`, gate e claim não são
+executados. Em `authority-dry-run`, ambos fazem parte do runtime, mas permanecem
+deliberadamente desconectados do FlowBlocker. A inicialização exige
+`DRY_RUN=true` e a API rejeita a tentativa de desativá-lo durante a execução.
+
+Depois do gate de falhas, execute o piloto autoritativo sem atuação:
+
+``` bash
+bash scripts/run_agentic_authority_dry_run.sh
+```
+
+O avaliador exige workload válido, dois agentes ativos e autorizados, propostas
+posteriores ao início do ataque, exatamente um domínio coordenador,
+`would_execute` apenas nesse domínio, concordância com o MCDA, zero tentativa de
+atuação, zero request ao FlowBlocker e zero regra DROP. O resultado fica em
+`experiments/results/authority-dry-run-*/authority-summary.json`; qualquer
+invariante violada produz status de saída diferente de zero.
 
 A matriz determinística de fault injection pode ser executada sem Mininet,
 containers ou privilégios de administrador:
@@ -389,7 +409,7 @@ precision/recall ao longo do experimento.
 | GET | `/predictor/anomalies?limit=N` | Anomalias recentes com resultado da mitigação |
 | GET | `/predictor/model` | Modo efetivo, parâmetros e proveniência do modelo offline |
 | GET | `/predictor/collaboration` | Configuração MCDA, evidências, claims e decisões explicadas |
-| GET | `/predictor/agent` | Propostas, estados, negociação shadow e comparação com o MCDA |
+| GET | `/predictor/agent` | Propostas, negociação, autorização/claim dry-run e comparação com o MCDA |
 | GET | `/predictor/export/status` | Estado e contadores da exportação CSV |
 | POST | `/predictor/feedback` | `{"anomaly_id", "verdict"}` — refina *thresholds* |
 | POST | `/predictor/config` | Ajuste em tempo de execução: `auto_mitigate`, `dry_run`, `min_rate_bps`, `cooldown_s`, `event_cooldown_s` |
@@ -775,6 +795,9 @@ bash scripts/run_collaborative_benchmark.sh collaborative-dry-run ddos
 BENCHMARK_AGENTIC_ENABLED=true \
   bash scripts/run_collaborative_benchmark.sh collaborative-dry-run ddos
 
+# Agentes revalidam AGREED e elegem quem agiria, sem chamar o FlowBlocker
+bash scripts/run_agentic_authority_dry_run.sh
+
 # Após o claim anterior expirar, valida o DROP real
 bash scripts/run_collaborative_benchmark.sh \
   collaborative-live ddos --allow-mitigation
@@ -801,19 +824,24 @@ Cada execução cria um diretório pequeno em
 
 - metadados, hash do modelo e commit Git;
 - JSON do iperf e ping antes/depois;
-- linha do tempo NDJSON de predições, anomalias, decisões MCDA e agentic shadow;
+- linha do tempo NDJSON de predições, anomalias, decisões MCDA e agentic;
 - snapshots das APIs, flows OVS e logs dos containers;
 - `summary.json` e `summary.md` com score, domínios confirmadores,
   coordenador, quantidade de domínios que agiram, latências e classificação
   `TP/TN/FP/FN/CONTAMINATED/INVALID`.
 
-Quando os agentes shadow estão habilitados, o resumo separa explicitamente a
+Quando os agentes estão habilitados, o resumo separa explicitamente a
 latência MCDA da latência agentic. Ele registra detecção→primeira proposta,
 primeira→última proposta, última proposta→`AGREED`, detecção→`AGREED` e
 ataque→`AGREED`. O agregado informa taxas de concordância agente–agente e
 agente–MCDA, além de propostas expiradas e episódios que aguardaram quórum.
 Contadores são calculados em relação ao snapshot inicial, portanto a opção
 `BENCHMARK_BOOTSTRAP_ENV=false` não incorpora execuções anteriores.
+
+Para selecionar diretamente o segundo estágio no runner genérico, use
+`BENCHMARK_AGENTIC_ENABLED=true` e
+`BENCHMARK_AGENTIC_MODE=authority-dry-run`. Esse modo só aceita
+`collaborative-dry-run`; combiná-lo com mitigação live é erro de configuração.
 
 Uma execução sem conexão com os controladores, sem ping mensurável, sem vazão
 do baseline/ataque, sem os dois hosts na tabela de domínios ou com erro nas

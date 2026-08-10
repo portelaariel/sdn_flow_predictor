@@ -70,11 +70,27 @@ if [[ "$PREDICTOR_AGENTIC_ENABLED" == "true" ]] \
   echo "PREDICTOR_AGENTIC_ENABLED requires collaboration" >&2
   exit 2
 fi
-if [[ "$PREDICTOR_AGENTIC_ENABLED" == "true" ]] \
-  && [[ "$PREDICTOR_AGENTIC_SHADOW" != "true" ]]; then
-  echo "the current agentic phase supports shadow mode only" >&2
-  exit 2
-fi
+case "$PREDICTOR_AGENTIC_MODE" in
+  shadow)
+    EFFECTIVE_AGENTIC_SHADOW=true
+    if [[ "$PREDICTOR_AGENTIC_ENABLED" == "true" \
+          && "$PREDICTOR_AGENTIC_SHADOW" != "true" ]]; then
+      echo "agentic shadow mode requires PREDICTOR_AGENTIC_SHADOW=true" >&2
+      exit 2
+    fi
+    ;;
+  authority-dry-run)
+    EFFECTIVE_AGENTIC_SHADOW=false
+    if [[ "$PREDICTOR_AGENTIC_ENABLED" == "true" && "$DRY_RUN" != "true" ]]; then
+      echo "authority-dry-run requires global dry_run=true" >&2
+      exit 2
+    fi
+    ;;
+  *)
+    echo "PREDICTOR_AGENTIC_MODE must be shadow or authority-dry-run" >&2
+    exit 2
+    ;;
+esac
 if [[ "$PREDICTOR_AGENTIC_ENABLED" == "true" ]] \
   && (( PREDICTOR_AGENT_REQUIRED_VOTES > COLLAB_EXPECTED_DOMAINS )); then
   echo "PREDICTOR_AGENT_REQUIRED_VOTES cannot exceed expected domains" >&2
@@ -128,16 +144,18 @@ if kind == "status":
 elif kind == "collaboration":
     ready = payload.get("requested") is True and payload.get("active") is True
 elif kind == "agent":
+    expected_mode = sys.argv[2]
     ready = (
         payload.get("requested") is True
         and payload.get("active") is True
-        and payload.get("mode") == "shadow"
-        and payload.get("authoritative") is False
+        and payload.get("mode") == expected_mode
+        and payload.get("authoritative") is (expected_mode == "authority-dry-run")
+        and payload.get("actuation_enabled") is False
     )
 else:
     ready = False
 raise SystemExit(0 if ready else 1)
-' "$kind" >/dev/null 2>&1
+' "$kind" "$PREDICTOR_AGENTIC_MODE" >/dev/null 2>&1
 }
 
 # Build da imagem se ausente
@@ -177,7 +195,7 @@ for ((i=0; i<C; i++)); do
   log "  Dataset em: $HIST_DIR"
   log "  Detecção: $MODEL_DESCRIPTION"
   log "  Colaboração: $PREDICTOR_COLLABORATION_ENABLED (quórum=$PREDICTOR_COLLAB_MIN_DOMAINS/$COLLAB_EXPECTED_DOMAINS)"
-  log "  Agente: $PREDICTOR_AGENTIC_ENABLED (shadow=$PREDICTOR_AGENTIC_SHADOW, votos=$PREDICTOR_AGENT_REQUIRED_VOTES)"
+  log "  Agente: $PREDICTOR_AGENTIC_ENABLED (modo=$PREDICTOR_AGENTIC_MODE, votos=$PREDICTOR_AGENT_REQUIRED_VOTES)"
   CONTAINER="flow-predictor-$i"
   sudo docker create --name "$CONTAINER" --network "$NET" --ip "$PRED_IP" \
     -v "$HIST_DIR:/app/prediction_history" \
@@ -216,12 +234,14 @@ for ((i=0; i<C; i++)); do
     -e COLLAB_RATE_RATIO_MAX="$PREDICTOR_COLLAB_RATE_RATIO_MAX" \
     -e COLLAB_WEIGHTS_JSON="$PREDICTOR_COLLAB_WEIGHTS_JSON" \
     -e AGENTIC_ENABLED="$PREDICTOR_AGENTIC_ENABLED" \
-    -e AGENTIC_SHADOW="$PREDICTOR_AGENTIC_SHADOW" \
+    -e AGENTIC_SHADOW="$EFFECTIVE_AGENTIC_SHADOW" \
+    -e AGENTIC_MODE="$PREDICTOR_AGENTIC_MODE" \
     -e AGENT_REQUIRED_VOTES="$PREDICTOR_AGENT_REQUIRED_VOTES" \
     -e AGENT_PROPOSAL_TTL_S="$PREDICTOR_AGENT_PROPOSAL_TTL_S" \
     -e AGENT_NEGOTIATION_WINDOW_S="$PREDICTOR_AGENT_NEGOTIATION_WINDOW_S" \
     -e AGENT_PROPOSAL_THRESHOLD="$PREDICTOR_AGENT_PROPOSAL_THRESHOLD" \
     -e AGENT_TOPOLOGY_CACHE_S="$PREDICTOR_AGENT_TOPOLOGY_CACHE_S" \
+    -e AGENT_CLAIM_TTL_S="$PREDICTOR_AGENT_CLAIM_TTL_S" \
     -p "$PRED_HTTP_PORT:$PRED_HTTP_PORT" \
     "$PRED_IMG" >/dev/null
 

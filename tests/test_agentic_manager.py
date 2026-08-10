@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent_protocol import agent_flow_hash
+from agent_authority import claim_agentic_mitigation, evaluate_agentic_authority
 from domain_agent import DomainAgent, domain_role
 
 
@@ -38,8 +39,25 @@ class AgenticShadowManagerTests(unittest.TestCase):
             def __init__(self, key):
                 self.key = key.encode("utf-8")
 
+        class Version:
+            def __init__(self, key):
+                self.key = key
+
+            def __eq__(self, value):
+                return ("version", self.key, value)
+
+        class Transactions:
+            @staticmethod
+            def version(key):
+                return AgenticShadowManagerTests.FakeEtcd.Version(key)
+
+            @staticmethod
+            def put(key, value, lease_id):
+                return ("put", key, value, lease_id)
+
         def __init__(self):
             self.values = {}
+            self.transactions = self.Transactions()
 
         def lease(self, _ttl):
             return self.Lease()
@@ -52,6 +70,17 @@ class AgenticShadowManagerTests(unittest.TestCase):
                 (value, self.Metadata(key)) for key, value in self.values.items()
                 if key.startswith(prefix)
             ]
+
+        def transaction(self, *, compare, success, failure):
+            _kind, key, expected = compare[0]
+            won = expected == 0 and key not in self.values
+            for kind, operation_key, value, _lease_id in (success if won else failure):
+                if kind == "put":
+                    self.values[operation_key] = value.encode("utf-8")
+            return won, []
+
+        def get(self, key):
+            return self.values.get(key), None
 
     @classmethod
     def setUpClass(cls):
@@ -85,6 +114,10 @@ class AgenticShadowManagerTests(unittest.TestCase):
             "WHITELIST_IPS": set(),
             "AGENTIC_ENABLED": True,
             "AGENTIC_SHADOW": True,
+            "AGENTIC_MODE": "shadow",
+            "AGENT_CLAIM_TTL_S": 60.0,
+            "evaluate_agentic_authority": evaluate_agentic_authority,
+            "claim_agentic_mitigation": claim_agentic_mitigation,
             "now_ns": lambda: cls.NOW_NS,
             "_metric": lambda tag, message: cls.metrics.append((tag, message)),
             "_etcd": cls.etcd,
@@ -156,6 +189,11 @@ class AgenticShadowManagerTests(unittest.TestCase):
         manager.disagreements = 0
         manager.waiting_events = 0
         manager.expired_proposals = 0
+        manager.authority_evaluations = 0
+        manager.authorizations = 0
+        manager.authority_denials = 0
+        manager.claims_won = 0
+        manager.claims_lost = 0
         manager.started_ns = self.NOW_NS
         return manager
 
@@ -215,6 +253,59 @@ class AgenticShadowManagerTests(unittest.TestCase):
         manager._evaluate_negotiations()
         self.assertEqual(len(manager.decision_events), 1)
         self.assertEqual(manager.agreements, 1)
+
+    def test_authority_dry_run_validates_claims_and_never_executes(self):
+        manager = self.bare_manager()
+        flow = "10.0.0.1->10.0.0.8"
+        source = DomainAgent(
+            "domain-0", proposal_threshold=0.65,
+            persistence_windows=3, rate_ratio_max=10.0,
+            proposal_ttl_s=12.0, required_votes=2,
+            negotiation_window_s=4.0,
+        ).build_proposal(
+            self.evidence("domain-0"), role="SOURCE",
+            relevant_domains=["domain-0", "domain-1"],
+            source_cid="domain-0", destination_cid="domain-1",
+            created_ns=self.NOW_NS,
+        )
+        destination = DomainAgent(
+            "domain-1", proposal_threshold=0.65,
+            persistence_windows=3, rate_ratio_max=10.0,
+            proposal_ttl_s=12.0, required_votes=2,
+            negotiation_window_s=4.0,
+        ).build_proposal(
+            self.evidence("domain-1"), role="DESTINATION",
+            relevant_domains=["domain-0", "domain-1"],
+            source_cid="domain-0", destination_cid="domain-1",
+            created_ns=self.NOW_NS,
+        )
+        manager.local_proposals[flow] = source
+        source_key = (
+            f"flowpredictor/agent-proposal/{agent_flow_hash(flow)}/2/domain-0"
+        )
+        destination_key = (
+            f"flowpredictor/agent-proposal/{agent_flow_hash(flow)}/2/domain-1"
+        )
+        self.etcd.put(source_key, json.dumps(source))
+        self.etcd.put(destination_key, json.dumps(destination))
+        globals_dict = self.manager_class._evaluate_negotiations.__globals__
+        original_mode = globals_dict["AGENTIC_MODE"]
+        globals_dict["AGENTIC_MODE"] = "authority-dry-run"
+        try:
+            manager._evaluate_negotiations()
+        finally:
+            globals_dict["AGENTIC_MODE"] = original_mode
+
+        decision = manager.decisions[flow]
+        self.assertTrue(decision["authoritative"])
+        self.assertFalse(decision["actuation_enabled"])
+        self.assertTrue(decision["authority"]["authorized"])
+        self.assertTrue(decision["authority"]["claim"]["won"])
+        self.assertTrue(decision["execution"]["would_execute"])
+        self.assertFalse(decision["execution"]["attempted"])
+        self.assertFalse(decision["execution"]["executed"])
+        self.assertEqual(manager.authorizations, 1)
+        self.assertEqual(manager.claims_won, 1)
 
     def test_expired_proposal_does_not_delete_new_dirty_evidence(self):
         manager = self.bare_manager()
