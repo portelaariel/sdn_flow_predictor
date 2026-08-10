@@ -1,4 +1,6 @@
 #!/usr/bin/python3
+import os
+
 from mininet.net import Mininet
 from mininet.node import RemoteController, OVSSwitch
 from mininet.cli import CLI
@@ -15,9 +17,14 @@ def build_network(c, s):
 
     # Controllers
     controllers = []
+    published_controller_host = os.getenv("MININET_CONTROLLER_HOST", "").strip()
     for i in range(c):
         cid = 'c%d' % i
-        ip = '192.168.%d.10' % (10 + i)
+        # Containers publish one OpenFlow port per domain on the host.  Tests
+        # may explicitly use that stable host route when direct access to a
+        # Docker bridge is filtered; the historical container-IP route remains
+        # the default for interactive use.
+        ip = published_controller_host or '192.168.%d.10' % (10 + i)
         port = 6633 + i
         ctrl = RemoteController(cid, ip=ip, port=port)
         net.addController(ctrl)
@@ -72,7 +79,6 @@ def customTopology(c, s):
 
 if __name__ == '__main__':
     setLogLevel('info')
-    import os
     c = int(os.getenv('CSETS', '1'))
     s = int(os.getenv('SPER', '1'))
     customTopology(c, s)

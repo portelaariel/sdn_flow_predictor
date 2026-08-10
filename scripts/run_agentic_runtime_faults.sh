@@ -154,6 +154,17 @@ wait_http() {
   return 1
 }
 
+wait_tcp() {
+  local host="$1" port="$2" tries="${3:-30}"
+  for ((attempt=1; attempt<=tries; attempt++)); do
+    if (echo > /dev/tcp/"$host"/"$port") >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 wait_gate() {
   local ready="$1" pid="$2" timeout_s="$3"
   local deadline=$((SECONDS + timeout_s))
@@ -189,6 +200,27 @@ if [[ "$BOOTSTRAP_ENV" == "true" ]]; then
 else
   echo "[runtime-fault] reutilizando ambiente SDN existente"
 fi
+
+# O setup considera o HTTP suficiente e seus checks são best-effort. Para o
+# Mininet, porém, o listener OpenFlow é obrigatório. Usamos as portas publicadas
+# no host para não depender de uma rota direta host -> bridge Docker, que pode
+# ser bloqueada por firewall mesmo quando os containers estão saudáveis.
+echo "[runtime-fault] validando listeners OpenFlow publicados"
+for ((i=0; i<CSETS; i++)); do
+  controller_port=$((CTRL_OF_PORT_BASE + i))
+  controller_api_port=$((CTRL_API_PORT_BASE + i))
+  if ! wait_tcp 127.0.0.1 "$controller_port" 30; then
+    sudo docker logs --tail 120 "ryu-core-${i}" \
+      > "$OUTDIR/ryu-core-${i}-openflow-preflight.log" 2>&1 || true
+    echo "Ryu do domínio $i não escuta OpenFlow em 127.0.0.1:${controller_port}" >&2
+    echo "consulte $OUTDIR/ryu-core-${i}-openflow-preflight.log" >&2
+    exit 1
+  fi
+  wait_http "http://127.0.0.1:${controller_api_port}/stats/switches" 30 || {
+    echo "API Ryu indisponível na porta ${controller_api_port}" >&2
+    exit 1
+  }
+done
 
 PREDICTOR_OFFLINE_MODEL="$MODEL_PATH" \
 PREDICTOR_OFFLINE_MODEL_REQUIRED=true \
@@ -247,7 +279,7 @@ run_episode() {
   ACTIVE_GATE_DIR="$gate"
 
   set +e
-  sudo env CSETS="$CSETS" SPER="$SPER" \
+  sudo env CSETS="$CSETS" SPER="$SPER" MININET_CONTROLLER_HOST=127.0.0.1 \
     python3 "$PROJECT_ROOT/experiments/run_mininet_workload.py" \
     --csets "$CSETS" \
     --sper "$SPER" \
