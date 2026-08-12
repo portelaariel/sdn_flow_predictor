@@ -170,6 +170,29 @@ def evaluate(
     baseline = manifest.get("baseline") or {}
     runtime = manifest.get("runtime") or {}
     execution = manifest.get("execution") or {}
+    episode_definition = design.get("mcda_episode_definition") or {}
+    try:
+        frozen_episode_definition = {
+            "name": str(episode_definition.get("name") or ""),
+            "lookback_ms": float(episode_definition.get("lookback_ms", 0)),
+            "max_preceding_windows": int(
+                episode_definition.get("max_preceding_windows", -1)
+            ),
+            "future_convergence_ms": float(
+                episode_definition.get("future_convergence_ms", 0)
+            ),
+        }
+    except (TypeError, ValueError):
+        frozen_episode_definition = {
+            "name": "", "lookback_ms": 0.0,
+            "max_preceding_windows": -1, "future_convergence_ms": 0.0,
+        }
+    episode_definition_valid = (
+        frozen_episode_definition["name"] == "bounded-episode-window-v2"
+        and frozen_episode_definition["lookback_ms"] == 2000.0
+        and frozen_episode_definition["max_preceding_windows"] == 1
+        and frozen_episode_definition["future_convergence_ms"] == 1000.0
+    )
     try:
         repetitions_per_flow = int(design.get("repetitions_per_flow", 3))
         expected_flows = int(design.get("distinct_flows", 3))
@@ -238,6 +261,13 @@ def evaluate(
         pilot_aggregate.get(name) is True
         for name in ("operational_ready", "comparative_ready", "campaign_ready")
     )
+    pilot_episode_definition = pilot.get("mcda_episode_definition") or {}
+    campaign_episode_definition = (
+        campaign.get("mcda_episode_definition") or {}
+    )
+    campaign_manifest_episode_definition = (
+        campaign_manifest.get("mcda_episode_definition") or {}
+    )
     baseline_model = str(baseline.get("model_sha256") or "")
     runtime_model = str(runtime.get("model_sha256") or "")
     runtime_commit = str(runtime.get("git_commit") or "")
@@ -246,17 +276,30 @@ def evaluate(
 
     checks = {
         "manifest_valid": (
-            manifest.get("mode") == "agentic-live-statistical-replication"
+            manifest.get("schema_version") == 2
+            and manifest.get("mode") == "agentic-live-statistical-replication"
             and repetitions_per_flow >= 3
             and expected_flows == 3
             and expected_per_scenario == repetitions_per_flow * expected_flows
             and bootstrap_resamples >= 100
+            and episode_definition_valid
         ),
         "pilot_report_present": bool(pilot),
         "pilot_campaign_ready": pilot_ready,
+        "pilot_episode_definition_matches": (
+            pilot.get("schema_version") == 2
+            and pilot_episode_definition == frozen_episode_definition
+        ),
         "campaign_report_present": bool(campaign),
         "campaign_process_succeeded": execution.get("campaign_exit_code") == 0,
         "campaign_ready": campaign_aggregate.get("campaign_ready") is True,
+        "campaign_episode_definition_matches": (
+            campaign.get("schema_version") == 2
+            and campaign_manifest.get("schema_version") == 2
+            and campaign_episode_definition == frozen_episode_definition
+            and campaign_manifest_episode_definition
+            == frozen_episode_definition
+        ),
         "operational_ready": campaign_aggregate.get("operational_ready") is True,
         "comparative_ready": campaign_aggregate.get("comparative_ready") is True,
         "expected_case_count": len(rows) == expected_per_scenario * 2,
@@ -300,6 +343,7 @@ def evaluate(
         "mcda_consensus_latency_ms",
         "agentic_consensus_latency_ms",
         "mcda_max_convergence_latency_ms",
+        "mcda_max_early_lead_ms",
     )
     latencies = {
         field: distribution(
@@ -335,7 +379,7 @@ def evaluate(
     tp, tn = classifications["TP"], classifications["TN"]
     fp, fn = classifications["FP"], classifications["FN"]
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "mode": "agentic-live-statistical-replication",
         "root": str(root),
@@ -370,6 +414,11 @@ def evaluate(
                 (campaign.get("metrics") or {}).get(
                     "mcda_bounded_convergence_rate"
                 )
+            ),
+            "mcda_convergence_direction_distribution": (
+                (campaign.get("metrics") or {}).get(
+                    "mcda_convergence_direction_distribution"
+                ) or {}
             ),
             "winner_distribution": (
                 (campaign.get("metrics") or {}).get("winner_distribution") or {}
@@ -432,6 +481,10 @@ def markdown(report: Dict[str, Any]) -> str:
             f"{metrics['agent_to_mcda_exact_domain_rate']} "
             "MCDA-convergência="
             f"{metrics['mcda_bounded_convergence_rate']}"
+        ),
+        (
+            "ordem-MCDA="
+            f"{metrics['mcda_convergence_direction_distribution']}"
         ),
         (
             f"replication_ready={str(aggregate['replication_ready']).lower()} "
