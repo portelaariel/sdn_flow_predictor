@@ -700,11 +700,27 @@ Os dois mecanismos não são idênticos:
 - agentes produzem propostas locais, aplicam regras de compatibilidade e votam;
 - cada mecanismo tem seu próprio ciclo de avaliação.
 
-A comparação mede se `AGREED` e `MITIGATE` convergem para o mesmo episódio. Ela
-não é requisito de atuação no runtime. O avaliador exige, por padrão, mesma
-janela e convergência futura em até 1.000 ms. Uma decisão MCDA válida na janela
-anterior pode falhar nesse critério estrito, mesmo pertencendo ao mesmo ataque.
-Por isso relatórios separam segurança operacional de comparabilidade.
+A comparação exata mede se `AGREED` e `MITIGATE` coincidem no instante da
+autoridade. Ela não é requisito de atuação no runtime. Uma segunda métrica
+avalia convergência no mesmo episódio com a definição congelada
+`bounded-episode-window-v2`:
+
+- MCDA já em `MITIGATE` no instante da autoridade; ou
+- MCDA em `MITIGATE` até 2.000 ms antes, na mesma janela ou na janela
+  imediatamente precedente; ou
+- MCDA alcançando `MITIGATE` até 1.000 ms depois, com `window_id` sobreposto.
+
+O candidato precisa pertencer ao mesmo fluxo e ocorrer depois do gate oficial
+do ataque. Decisões antigas, duas ou mais janelas atrás, não são associadas ao
+episódio. O relatório registra `BEFORE_AUTHORITY`, `AT_AUTHORITY` ou
+`AFTER_AUTHORITY`, permitindo distinguir antecipação de atraso.
+
+Essa definição v2 surgiu após uma replicação exploratória revelar que o MCDA
+podia reconhecer o ataque na janela imediatamente anterior aos agentes e cair
+para `CORROBORATED` na seguinte. Por ter sido formulada após observar esse
+caso, ela não deve ser usada para reclassificar a replicação original como
+confirmatória. O código e os limites precisam ser congelados em commit e
+avaliados em uma campanha e replicação novas.
 
 ## Como a mitigação funciona
 
@@ -949,7 +965,9 @@ bash scripts/run_agentic_authority_live_replication.sh \
 
 Os flags `--allow-*` são confirmações explícitas porque esses comandos podem
 interromper tráfego. Os runners conferem commit Git, hash do modelo, árvore
-rastreada, gates anteriores e espaço livre.
+rastreada, gates anteriores e espaço livre. A replicação v2 também recusa uma
+campanha piloto que não tenha usado a mesma definição de episódio MCDA
+(lookback de 2.000 ms, uma janela precedente e tolerância futura de 1.000 ms).
 
 Campanhas longas devem ser executadas dentro de `tmux`:
 

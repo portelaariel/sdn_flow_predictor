@@ -29,6 +29,8 @@ Variáveis úteis:
   AGENTIC_LIVE_CAMPAIGN_ATTACK_RATES=50M,100M,150M
   AGENTIC_LIVE_CAMPAIGN_BUILD_IMAGE=true|false
   AGENTIC_LIVE_CAMPAIGN_MCDA_CONVERGENCE_WINDOW_MS=1000
+  AGENTIC_LIVE_CAMPAIGN_MCDA_EPISODE_LOOKBACK_MS=2000
+  AGENTIC_LIVE_CAMPAIGN_MCDA_MAX_PRECEDING_WINDOWS=1
   AGENTIC_LIVE_CAMPAIGN_RESULTS_ROOT=experiments/results
 EOF
 }
@@ -52,6 +54,8 @@ BUILD_IMAGE="${AGENTIC_LIVE_CAMPAIGN_BUILD_IMAGE:-true}"
 BASELINE_DURATION_S="${AGENTIC_LIVE_CAMPAIGN_BASELINE_DURATION_S:-12}"
 ATTACK_DURATION_S="${AGENTIC_LIVE_CAMPAIGN_ATTACK_DURATION_S:-20}"
 MCDA_CONVERGENCE_WINDOW_MS="${AGENTIC_LIVE_CAMPAIGN_MCDA_CONVERGENCE_WINDOW_MS:-1000}"
+MCDA_EPISODE_LOOKBACK_MS="${AGENTIC_LIVE_CAMPAIGN_MCDA_EPISODE_LOOKBACK_MS:-2000}"
+MCDA_MAX_PRECEDING_WINDOWS="${AGENTIC_LIVE_CAMPAIGN_MCDA_MAX_PRECEDING_WINDOWS:-1}"
 mkdir -p "$RESULTS_ROOT"
 
 for value in "$REPETITIONS" "$MIN_RUNS" "$MIN_FLOWS"; do
@@ -69,6 +73,22 @@ done
 if ! [[ "$MCDA_CONVERGENCE_WINDOW_MS" =~ ^[1-9][0-9]*$ ]] \
     || (( MCDA_CONVERGENCE_WINDOW_MS > 10000 )); then
   echo "janela de convergência MCDA deve estar entre 1 e 10000 ms" >&2
+  exit 2
+fi
+if ! [[ "$MCDA_EPISODE_LOOKBACK_MS" =~ ^[1-9][0-9]*$ ]] \
+    || (( MCDA_EPISODE_LOOKBACK_MS > 10000 )); then
+  echo "lookback do episódio MCDA deve estar entre 1 e 10000 ms" >&2
+  exit 2
+fi
+if ! [[ "$MCDA_MAX_PRECEDING_WINDOWS" =~ ^[0-9]+$ ]] \
+    || (( MCDA_MAX_PRECEDING_WINDOWS > 4 )); then
+  echo "janelas MCDA precedentes devem estar entre 0 e 4" >&2
+  exit 2
+fi
+if (( MCDA_CONVERGENCE_WINDOW_MS != 1000 \
+      || MCDA_EPISODE_LOOKBACK_MS != 2000 \
+      || MCDA_MAX_PRECEDING_WINDOWS != 1 )); then
+  echo "definição MCDA v2 congelada exige futuro=1000 ms, lookback=2000 ms e uma janela precedente" >&2
   exit 2
 fi
 if [[ "$BUILD_IMAGE" != "true" && "$BUILD_IMAGE" != "false" ]]; then
@@ -190,7 +210,9 @@ CAMPAIGN_ROOT="$CAMPAIGN_ROOT" CAMPAIGN_MIN_RUNS="$MIN_RUNS" \
 CAMPAIGN_MIN_FLOWS="$MIN_FLOWS" PROMOTION_REPORT="$PROMOTION_REPORT" \
 CANARY_REPORT="$CANARY_REPORT" PROMOTION_COMMIT="$PROMOTION_COMMIT" \
 PROMOTION_MODEL="$PROMOTION_MODEL" \
-MCDA_CONVERGENCE_WINDOW_MS="$MCDA_CONVERGENCE_WINDOW_MS" python3 - <<'PY'
+MCDA_CONVERGENCE_WINDOW_MS="$MCDA_CONVERGENCE_WINDOW_MS" \
+MCDA_EPISODE_LOOKBACK_MS="$MCDA_EPISODE_LOOKBACK_MS" \
+MCDA_MAX_PRECEDING_WINDOWS="$MCDA_MAX_PRECEDING_WINDOWS" python3 - <<'PY'
 import json
 import os
 from datetime import datetime, timezone
@@ -206,12 +228,22 @@ for line in (root / "campaign-plan.tsv").read_text(encoding="utf-8").splitlines(
         "baseline_rate": baseline, "attack_rate": attack,
     })
 payload = {
-    "schema_version": 1,
+    "schema_version": 2,
     "created_at": datetime.now(timezone.utc).isoformat(),
     "mode": "authority-live-multiflow-campaign",
     "mcda_convergence_window_ms": int(
         os.environ["MCDA_CONVERGENCE_WINDOW_MS"]
     ),
+    "mcda_episode_definition": {
+        "name": "bounded-episode-window-v2",
+        "lookback_ms": int(os.environ["MCDA_EPISODE_LOOKBACK_MS"]),
+        "max_preceding_windows": int(
+            os.environ["MCDA_MAX_PRECEDING_WINDOWS"]
+        ),
+        "future_convergence_ms": int(
+            os.environ["MCDA_CONVERGENCE_WINDOW_MS"]
+        ),
+    },
     "minimums": {
         "ddos": int(os.environ["CAMPAIGN_MIN_RUNS"]),
         "benign": int(os.environ["CAMPAIGN_MIN_RUNS"]),
@@ -278,6 +310,8 @@ while IFS=$'\t' read -r case_id pair_id scenario source_host destination_host \
     python3 "$PROJECT_ROOT/experiments/evaluate_agentic_live_run.py" \
       "$run_dir" --output "$case_root/agentic-live-summary.json" \
       --mcda-convergence-window-ms "$MCDA_CONVERGENCE_WINDOW_MS" \
+      --mcda-episode-lookback-ms "$MCDA_EPISODE_LOOKBACK_MS" \
+      --mcda-max-preceding-windows "$MCDA_MAX_PRECEDING_WINDOWS" \
       2>&1 | tee "$case_root/live-evaluator.log"
     evaluator_status="${PIPESTATUS[0]}"
     set -e

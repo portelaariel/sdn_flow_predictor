@@ -625,6 +625,66 @@ class BenchmarkToolTests(unittest.TestCase):
                 lagged["mcda_convergence"]["domain-0"]["latency_ms"], 500.0
             )
 
+            # A definição v2 também reconhece um MITIGATE anterior, mas
+            # somente dentro do lookback e na janela imediatamente anterior.
+            early = json.loads(json.dumps(rows[0]))
+            early["sampled_ns"] = attack_ns + 550_000_000
+            early["collaboration"]["decisions"] = [{
+                "flow": flow,
+                "decision": "MITIGATE",
+                "evaluated_ns": attack_ns + 100_000_000,
+                "window_ids": [1],
+                "claim": None,
+                "mitigation": {
+                    "attempted": False,
+                    "executed": False,
+                    "owner": "agentic",
+                },
+            }]
+            (run_dir / "timeline.ndjson").write_text(
+                "".join(json.dumps(item) + "\n" for item in rows + [early]),
+                encoding="utf-8",
+            )
+            anticipated = evaluate_agentic_live_run(run_dir)
+            domain_0 = anticipated["mcda_convergence"]["domain-0"]
+            self.assertTrue(anticipated["mcda_converged_within_bound"])
+            self.assertEqual(domain_0["direction"], "BEFORE_AUTHORITY")
+            self.assertEqual(domain_0["window_relation"], "PRECEDING")
+            self.assertEqual(domain_0["preceding_window_distance"], 1)
+            self.assertEqual(domain_0["offset_ms"], -400.0)
+            self.assertEqual(domain_0["latency_ms"], 0.0)
+            self.assertEqual(domain_0["lead_ms"], 400.0)
+
+            outside_lookback = evaluate_agentic_live_run(
+                run_dir, mcda_episode_lookback_ms=200.0
+            )
+            self.assertFalse(
+                outside_lookback["mcda_convergence"]["domain-0"]["converged"]
+            )
+
+            early["collaboration"]["decisions"][0]["window_ids"] = [0]
+            (run_dir / "timeline.ndjson").write_text(
+                "".join(json.dumps(item) + "\n" for item in rows + [early]),
+                encoding="utf-8",
+            )
+            too_many_windows = evaluate_agentic_live_run(run_dir)
+            self.assertFalse(
+                too_many_windows["mcda_convergence"]["domain-0"]["converged"]
+            )
+
+            early["collaboration"]["decisions"][0].update({
+                "evaluated_ns": attack_ns - 100_000_000,
+                "window_ids": [1],
+            })
+            (run_dir / "timeline.ndjson").write_text(
+                "".join(json.dumps(item) + "\n" for item in rows + [early]),
+                encoding="utf-8",
+            )
+            before_attack_gate = evaluate_agentic_live_run(run_dir)
+            self.assertFalse(
+                before_attack_gate["mcda_convergence"]["domain-0"]["converged"]
+            )
+
             rows[0]["collaboration"]["decisions"][0]["claim"] = {
                 "won": True,
             }
@@ -641,8 +701,15 @@ class BenchmarkToolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest = {
+                "schema_version": 2,
                 "minimums": {"ddos": 1, "benign": 1, "distinct_flows": 1},
                 "mcda_convergence_window_ms": 1000,
+                "mcda_episode_definition": {
+                    "name": "bounded-episode-window-v2",
+                    "lookback_ms": 2000.0,
+                    "max_preceding_windows": 1,
+                    "future_convergence_ms": 1000.0,
+                },
                 "prerequisites": {
                     "promotion_ready": True,
                     "canary_ready": True,
@@ -660,6 +727,7 @@ class BenchmarkToolTests(unittest.TestCase):
                 json.dumps(manifest), encoding="utf-8"
             )
             common = {
+                "schema_version": 2,
                 "flow": flow,
                 "active_domains": ["domain-0", "domain-1"],
                 "git_commit": "commit-a",
@@ -674,7 +742,16 @@ class BenchmarkToolTests(unittest.TestCase):
                 "agentic_mcda_comparisons": {},
                 "mcda_converged_within_bound": None,
                 "mcda_max_convergence_latency_ms": None,
+                "mcda_max_early_lead_ms": None,
                 "mcda_convergence_window_ms": 1000.0,
+                "mcda_episode_definition": {
+                    "name": "bounded-episode-window-v2",
+                    "lookback_ms": 2000.0,
+                    "max_preceding_windows": 1,
+                    "future_convergence_ms": 1000.0,
+                },
+                "mcda_convergence": {},
+                "mcda_convergence_directions": {},
                 "checks": {},
                 "aggregate": {"safe": True},
             }
@@ -706,6 +783,17 @@ class BenchmarkToolTests(unittest.TestCase):
                 },
                 "mcda_converged_within_bound": True,
                 "mcda_max_convergence_latency_ms": 588.775,
+                "mcda_max_early_lead_ms": 300.0,
+                "mcda_convergence": {
+                    "domain-0": {"direction": "BEFORE_AUTHORITY"},
+                    "domain-1": {"direction": "AT_AUTHORITY"},
+                },
+                "mcda_convergence_directions": {
+                    "BEFORE_AUTHORITY": 1,
+                    "AT_AUTHORITY": 1,
+                    "AFTER_AUTHORITY": 0,
+                    "NOT_OBSERVED": 0,
+                },
             }
             for case_id, payload in (("01-benign", benign), ("01-ddos", ddos)):
                 case_dir = root / case_id
@@ -733,8 +821,27 @@ class BenchmarkToolTests(unittest.TestCase):
             self.assertEqual(
                 report["metrics"]["mcda_bounded_convergence_rate"], 1.0
             )
+            self.assertEqual(
+                report["metrics"]["mcda_convergence_direction_distribution"],
+                {"AT_AUTHORITY": 1, "BEFORE_AUTHORITY": 1},
+            )
             self.assertTrue(report["aggregate"]["operational_ready"])
             self.assertTrue(report["aggregate"]["comparative_ready"])
+
+            ddos["mcda_episode_definition"]["lookback_ms"] = 1000.0
+            (root / "01-ddos" / "agentic-live-summary.json").write_text(
+                json.dumps(ddos), encoding="utf-8"
+            )
+            changed_definition = evaluate_agentic_live_campaign(root)
+            self.assertTrue(changed_definition["aggregate"]["operational_ready"])
+            self.assertFalse(changed_definition["aggregate"]["comparative_ready"])
+            self.assertFalse(
+                changed_definition["checks"]["single_mcda_episode_definition"]
+            )
+            ddos["mcda_episode_definition"]["lookback_ms"] = 2000.0
+            (root / "01-ddos" / "agentic-live-summary.json").write_text(
+                json.dumps(ddos), encoding="utf-8"
+            )
 
             benign["execution_domains"] = ["domain-0"]
             (root / "01-benign" / "agentic-live-summary.json").write_text(
@@ -754,6 +861,13 @@ class BenchmarkToolTests(unittest.TestCase):
             root = Path(tmp)
             pilot_path = root / "pilot.json"
             pilot_path.write_text(json.dumps({
+                "schema_version": 2,
+                "mcda_episode_definition": {
+                    "name": "bounded-episode-window-v2",
+                    "lookback_ms": 2000.0,
+                    "max_preceding_windows": 1,
+                    "future_convergence_ms": 1000.0,
+                },
                 "aggregate": {
                     "campaign_ready": True,
                     "operational_ready": True,
@@ -761,6 +875,7 @@ class BenchmarkToolTests(unittest.TestCase):
                 }
             }), encoding="utf-8")
             (root / "replication-manifest.json").write_text(json.dumps({
+                "schema_version": 2,
                 "mode": "agentic-live-statistical-replication",
                 "design": {
                     "runs_per_scenario": 9,
@@ -768,6 +883,12 @@ class BenchmarkToolTests(unittest.TestCase):
                     "distinct_flows": 3,
                     "bootstrap_resamples": 100,
                     "bootstrap_seed": 7,
+                    "mcda_episode_definition": {
+                        "name": "bounded-episode-window-v2",
+                        "lookback_ms": 2000.0,
+                        "max_preceding_windows": 1,
+                        "future_convergence_ms": 1000.0,
+                    },
                 },
                 "baseline": {
                     "pilot_report": str(pilot_path),
@@ -818,9 +939,25 @@ class BenchmarkToolTests(unittest.TestCase):
                             "mcda_max_convergence_latency_ms": 300 + repetition if is_attack else None,
                         })
             (campaign_root / "campaign-manifest.json").write_text(
-                json.dumps({"cases": manifest_cases}), encoding="utf-8"
+                json.dumps({
+                    "schema_version": 2,
+                    "mcda_episode_definition": {
+                        "name": "bounded-episode-window-v2",
+                        "lookback_ms": 2000.0,
+                        "max_preceding_windows": 1,
+                        "future_convergence_ms": 1000.0,
+                    },
+                    "cases": manifest_cases,
+                }), encoding="utf-8"
             )
             campaign_payload = {
+                "schema_version": 2,
+                "mcda_episode_definition": {
+                    "name": "bounded-episode-window-v2",
+                    "lookback_ms": 2000.0,
+                    "max_preceding_windows": 1,
+                    "future_convergence_ms": 1000.0,
+                },
                 "cases": rows,
                 "aggregate": {
                     "campaign_ready": True,
@@ -831,6 +968,11 @@ class BenchmarkToolTests(unittest.TestCase):
                     "agent_to_mcda_agreement_rate": 0.888889,
                     "agent_to_mcda_domain_agreement_rate": 0.944444,
                     "mcda_bounded_convergence_rate": 1.0,
+                    "mcda_convergence_direction_distribution": {
+                        "BEFORE_AUTHORITY": 6,
+                        "AT_AUTHORITY": 6,
+                        "AFTER_AUTHORITY": 6,
+                    },
                     "winner_distribution": {"domain-0": 5, "domain-1": 4},
                 },
             }
@@ -849,6 +991,19 @@ class BenchmarkToolTests(unittest.TestCase):
                 report["metrics"]["latencies"]["detection_latency_ms"]["n"],
                 9,
             )
+
+            campaign_payload["mcda_episode_definition"]["lookback_ms"] = 1000.0
+            (campaign_root / "campaign-summary.json").write_text(
+                json.dumps(campaign_payload), encoding="utf-8"
+            )
+            changed_protocol = evaluate_agentic_live_replication(
+                root, bootstrap_resamples=100, bootstrap_seed=7
+            )
+            self.assertFalse(changed_protocol["aggregate"]["replication_ready"])
+            self.assertFalse(
+                changed_protocol["checks"]["campaign_episode_definition_matches"]
+            )
+            campaign_payload["mcda_episode_definition"]["lookback_ms"] = 2000.0
 
             rows.pop()
             (campaign_root / "campaign-summary.json").write_text(json.dumps({

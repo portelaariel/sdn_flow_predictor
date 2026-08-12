@@ -5,7 +5,10 @@ import argparse
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
+
+MCDA_EPISODE_DEFINITION = "bounded-episode-window-v2"
 
 
 def read_json(path: Path, default: Any = None) -> Any:
@@ -38,8 +41,44 @@ def timeline(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
+def window_ids(payload: Dict[str, Any]) -> set[int]:
+    """Return valid, non-negative window identifiers from a decision."""
+    values = set()
+    for value in payload.get("window_ids", []):
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed >= 0:
+            values.add(parsed)
+    return values
+
+
+def preceding_window_distance(
+    candidate_windows: set[int], agent_windows: set[int]
+) -> Optional[int]:
+    """Measure how many windows an earlier MCDA decision precedes the agent.
+
+    Zero means that both decisions share at least one window. A positive value
+    is only returned when every candidate window is before every agent window;
+    mixed or future identities are rejected instead of being coerced into the
+    same episode.
+    """
+    if not candidate_windows or not agent_windows:
+        return None
+    if candidate_windows & agent_windows:
+        return 0
+    candidate_last = max(candidate_windows)
+    agent_first = min(agent_windows)
+    if candidate_last >= agent_first:
+        return None
+    return agent_first - candidate_last
+
+
 def evaluate(
-    run_dir: Path, mcda_convergence_window_ms: float = 1000.0
+    run_dir: Path, mcda_convergence_window_ms: float = 1000.0,
+    mcda_episode_lookback_ms: float = 2000.0,
+    mcda_max_preceding_windows: int = 1,
 ) -> Dict[str, Any]:
     metadata = read_json(run_dir / "metadata.json", {}) or {}
     workload = read_json(run_dir / "workload_status.json", {}) or {}
@@ -146,6 +185,8 @@ def evaluate(
             }
 
     convergence_window_ns = max(1, int(mcda_convergence_window_ms * 1e6))
+    episode_lookback_ns = max(1, int(mcda_episode_lookback_ms * 1e6))
+    max_preceding_windows = max(0, int(mcda_max_preceding_windows))
     mcda_convergence = {}
     for event in authorized:
         domain = str(event.get("observed_by") or "")
@@ -160,11 +201,47 @@ def evaluate(
             or event.get("evaluated_ns")
             or 0
         )
-        agent_windows = {
-            int(value) for value in event.get("window_ids", [])
-        }
+        agent_windows = window_ids(event)
         converged_ns = authority_ns if comparison["matches"] else None
         converged_decision = comparison.get("mcda") if converged_ns else None
+        direction = "AT_AUTHORITY" if converged_ns is not None else "NOT_OBSERVED"
+        window_relation = "OVERLAP" if converged_ns is not None else None
+        preceding_distance = 0 if converged_ns is not None else None
+
+        # The exploratory replication showed a legitimate ordering not covered
+        # by v1: MCDA reached MITIGATE in the immediately preceding polling
+        # window, while the agents completed authority in the next window. A
+        # bounded lookback records that lead without accepting arbitrary old
+        # decisions. The attack gate, canonical flow, time bound and adjacent
+        # window identity must all agree.
+        if converged_ns is None and authority_ns and agent_windows:
+            early_candidates = []
+            for candidate in mcda_events.get(domain, {}).values():
+                candidate_ns = int(candidate.get("evaluated_ns", 0) or 0)
+                distance = preceding_window_distance(
+                    window_ids(candidate), agent_windows
+                )
+                if (
+                    candidate.get("decision") == "MITIGATE"
+                    and max(start_ns, authority_ns - episode_lookback_ns)
+                    <= candidate_ns <= authority_ns
+                    and distance is not None
+                    and distance <= max_preceding_windows
+                ):
+                    early_candidates.append((candidate_ns, distance, candidate))
+            if early_candidates:
+                converged_ns, preceding_distance, converged_decision = max(
+                    early_candidates, key=lambda item: item[0]
+                )
+                direction = (
+                    "AT_AUTHORITY"
+                    if converged_ns == authority_ns
+                    else "BEFORE_AUTHORITY"
+                )
+                window_relation = (
+                    "OVERLAP" if preceding_distance == 0 else "PRECEDING"
+                )
+
         if converged_ns is None and authority_ns and agent_windows:
             candidates = [
                 candidate
@@ -172,9 +249,7 @@ def evaluate(
                 if candidate.get("decision") == "MITIGATE"
                 and authority_ns <= int(candidate.get("evaluated_ns", 0) or 0)
                 <= authority_ns + convergence_window_ns
-                and agent_windows & {
-                    int(value) for value in candidate.get("window_ids", [])
-                }
+                and agent_windows & window_ids(candidate)
             ]
             if candidates:
                 converged_decision = min(
@@ -182,15 +257,32 @@ def evaluate(
                     key=lambda item: int(item.get("evaluated_ns", 0) or 0),
                 )
                 converged_ns = int(converged_decision["evaluated_ns"])
+                direction = (
+                    "AT_AUTHORITY"
+                    if converged_ns == authority_ns
+                    else "AFTER_AUTHORITY"
+                )
+                window_relation = "OVERLAP"
+                preceding_distance = 0
+        offset_ms = (
+            round((converged_ns - authority_ns) / 1e6, 3)
+            if converged_ns is not None else None
+        )
         mcda_convergence[domain] = {
             "matches_at_authority": comparison["matches"],
             "authority_ns": authority_ns,
             "window_ids": sorted(agent_windows),
             "converged": converged_ns is not None,
             "converged_ns": converged_ns,
+            "direction": direction,
+            "window_relation": window_relation,
+            "preceding_window_distance": preceding_distance,
+            "offset_ms": offset_ms,
             "latency_ms": (
-                round((converged_ns - authority_ns) / 1e6, 3)
-                if converged_ns is not None else None
+                max(0.0, offset_ms) if offset_ms is not None else None
+            ),
+            "lead_ms": (
+                max(0.0, -offset_ms) if offset_ms is not None else None
             ),
             "mcda": converged_decision,
         }
@@ -270,7 +362,7 @@ def evaluate(
         observational_checks = {}
     checks = {**common, **scenario_checks}
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "mode": "authority-live-canary",
         "run": run_dir.name,
@@ -296,6 +388,12 @@ def evaluate(
         "mcda_convergence_window_ms": round(
             convergence_window_ns / 1e6, 3
         ),
+        "mcda_episode_definition": {
+            "name": MCDA_EPISODE_DEFINITION,
+            "lookback_ms": round(episode_lookback_ns / 1e6, 3),
+            "max_preceding_windows": max_preceding_windows,
+            "future_convergence_ms": round(convergence_window_ns / 1e6, 3),
+        },
         "mcda_converged_within_bound": mcda_converged_within_bound,
         "mcda_convergence": {
             domain: mcda_convergence[domain]
@@ -308,6 +406,23 @@ def evaluate(
             ),
             default=None,
         ),
+        "mcda_max_early_lead_ms": max(
+            (
+                item["lead_ms"] for item in mcda_convergence.values()
+                if isinstance(item.get("lead_ms"), (int, float))
+            ),
+            default=None,
+        ),
+        "mcda_convergence_directions": {
+            direction: sum(
+                item.get("direction") == direction
+                for item in mcda_convergence.values()
+            )
+            for direction in (
+                "BEFORE_AUTHORITY", "AT_AUTHORITY", "AFTER_AUTHORITY",
+                "NOT_OBSERVED",
+            )
+        },
         "active_domains": sorted(active_domains),
         "authorized_domains": sorted(str(value) for value in authorized_domains),
         "winner_domains": sorted(str(value) for value in winner_domains),
@@ -334,10 +449,25 @@ def main() -> int:
     parser.add_argument(
         "--mcda-convergence-window-ms", type=float, default=1000.0
     )
+    parser.add_argument(
+        "--mcda-episode-lookback-ms", type=float, default=2000.0
+    )
+    parser.add_argument(
+        "--mcda-max-preceding-windows", type=int, default=1
+    )
     args = parser.parse_args()
     if args.mcda_convergence_window_ms <= 0:
         parser.error("--mcda-convergence-window-ms deve ser positivo")
-    report = evaluate(args.run_dir, args.mcda_convergence_window_ms)
+    if args.mcda_episode_lookback_ms <= 0:
+        parser.error("--mcda-episode-lookback-ms deve ser positivo")
+    if args.mcda_max_preceding_windows < 0:
+        parser.error("--mcda-max-preceding-windows deve ser não negativo")
+    report = evaluate(
+        args.run_dir,
+        args.mcda_convergence_window_ms,
+        args.mcda_episode_lookback_ms,
+        args.mcda_max_preceding_windows,
+    )
     output = args.output or (args.run_dir / "agentic-live-summary.json")
     output.write_text(
         json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
@@ -354,6 +484,7 @@ def main() -> int:
         "drop_rules": len(report["drop_rule_files"]),
         "agentic_matches_mcda": report["agentic_matches_mcda"],
         "mcda_converged_within_bound": report["mcda_converged_within_bound"],
+        "mcda_convergence_directions": report["mcda_convergence_directions"],
         "aggregate": report["aggregate"],
     }, indent=2, sort_keys=True, ensure_ascii=False))
     return 0 if report["aggregate"]["safe"] else 1

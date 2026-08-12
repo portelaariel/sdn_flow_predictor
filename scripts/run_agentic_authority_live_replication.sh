@@ -28,6 +28,8 @@ Variáveis úteis (definidas antes do início e gravadas no manifesto):
   AGENTIC_REPLICATION_ATTACK_DURATION_S=20
   AGENTIC_REPLICATION_BOOTSTRAP_RESAMPLES=5000
   AGENTIC_REPLICATION_MCDA_CONVERGENCE_WINDOW_MS=1000
+  AGENTIC_REPLICATION_MCDA_EPISODE_LOOKBACK_MS=2000
+  AGENTIC_REPLICATION_MCDA_MAX_PRECEDING_WINDOWS=1
   AGENTIC_REPLICATION_RESULTS_ROOT=experiments/results
   AGENTIC_REPLICATION_PILOT_REPORT=/caminho/campaign-summary.json
 EOF
@@ -52,6 +54,8 @@ BASELINE_DURATION_S="${AGENTIC_REPLICATION_BASELINE_DURATION_S:-12}"
 ATTACK_DURATION_S="${AGENTIC_REPLICATION_ATTACK_DURATION_S:-20}"
 BOOTSTRAP_RESAMPLES="${AGENTIC_REPLICATION_BOOTSTRAP_RESAMPLES:-5000}"
 MCDA_CONVERGENCE_WINDOW_MS="${AGENTIC_REPLICATION_MCDA_CONVERGENCE_WINDOW_MS:-1000}"
+MCDA_EPISODE_LOOKBACK_MS="${AGENTIC_REPLICATION_MCDA_EPISODE_LOOKBACK_MS:-2000}"
+MCDA_MAX_PRECEDING_WINDOWS="${AGENTIC_REPLICATION_MCDA_MAX_PRECEDING_WINDOWS:-1}"
 
 if ! [[ "$REPETITIONS" =~ ^[1-9][0-9]*$ ]] \
     || (( REPETITIONS < 9 || REPETITIONS > 18 || REPETITIONS % 3 != 0 )); then
@@ -59,7 +63,8 @@ if ! [[ "$REPETITIONS" =~ ^[1-9][0-9]*$ ]] \
   exit 2
 fi
 for value in "$MIN_FREE_MB" "$BASELINE_DURATION_S" "$ATTACK_DURATION_S" \
-    "$BOOTSTRAP_RESAMPLES" "$MCDA_CONVERGENCE_WINDOW_MS"; do
+    "$BOOTSTRAP_RESAMPLES" "$MCDA_CONVERGENCE_WINDOW_MS" \
+    "$MCDA_EPISODE_LOOKBACK_MS"; do
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
     echo "mínimos, durações, bootstrap e janela devem ser inteiros positivos" >&2
     exit 2
@@ -71,6 +76,21 @@ if (( BOOTSTRAP_RESAMPLES < 100 || BOOTSTRAP_RESAMPLES > 100000 )); then
 fi
 if (( MCDA_CONVERGENCE_WINDOW_MS > 10000 )); then
   echo "AGENTIC_REPLICATION_MCDA_CONVERGENCE_WINDOW_MS deve ser <= 10000" >&2
+  exit 2
+fi
+if (( MCDA_EPISODE_LOOKBACK_MS > 10000 )); then
+  echo "AGENTIC_REPLICATION_MCDA_EPISODE_LOOKBACK_MS deve ser <= 10000" >&2
+  exit 2
+fi
+if ! [[ "$MCDA_MAX_PRECEDING_WINDOWS" =~ ^[0-9]+$ ]] \
+    || (( MCDA_MAX_PRECEDING_WINDOWS > 4 )); then
+  echo "AGENTIC_REPLICATION_MCDA_MAX_PRECEDING_WINDOWS deve estar entre 0 e 4" >&2
+  exit 2
+fi
+if (( MCDA_CONVERGENCE_WINDOW_MS != 1000 \
+      || MCDA_EPISODE_LOOKBACK_MS != 2000 \
+      || MCDA_MAX_PRECEDING_WINDOWS != 1 )); then
+  echo "definição MCDA v2 congelada exige futuro=1000 ms, lookback=2000 ms e uma janela precedente" >&2
   exit 2
 fi
 if [[ "$BUILD_IMAGE" != "true" && "$BUILD_IMAGE" != "false" ]]; then
@@ -97,6 +117,20 @@ if [[ -z "$PILOT_REPORT" || ! -r "$PILOT_REPORT" ]] \
   exit 1
 fi
 PILOT_REPORT="$(cd "$(dirname "$PILOT_REPORT")" && pwd)/$(basename "$PILOT_REPORT")"
+if ! jq -e \
+    --arg name "bounded-episode-window-v2" \
+    --argjson future "$MCDA_CONVERGENCE_WINDOW_MS" \
+    --argjson lookback "$MCDA_EPISODE_LOOKBACK_MS" \
+    --argjson preceding "$MCDA_MAX_PRECEDING_WINDOWS" '
+      .schema_version == 2 and
+      .mcda_episode_definition.name == $name and
+      .mcda_episode_definition.future_convergence_ms == $future and
+      .mcda_episode_definition.lookback_ms == $lookback and
+      .mcda_episode_definition.max_preceding_windows == $preceding
+    ' "$PILOT_REPORT" >/dev/null; then
+  echo "campanha piloto não usa a definição MCDA v2 congelada" >&2
+  exit 1
+fi
 
 PILOT_COMMIT="$(jq -r '
   [.cases[].git_commit | select(. != null)] | unique |
@@ -180,7 +214,9 @@ REPETITIONS="$REPETITIONS" REPETITIONS_PER_FLOW="$REPETITIONS_PER_FLOW" \
 MIN_FREE_MB="$MIN_FREE_MB" AVAILABLE_MB="$AVAILABLE_MB" \
 BASELINE_DURATION_S="$BASELINE_DURATION_S" ATTACK_DURATION_S="$ATTACK_DURATION_S" \
 BOOTSTRAP_RESAMPLES="$BOOTSTRAP_RESAMPLES" \
-MCDA_CONVERGENCE_WINDOW_MS="$MCDA_CONVERGENCE_WINDOW_MS" python3 - <<'PY'
+MCDA_CONVERGENCE_WINDOW_MS="$MCDA_CONVERGENCE_WINDOW_MS" \
+MCDA_EPISODE_LOOKBACK_MS="$MCDA_EPISODE_LOOKBACK_MS" \
+MCDA_MAX_PRECEDING_WINDOWS="$MCDA_MAX_PRECEDING_WINDOWS" python3 - <<'PY'
 import json
 import os
 from datetime import datetime, timezone
@@ -188,7 +224,7 @@ from pathlib import Path
 
 root = Path(os.environ["REPLICATION_ROOT"])
 payload = {
-    "schema_version": 1,
+    "schema_version": 2,
     "created_at": datetime.now(timezone.utc).isoformat(),
     "mode": "agentic-live-statistical-replication",
     "design": {
@@ -209,6 +245,16 @@ payload = {
         "mcda_convergence_window_ms": int(
             os.environ["MCDA_CONVERGENCE_WINDOW_MS"]
         ),
+        "mcda_episode_definition": {
+            "name": "bounded-episode-window-v2",
+            "lookback_ms": int(os.environ["MCDA_EPISODE_LOOKBACK_MS"]),
+            "max_preceding_windows": int(
+                os.environ["MCDA_MAX_PRECEDING_WINDOWS"]
+            ),
+            "future_convergence_ms": int(
+                os.environ["MCDA_CONVERGENCE_WINDOW_MS"]
+            ),
+        },
         "bootstrap_resamples": int(os.environ["BOOTSTRAP_RESAMPLES"]),
         "bootstrap_seed": 20260810,
         "confidence_level": 0.95,
@@ -258,6 +304,8 @@ AGENTIC_LIVE_CAMPAIGN_BUILD_IMAGE="$BUILD_IMAGE" \
 AGENTIC_LIVE_CAMPAIGN_BASELINE_DURATION_S="$BASELINE_DURATION_S" \
 AGENTIC_LIVE_CAMPAIGN_ATTACK_DURATION_S="$ATTACK_DURATION_S" \
 AGENTIC_LIVE_CAMPAIGN_MCDA_CONVERGENCE_WINDOW_MS="$MCDA_CONVERGENCE_WINDOW_MS" \
+AGENTIC_LIVE_CAMPAIGN_MCDA_EPISODE_LOOKBACK_MS="$MCDA_EPISODE_LOOKBACK_MS" \
+AGENTIC_LIVE_CAMPAIGN_MCDA_MAX_PRECEDING_WINDOWS="$MCDA_MAX_PRECEDING_WINDOWS" \
 AGENTIC_LIVE_CAMPAIGN_PROMOTION_REPORT="$PROMOTION_REPORT" \
 AGENTIC_LIVE_CAMPAIGN_CANARY_REPORT="$CANARY_REPORT" \
 PREDICTOR_OFFLINE_MODEL="$MODEL_PATH" \

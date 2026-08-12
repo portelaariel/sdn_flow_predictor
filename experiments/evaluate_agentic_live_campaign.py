@@ -57,6 +57,31 @@ def evaluate(root: Path) -> Dict[str, Any]:
         )
     except (TypeError, ValueError):
         expected_convergence_window_ms = 0.0
+    episode_definition = manifest.get("mcda_episode_definition") or {}
+    try:
+        expected_episode_definition = {
+            "name": str(episode_definition.get("name") or ""),
+            "lookback_ms": float(episode_definition.get("lookback_ms", 0)),
+            "max_preceding_windows": int(
+                episode_definition.get("max_preceding_windows", -1)
+            ),
+            "future_convergence_ms": float(
+                episode_definition.get("future_convergence_ms", 0)
+            ),
+        }
+    except (TypeError, ValueError):
+        expected_episode_definition = {
+            "name": "", "lookback_ms": 0.0,
+            "max_preceding_windows": -1, "future_convergence_ms": 0.0,
+        }
+    episode_definition_valid = (
+        manifest.get("schema_version") == 2
+        and expected_episode_definition["name"] == "bounded-episode-window-v2"
+        and expected_episode_definition["lookback_ms"] == 2000.0
+        and expected_episode_definition["max_preceding_windows"] == 1
+        and expected_episode_definition["future_convergence_ms"] == 1000.0
+        and expected_convergence_window_ms == 1000.0
+    )
     if not isinstance(expected_cases, list):
         expected_cases = []
     if not isinstance(minimums, dict):
@@ -97,6 +122,7 @@ def evaluate(root: Path) -> Dict[str, Any]:
         }
         if isinstance(report, dict):
             row.update({
+                "report_schema_version": report.get("schema_version"),
                 "scenario": report.get("scenario"),
                 "flow": report.get("flow"),
                 "classification": report.get("classification"),
@@ -137,9 +163,20 @@ def evaluate(root: Path) -> Dict[str, Any]:
                 "mcda_max_convergence_latency_ms": report.get(
                     "mcda_max_convergence_latency_ms"
                 ),
+                "mcda_max_early_lead_ms": report.get(
+                    "mcda_max_early_lead_ms"
+                ),
+                "mcda_episode_definition": (
+                    report.get("mcda_episode_definition") or {}
+                ),
+                "mcda_convergence": report.get("mcda_convergence") or {},
+                "mcda_convergence_directions": (
+                    report.get("mcda_convergence_directions") or {}
+                ),
             })
         else:
             row.update({
+                "report_schema_version": None,
                 "scenario": None, "flow": None, "classification": "MISSING",
                 "safe": False, "failed_checks": ["live_summary_missing"],
                 "authorized_domains": [], "winner_domains": [],
@@ -154,6 +191,10 @@ def evaluate(root: Path) -> Dict[str, Any]:
                 "mcda_converged_within_bound": None,
                 "mcda_convergence_window_ms": None,
                 "mcda_max_convergence_latency_ms": None,
+                "mcda_max_early_lead_ms": None,
+                "mcda_episode_definition": {},
+                "mcda_convergence": {},
+                "mcda_convergence_directions": {},
             })
         row["identity_matches_manifest"] = (
             row["scenario"] == row["expected_scenario"]
@@ -198,13 +239,21 @@ def evaluate(root: Path) -> Dict[str, Any]:
         and bool(prerequisites.get("model_sha256"))
     )
     checks = {
-        "manifest_valid": bool(expected_cases) and len(expected_ids) == len(expected_cases),
+        "manifest_valid": (
+            manifest.get("schema_version") == 2
+            and bool(expected_cases)
+            and len(expected_ids) == len(expected_cases)
+        ),
         "prerequisites_valid": prerequisites_valid,
         "convergence_window_valid": expected_convergence_window_ms > 0,
+        "episode_definition_valid": episode_definition_valid,
         "minimums_valid": minimums_valid,
         "all_cases_reported": (
             len(rows) == len(expected_cases)
             and all(row["report_present"] for row in rows)
+        ),
+        "all_case_reports_v2": bool(rows) and all(
+            row["report_schema_version"] == 2 for row in rows
         ),
         "no_unexpected_reports": not unexpected,
         "all_case_gates_safe": bool(rows) and all(row["passed"] for row in rows),
@@ -244,6 +293,10 @@ def evaluate(root: Path) -> Dict[str, Any]:
             == expected_convergence_window_ms
             for row in ddos_rows
         ),
+        "single_mcda_episode_definition": bool(ddos_rows) and all(
+            row["mcda_episode_definition"] == expected_episode_definition
+            for row in ddos_rows
+        ),
         "one_flowblocker_request_per_attack": sum(
             row["flowblocker_requests"] for row in rows
         ) == len(ddos_rows),
@@ -258,12 +311,19 @@ def evaluate(root: Path) -> Dict[str, Any]:
             if isinstance(row.get(field), (int, float))
         ]
 
+    comparative_check_names = {
+        "all_mcda_observers_converged",
+        "convergence_window_valid",
+        "episode_definition_valid",
+        "single_mcda_convergence_window",
+        "single_mcda_episode_definition",
+    }
     operational_checks = {
         name: passed for name, passed in checks.items()
-        if name != "all_mcda_observers_converged"
+        if name not in comparative_check_names
     }
     operational_ready = all(operational_checks.values())
-    comparative_ready = checks["all_mcda_observers_converged"]
+    comparative_ready = all(checks[name] for name in comparative_check_names)
     campaign_ready = operational_ready and comparative_ready
     comparison_rows = [
         comparison
@@ -272,13 +332,24 @@ def evaluate(root: Path) -> Dict[str, Any]:
         if isinstance(comparison, dict)
         and isinstance(comparison.get("matches"), bool)
     ]
+    convergence_rows = [
+        convergence
+        for row in ddos_rows
+        for convergence in row["mcda_convergence"].values()
+        if isinstance(convergence, dict)
+    ]
+    direction_distribution = Counter(
+        str(item.get("direction") or "NOT_OBSERVED")
+        for item in convergence_rows
+    )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "mode": "authority-live-multiflow-campaign",
         "root": str(root),
         "prerequisites": prerequisites,
         "mcda_convergence_window_ms": expected_convergence_window_ms,
+        "mcda_episode_definition": expected_episode_definition,
         "checks": checks,
         "cases": rows,
         "unexpected_reports": unexpected,
@@ -301,6 +372,9 @@ def evaluate(root: Path) -> Dict[str, Any]:
                 ),
                 len(ddos_rows),
             ),
+            "mcda_convergence_direction_distribution": dict(sorted(
+                direction_distribution.items()
+            )),
             "detection_latency_ms": distribution(values("detection_latency_ms")),
             "mcda_consensus_latency_ms": distribution(
                 values("mcda_consensus_latency_ms")
@@ -310,6 +384,9 @@ def evaluate(root: Path) -> Dict[str, Any]:
             ),
             "mcda_convergence_latency_ms": distribution(
                 values("mcda_max_convergence_latency_ms")
+            ),
+            "mcda_early_lead_ms": distribution(
+                values("mcda_max_early_lead_ms")
             ),
             "ping_after_loss_percent": distribution(
                 values("ping_after_loss_percent")
@@ -332,10 +409,17 @@ def evaluate(root: Path) -> Dict[str, Any]:
 
 def markdown(report: Dict[str, Any]) -> str:
     lines = [
-        "| caso | cenário | fluxo | classe | gate | executor | requests | DROP | agente=MCDA@autoridade | MCDA convergiu |",
-        "| --- | --- | --- | --- | --- | --- | ---: | ---: | --- | --- |",
+        "| caso | cenário | fluxo | classe | gate | executor | requests | DROP | agente=MCDA@autoridade | MCDA convergiu | ordem MCDA |",
+        "| --- | --- | --- | --- | --- | --- | ---: | ---: | --- | --- | --- |",
     ]
     for row in report["cases"]:
+        directions = row.get("mcda_convergence_directions") or {}
+        order = (
+            f"antes={directions.get('BEFORE_AUTHORITY', 0)},"
+            f"junto={directions.get('AT_AUTHORITY', 0)},"
+            f"depois={directions.get('AFTER_AUTHORITY', 0)}"
+            if row["expected_scenario"] == "ddos" else "-"
+        )
         lines.append(
             f"| {row['case_id']} | {row['expected_scenario']} | "
             f"{row['expected_flow']} | {row['classification']} | "
@@ -343,7 +427,8 @@ def markdown(report: Dict[str, Any]) -> str:
             f"{','.join(row['execution_domains']) or '-'} | "
             f"{row['flowblocker_requests']} | {row['drop_rules']} | "
             f"{row['agentic_matches_mcda'] if row['expected_scenario'] == 'ddos' else '-'} | "
-            f"{row['mcda_converged_within_bound'] if row['expected_scenario'] == 'ddos' else '-'} |"
+            f"{row['mcda_converged_within_bound'] if row['expected_scenario'] == 'ddos' else '-'} | "
+            f"{order} |"
         )
     metrics, aggregate = report["metrics"], report["aggregate"]
     lines.extend([

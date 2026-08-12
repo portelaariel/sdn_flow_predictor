@@ -179,6 +179,10 @@ class RuntimeWiringTests(unittest.TestCase):
         self.assertIn("BENCHMARK_BOOTSTRAP_ENV=true", source)
         self.assertIn("agentic-live", source)
         self.assertIn("evaluate_agentic_live_campaign.py", source)
+        self.assertIn("bounded-episode-window-v2", source)
+        self.assertIn("MCDA_EPISODE_LOOKBACK_MS", source)
+        self.assertIn("MCDA_MAX_PRECEDING_WINDOWS", source)
+        self.assertIn("definição MCDA v2 congelada exige", source)
 
     def test_authority_live_replication_freezes_design_and_checks_preflight(self):
         source = self.authority_live_replication_source
@@ -193,6 +197,14 @@ class RuntimeWiringTests(unittest.TestCase):
         self.assertIn("AGENTIC_LIVE_CAMPAIGN_SOURCE_HOSTS=h1,h2,h3", source)
         self.assertIn("AGENTIC_LIVE_CAMPAIGN_ATTACK_RATES=50M,100M,150M", source)
         self.assertIn("evaluate_agentic_live_replication.py", source)
+        self.assertIn("bounded-episode-window-v2", source)
+        self.assertIn("definição MCDA v2 congelada exige", source)
+        self.assertIn(
+            "campanha piloto não usa a definição MCDA v2 congelada", source
+        )
+        self.assertIn(
+            "AGENTIC_LIVE_CAMPAIGN_MCDA_EPISODE_LOOKBACK_MS", source
+        )
 
 
 if __name__ == "__main__":
