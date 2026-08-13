@@ -1009,7 +1009,19 @@ jq '.checks | to_entries | map(select(.value != true))' \
 
 Um caso pode ser operacionalmente seguro e, mesmo assim, falhar na comparação
 temporal estrita com o MCDA. Consulte `operational_ready`, `comparative_ready`
-e `campaign_ready` separadamente.
+e `campaign_ready` separadamente. Na replicação estatística, o resumo mantém
+essa distinção em três campos:
+
+- `operational_replication_ready`: detecção, controles benignos, mitigação,
+  executor único e integridade do protocolo operacional foram confirmados;
+- `comparative_replication_ready`: além da integridade do experimento, todos
+  os observadores MCDA convergiram segundo a definição v2 congelada;
+- `joint_replication_ready` (também exposto como `replication_ready` por
+  compatibilidade): as duas hipóteses foram confirmadas na mesma replicação.
+
+O status do processo interno da campanha é mantido no gate conjunto. Ele pode
+ser diferente de zero como consequência de `comparative_ready=false`; por
+isso, isoladamente, não deve ser descrito como falha de detecção ou mitigação.
 
 ## API REST
 
