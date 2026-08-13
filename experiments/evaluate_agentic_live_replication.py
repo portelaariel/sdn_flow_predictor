@@ -330,7 +330,43 @@ def evaluate(
         "tracked_tree_clean_at_start": execution.get("tracked_tree_clean") is True,
         "disk_preflight_passed": execution.get("disk_preflight_passed") is True,
     }
+    # O runner da campanha retorna status 1 quando qualquer gate agregado
+    # falha. Portanto, uma divergência puramente comparativa também torna
+    # campaign_process_succeeded e campaign_ready falsos, embora todos os
+    # casos operacionais tenham sido executados corretamente. Esses dois
+    # checks continuam no gate conjunto, mas não podem contaminar os gates
+    # científicos separados.
+    derived_joint_checks = {
+        "campaign_process_succeeded",
+        "campaign_ready",
+    }
+    operational_checks = {
+        name: passed for name, passed in checks.items()
+        if name not in derived_joint_checks | {"comparative_ready"}
+    }
+    comparative_checks = {
+        name: passed for name, passed in checks.items()
+        if name not in derived_joint_checks
+    }
+    operational_replication_ready = all(operational_checks.values())
+    comparative_replication_ready = all(comparative_checks.values())
     replication_ready = all(checks.values())
+
+    def check_scope(values: Dict[str, bool]) -> Dict[str, Any]:
+        return {
+            "ready": all(values.values()),
+            "checks_passed": sum(values.values()),
+            "checks_total": len(values),
+            "failed_checks": sorted(
+                name for name, passed in values.items() if passed is not True
+            ),
+        }
+
+    check_scopes = {
+        "operational": check_scope(operational_checks),
+        "comparative": check_scope(comparative_checks),
+        "joint": check_scope(checks),
+    }
 
     def numeric(rows_: Iterable[Dict[str, Any]], field: str) -> List[float]:
         return [
@@ -379,7 +415,7 @@ def evaluate(
     tp, tn = classifications["TP"], classifications["TN"]
     fp, fn = classifications["FP"], classifications["FN"]
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "mode": "agentic-live-statistical-replication",
         "root": str(root),
@@ -389,6 +425,7 @@ def evaluate(
         ),
         "design": design,
         "checks": checks,
+        "check_scopes": check_scopes,
         "metrics": {
             "TP": tp, "TN": tn, "FP": fp, "FN": fn,
             "precision": rate(tp, tp + fp),
@@ -432,6 +469,9 @@ def evaluate(
             "passed_cases": sum(row.get("passed") is True for row in rows),
             "checks_passed": sum(checks.values()),
             "checks_total": len(checks),
+            "operational_replication_ready": operational_replication_ready,
+            "comparative_replication_ready": comparative_replication_ready,
+            "joint_replication_ready": replication_ready,
             "replication_ready": replication_ready,
         },
     }
@@ -487,7 +527,12 @@ def markdown(report: Dict[str, Any]) -> str:
             f"{metrics['mcda_convergence_direction_distribution']}"
         ),
         (
-            f"replication_ready={str(aggregate['replication_ready']).lower()} "
+            "operational_replication_ready="
+            f"{str(aggregate['operational_replication_ready']).lower()} "
+            "comparative_replication_ready="
+            f"{str(aggregate['comparative_replication_ready']).lower()} "
+            "joint_replication_ready="
+            f"{str(aggregate['joint_replication_ready']).lower()} "
             f"cases={aggregate['passed_cases']}/{aggregate['expected_cases']} "
             f"checks={aggregate['checks_passed']}/{aggregate['checks_total']}"
         ),

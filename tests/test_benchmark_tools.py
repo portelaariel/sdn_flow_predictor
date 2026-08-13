@@ -983,7 +983,15 @@ class BenchmarkToolTests(unittest.TestCase):
             report = evaluate_agentic_live_replication(
                 root, bootstrap_resamples=100, bootstrap_seed=7
             )
+            self.assertEqual(report["schema_version"], 3)
             self.assertTrue(report["aggregate"]["replication_ready"])
+            self.assertTrue(
+                report["aggregate"]["operational_replication_ready"]
+            )
+            self.assertTrue(
+                report["aggregate"]["comparative_replication_ready"]
+            )
+            self.assertTrue(report["aggregate"]["joint_replication_ready"])
             self.assertEqual(report["metrics"]["TP"], 9)
             self.assertEqual(report["metrics"]["TN"], 9)
             self.assertLess(report["metrics"]["sensitivity_ci95"]["low"], 1.0)
@@ -991,6 +999,80 @@ class BenchmarkToolTests(unittest.TestCase):
                 report["metrics"]["latencies"]["detection_latency_ms"]["n"],
                 9,
             )
+
+            # Uma divergência MCDA torna o gate comparativo e o status do
+            # runner falsos, mas não deve apagar a confirmação operacional.
+            replication_manifest_path = root / "replication-manifest.json"
+            replication_manifest = json.loads(
+                replication_manifest_path.read_text(encoding="utf-8")
+            )
+            replication_manifest["execution"]["campaign_exit_code"] = 1
+            replication_manifest_path.write_text(
+                json.dumps(replication_manifest), encoding="utf-8"
+            )
+            campaign_payload["aggregate"].update({
+                "campaign_ready": False,
+                "operational_ready": True,
+                "comparative_ready": False,
+            })
+            campaign_payload["metrics"].update({
+                "mcda_bounded_convergence_rate": 0.888889,
+                "mcda_convergence_direction_distribution": {
+                    "BEFORE_AUTHORITY": 2,
+                    "AT_AUTHORITY": 13,
+                    "AFTER_AUTHORITY": 2,
+                    "NOT_OBSERVED": 1,
+                },
+            })
+            (campaign_root / "campaign-summary.json").write_text(
+                json.dumps(campaign_payload), encoding="utf-8"
+            )
+            divergent = evaluate_agentic_live_replication(
+                root, bootstrap_resamples=100, bootstrap_seed=7
+            )
+            self.assertTrue(
+                divergent["aggregate"]["operational_replication_ready"]
+            )
+            self.assertFalse(
+                divergent["aggregate"]["comparative_replication_ready"]
+            )
+            self.assertFalse(
+                divergent["aggregate"]["joint_replication_ready"]
+            )
+            self.assertFalse(divergent["aggregate"]["replication_ready"])
+            self.assertEqual(
+                divergent["check_scopes"]["operational"]["failed_checks"], []
+            )
+            self.assertEqual(
+                divergent["check_scopes"]["comparative"]["failed_checks"],
+                ["comparative_ready"],
+            )
+            self.assertEqual(
+                divergent["check_scopes"]["joint"]["failed_checks"],
+                [
+                    "campaign_process_succeeded",
+                    "campaign_ready",
+                    "comparative_ready",
+                ],
+            )
+
+            replication_manifest["execution"]["campaign_exit_code"] = 0
+            replication_manifest_path.write_text(
+                json.dumps(replication_manifest), encoding="utf-8"
+            )
+            campaign_payload["aggregate"].update({
+                "campaign_ready": True,
+                "operational_ready": True,
+                "comparative_ready": True,
+            })
+            campaign_payload["metrics"].update({
+                "mcda_bounded_convergence_rate": 1.0,
+                "mcda_convergence_direction_distribution": {
+                    "BEFORE_AUTHORITY": 6,
+                    "AT_AUTHORITY": 6,
+                    "AFTER_AUTHORITY": 6,
+                },
+            })
 
             campaign_payload["mcda_episode_definition"]["lookback_ms"] = 1000.0
             (campaign_root / "campaign-summary.json").write_text(
