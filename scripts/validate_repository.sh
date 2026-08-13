@@ -49,6 +49,7 @@ required_files=(
   experiments/evaluate_agentic_live_run.py
   experiments/evaluate_agentic_live_campaign.py
   experiments/evaluate_agentic_live_replication.py
+  experiments/package_agentic_live_replication.py
   scripts/run_collaborative_benchmark.sh
   scripts/run_agentic_runtime_faults.sh
   scripts/run_agentic_authority_dry_run.sh
