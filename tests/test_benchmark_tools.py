@@ -21,6 +21,10 @@ from experiments.evaluate_agentic_live_replication import (
     evaluate as evaluate_agentic_live_replication,
     wilson_interval,
 )
+from experiments.package_agentic_live_replication import (
+    package_replication,
+    verify_package,
+)
 from experiments.evaluate_agentic_runtime_faults import evaluate
 from experiments.monitor_predictors import (
     flow_anomalies,
@@ -999,6 +1003,39 @@ class BenchmarkToolTests(unittest.TestCase):
                 report["metrics"]["latencies"]["detection_latency_ms"]["n"],
                 9,
             )
+
+            (root / "replication-summary.json").write_text(
+                json.dumps(report), encoding="utf-8"
+            )
+            package = package_replication(root)
+            artifact = root / "research-artifact-v1"
+            self.assertEqual(package["generated_file_count"], 7)
+            self.assertTrue((artifact / "REPORT.md").is_file())
+            self.assertTrue((artifact / "cases.csv").is_file())
+            self.assertTrue((artifact / "mcda-convergence.csv").is_file())
+            self.assertIn(
+                "Hipótese operacional",
+                (artifact / "REPORT.md").read_text(encoding="utf-8"),
+            )
+            artifact_manifest = json.loads(
+                (artifact / "artifact-manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                artifact_manifest["readiness"][
+                    "operational_replication_ready"
+                ],
+                True,
+            )
+            self.assertGreater(artifact_manifest["source_file_count"], 3)
+            self.assertTrue(verify_package(root)["valid"])
+            (artifact / "cases.csv").write_text("alterado\n", encoding="utf-8")
+            integrity = verify_package(root)
+            self.assertFalse(integrity["valid"])
+            self.assertEqual(integrity["mismatches"][0]["path"], (
+                "research-artifact-v1/cases.csv"
+            ))
 
             # Uma divergência MCDA torna o gate comparativo e o status do
             # runner falsos, mas não deve apagar a confirmação operacional.

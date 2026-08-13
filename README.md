@@ -1023,6 +1023,35 @@ O status do processo interno da campanha é mantido no gate conjunto. Ele pode
 ser diferente de zero como consequência de `comparative_ready=false`; por
 isso, isoladamente, não deve ser descrito como falha de detecção ou mitigação.
 
+### Preservar a replicação como artefato científico
+
+Depois de gerar o `replication-summary.json` schema 3, produza um pacote leve
+no próprio diretório da replicação:
+
+```bash
+python3 experiments/package_agentic_live_replication.py "$run"
+```
+
+O comando não copia logs ou timelines. Ele cria
+`research-artifact-v1/` com:
+
+- relatório metodológico em `REPORT.md`;
+- tabelas `cases.csv`, `mcda-convergence.csv` e `summary-metrics.csv`;
+- figuras vetoriais de latência e ordem temporal MCDA–agentes;
+- `artifact-manifest.json` com tamanho e SHA-256 dos arquivos brutos e dos
+  produtos gerados.
+
+Verifique posteriormente se algum arquivo foi alterado ou perdido:
+
+```bash
+python3 experiments/package_agentic_live_replication.py "$run" --verify
+```
+
+O relatório separa as hipóteses operacional, comparativa e conjunta, registra
+ameaças à validade e mantém os intervalos de confiança. O pacote resume a
+execução; os arquivos brutos continuam sendo a fonte primária e não devem ser
+apagados.
+
 ## API REST
 
 Cada FlowPredictor publica uma API. Na topologia padrão, o domínio 0 usa a
