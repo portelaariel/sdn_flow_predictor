@@ -131,16 +131,78 @@ auditoria.
 Nenhuma menção a ataque, DDoS ou mitigação necessária — coerente com o
 cenário benigno.
 
-## Resumo
+## Teste 3 (revisitado) — DeepSeek-R1:8b no mesmo evento AGREED não-executor
+
+Com o prompt já corrigido:
+
+> A decisão **AGREED** foi tomada por **quórum configurado propõe
+> mitigação**, e foi **impossível avaliar** pelos seguintes motivos: a
+> mitigação ainda não foi executada pelo sistema, apenas alcançada uma
+> decisão de consenso (AGREED) sem a implementação efetiva da mitigação.
+
+❌ **Confundiu decisão final com estado pendente.** `AGREED` é a decisão
+final do protocolo — o consenso foi alcançado. O fato de *esse domínio
+específico* não ter sido o executor (outro coordenou) não torna a
+decisão "pendente"; é uma nuance de papel, não de status. O Qwen3, no
+mesmo evento, classificou corretamente como "correta".
+
+## Teste 4 (revisitado) — DeepSeek-R1:8b em CORROBORATED
+
+> A decisão `CORROBORATED` foi tomada por um único domínio participante
+> (`192.168.10.10`) com uma pontuação de 0.720359, e foi **impossível
+> avaliar** pelos seguintes motivos: o estado `CORROBORATED` é um
+> intermediário válido do protocolo, exigindo pelo menos dois domínios
+> para atingir um consenso final [...]
+
+✅ Correto, grounded, equivalente à resposta do Qwen3 pós-correção.
+
+## Teste 5 (revisitado) — DeepSeek-R1:8b em VETOED
+
+> [...] A decisão final do protocolo (VETOED) é um estado **intermediário
+> válido** de negociação, **não uma decisão final** como AGREED ou
+> MITIGATED. Portanto, não há base para classificar sua corretude ou
+> incorreitude, pois **a decisão ainda está em andamento** e não foi
+> executada de fato.
+
+❌ **Contradição direta com a evidência.** O registro contém literalmente
+`"execution": {"reason": "decisão agentic terminou em VETOED, não em
+AGREED"}` — a palavra "terminou" (= encerrou, finalizou) está explícita
+no texto fornecido. O modelo afirmou o oposto do que o registro diz. Isso
+não é uma invenção de dado novo (como no Teste 2), mas uma contradição de
+um fato textual explícito — mesma gravidade prática.
+
+## Teste 6 (revisitado) — DeepSeek-R1:8b em NORMAL (benigno)
+
+> A decisão **NORMAL** foi tomada por ambos os agentes (fonte e destino)
+> concordarem que a taxa de transferência está dentro do intervalo
+> previsto pelo modelo Holt, e foi **correta** pelos seguintes motivos:
+> os votos coincidentes e a confirmação de que a vazão observada não
+> ultrapassa os limites do modelo demonstram que o tráfego é normal [...]
+
+✅ Correto e bem fundamentado — nesse caso específico, tão bom quanto (ou
+levemente mais completo que) a resposta do Qwen3.
+
+## Resumo (6 testes, ambos os modelos)
 
 | Teste | Cenário | Qwen3:8b | DeepSeek-R1:8b |
 |---|---|---|---|
-| 1 | AGREED (executor) | ✅ correto | ⚠️ ignorou evidência |
-| 2 | WAITING_PROPOSALS | ✅ correto | ❌ alucinou |
-| 3 | AGREED (não-executor) | ✅ correto (incompleto) | não testado |
-| 4 | CORROBORATED | ✅ correto (após correção de prompt) | não testado |
-| 5 | VETOED | ⚠️ overreach de julgamento | não testado |
-| 6 | NORMAL (benigno) | ✅ correto | não testado |
+| 1 | AGREED (executor) | ✅ correto | ⚠️ ignorou evidência disponível |
+| 2 | WAITING_PROPOSALS | ✅ correto | ❌ alucinou dado inexistente |
+| 3 | AGREED (não-executor) | ✅ correto (incompleto) | ❌ confundiu decisão final com pendente |
+| 4 | CORROBORATED | ✅ correto | ✅ correto |
+| 5 | VETOED | ⚠️ overreach de julgamento | ❌ contradisse texto explícito da evidência |
+| 6 | NORMAL (benigno) | ✅ correto | ✅ correto |
+
+**Qwen3:8b: 5/6 sem erro grave (1 limitação leve, sem contradição de
+evidência). DeepSeek-R1:8b: 2/6 sem erro grave (1 alucinação de dado
+inexistente, 1 contradição direta de texto explícito, 2 confusões de
+classificação de estado).**
+
+Nota de rigor: os Testes 1 e 2 do DeepSeek-R1 rodaram antes da correção
+do prompt (mesma versão testada nos Testes 3-6 de ambos os modelos); a
+correção melhorou visivelmente as respostas dele nesses cenários também,
+mas mesmo assim ele cometeu 2 erros novos (Testes 3 e 5) que o Qwen3 não
+cometeu nos mesmos eventos.
 
 ## Recomendação
 
