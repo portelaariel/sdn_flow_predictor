@@ -183,6 +183,22 @@ def build_explain_prompt(decision_event: Dict[str, Any],
     )
 
 
+def classify_assessment(narrative: str) -> str:
+    """Detecta o veredito da narrativa. 'Impossivel avaliar' tem
+    prioridade sobre as outras buscas porque alguns modelos mencionam as
+    palavras 'correta'/'incorreta' dentro de uma frase explicativa (ex:
+    'para determinar se e correta ou incorreta...') sem que isso seja o
+    veredito de fato - checar isso primeiro evita falso positivo."""
+    lowered = narrative.lower()
+    if "impossível avaliar" in lowered or "impossivel avaliar" in lowered:
+        return "indeterminado"
+    if "incorreta" in lowered:
+        return "incoerente"
+    if "correta" in lowered:
+        return "coerente"
+    return "indeterminado"
+
+
 class AnthropicLLMClient(LLMClient):
     name = "anthropic"
 
@@ -211,12 +227,7 @@ class AnthropicLLMClient(LLMClient):
             block.text for block in response.content
             if getattr(block, "type", None) == "text"
         )
-        assessment = "indeterminado"
-        lowered = narrative.lower()
-        if "incorreta" in lowered:
-            assessment = "incoerente"
-        elif "correta" in lowered:
-            assessment = "coerente"
+        assessment = classify_assessment(narrative)
 
         return Explanation(
             event_id=str(decision_event.get("event_id")),
@@ -275,12 +286,7 @@ class OllamaLLMClient(LLMClient):
         narrative = re.sub(r"<think>.*?</think>", "", raw_narrative,
                             flags=re.DOTALL).strip()
 
-        assessment = "indeterminado"
-        lowered = narrative.lower()
-        if "incorreta" in lowered:
-            assessment = "incoerente"
-        elif "correta" in lowered:
-            assessment = "coerente"
+        assessment = classify_assessment(narrative)
 
         return Explanation(
             event_id=str(decision_event.get("event_id")),

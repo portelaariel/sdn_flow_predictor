@@ -204,23 +204,125 @@ correção melhorou visivelmente as respostas dele nesses cenários também,
 mas mesmo assim ele cometeu 2 erros novos (Testes 3 e 5) que o Qwen3 não
 cometeu nos mesmos eventos.
 
-## Recomendação
+## Correção de bug no script (detecção de veredito)
 
-**Qwen3:8b via Ollama.** Zero alucinações de dado em 6 testes (contra 1
-alucinação confirmada do DeepSeek-R1 em apenas 2 testes, o que
-interrompeu a comparação — não valia a pena aprofundar um modelo que já
-havia inventado um fato técnico inexistente). Roda em ~35s por decisão
-numa RTX A2000 de 12GB, o que é adequado para o uso em lote pós-experimento
-que é o objetivo aqui.
+Durante os testes do gemma3:12b, o Teste 4 revelou um bug na própria
+lógica de detecção de veredito do script (não no modelo): a narrativa do
+gemma3 continha a frase *"classificar a decisão como correta ou
+incorreta seria prematuro"* — e a checagem simplista por substring
+(`"incorreta" in lowered`) disparou, marcando `assessment: "incoerente"`
+mesmo a resposta dizendo claramente "impossível avaliar". Corrigido
+dando prioridade à busca por "impossível avaliar" antes de checar
+"correta"/"incorreta" (função `classify_assessment`, compartilhada entre
+todos os provedores).
 
-**Limitações conhecidas a considerar antes de uso em produção/tese:**
-1. Em decisões `AGREED` onde o domínio não venceu o claim, a explicação
-   não detalha a nuance de "quem executa" (Teste 3).
-2. Em decisões `VETOED`, o modelo pode presumir que o lado que propôs
-   `MITIGATE` "estava certo", sem essa conclusão estar sustentada apenas
-   pelos dados (Teste 5) — recomenda-se revisão humana específica nesses
-   casos, ou refinamento futuro do prompt.
+## gemma4:12b — todos os 6 testes
 
-Nenhuma dessas limitações envolve invenção de dados — são questões de
-**ênfase/julgamento**, e ficam visíveis a qualquer revisor humano lendo o
-parecer, não escondidas atrás de uma alucinação factual.
+**Teste 1 (AGREED, executor)** — ✅ correto:
+> A decisão AGREED foi tomada porque o quórum de 2 votos exigidos [...]
+> foi alcançado [...]. A decisão foi correta, pois o sistema identificou
+> um consenso unânime de mitigação com confiança de 0.858386 [...].
+> Embora a execução não tenha ocorrido, isso se deve ao modo de operação
+> "authority-dry-run" [...], e não a uma falha lógica na tomada de decisão.
+
+**Teste 2 (WAITING_PROPOSALS)** — ✅ correto, grounded.
+
+**Teste 3 (AGREED, não-executor)** — ✅ **melhor resposta registrada até
+agora para este cenário**, resolvendo a limitação que o Qwen3 tinha:
+> [...] Embora a execução não tenha ocorrido localmente (dry-run), isso
+> se deve ao fato de o fluxo pertencer a outro coordenador, e não a um
+> erro de detecção ou lógica do protocolo.
+
+**Teste 4 (CORROBORATED)** — ✅ correto, grounded.
+
+**Teste 5 (VETOED)** — ✅ **melhor resposta registrada até agora para
+este cenário**, resolvendo a limitação que o Qwen3 tinha (overreach de
+julgamento):
+> [...] o sistema operou conforme o protocolo de consenso multi-domínio,
+> onde a proposta de mitigação do domínio de origem foi invalidada pelo
+> status de "whitelist" do destino [...] o sistema agiu corretamente ao
+> respeitar a autoridade do domínio de destino sobre sua própria
+> infraestrutura.
+
+*(Diferente do Qwen3, que havia dito "a mitigação era necessária"
+tomando partido do lado que propôs MITIGATE, o gemma4 avalia o
+**resultado do protocolo** como correto — o veto funcionando como
+mecanismo de segurança projetado — sem tomar partido não sustentado
+pela evidência.)*
+
+**Teste 6 (NORMAL, benigno)** — ✅ correto, sem narrativa de ataque.
+
+**Resultado: 6/6 sem nenhum erro, incluindo as duas nuances que
+derrubaram o Qwen3.**
+
+## gemma3:12b — todos os 6 testes
+
+Padrão sistemático encontrado: em 4 dos 6 testes, o modelo tratou
+decisões **finais** (`AGREED`, `VETOED`, `NORMAL` — que o próprio
+registro descreve com a palavra "terminou") como se ainda estivessem
+"em andamento", só porque a execução real não foi tentada (efeito do
+modo dry-run). Mesmo tipo de confusão vista no DeepSeek-R1, mas mais
+frequente.
+
+- **Teste 1 (AGREED, executor)** — ⚠️ conservador demais: disse
+  "impossível avaliar" porque "a execução da mitigação não foi tentada",
+  ignorando que AGREED já é a decisão final segundo o protocolo.
+- **Teste 2 (WAITING_PROPOSALS)** — ✅ correto (esse é genuinamente
+  pendente, então a resposta "indeterminado" está certa aqui).
+- **Teste 3 (AGREED, não-executor)** — ⚠️ mesmo padrão do Teste 1.
+- **Teste 4 (CORROBORATED)** — ✅ correto (rótulo já corrigido pelo bug
+  do script, ver acima).
+- **Teste 5 (VETOED)** — ⚠️ mesmo padrão: disse que "o processo ainda
+  não atingiu um estado final", contradizendo o texto explícito do
+  registro ("decisão agentic terminou em VETOED").
+- **Teste 6 (NORMAL, benigno)** — ⚠️ mesmo padrão, tratou a decisão como
+  "provisória".
+
+**Resultado: 2/6 sem o padrão de erro (nenhuma alucinação de dado novo,
+mas confusão sistemática entre "não executado por config" e "decisão
+não finalizada").**
+
+## Resumo final (4 modelos, 6 testes cada)
+
+| Teste | Qwen3:8b | DeepSeek-R1:8b | gemma4:12b | gemma3:12b |
+|---|---|---|---|---|
+| 1 AGREED (executor) | ✅ | ⚠️ | ✅ | ⚠️ |
+| 2 WAITING_PROPOSALS | ✅ | ❌ alucinou | ✅ | ✅ |
+| 3 AGREED (não-executor) | ✅ (incompleto) | ❌ | ✅ **melhor** | ⚠️ |
+| 4 CORROBORATED | ✅ | ✅ | ✅ | ✅ |
+| 5 VETOED | ⚠️ | ❌ | ✅ **melhor** | ⚠️ |
+| 6 NORMAL (benigno) | ✅ | ✅ | ✅ | ⚠️ |
+| **Sem erro/limitação** | **5/6** | **2/6** | **6/6** | **2/6** |
+
+**gemma4:12b teve o melhor resultado entre os 4 modelos testados —
+zero erros, incluindo as duas únicas limitações que o Qwen3:8b (segundo
+melhor colocado) apresentou.** Ambiente de teste idêntico para todos
+(mesmo servidor, RTX A2000 12GB, mesmo prompt corrigido, mesmos 6
+`decision_events`).
+
+Considerações que ainda pesam a favor do Qwen3:8b caso a licença seja um
+critério relevante: Apache 2.0 é mais permissiva/simples de citar do que
+a licença do Gemma (Gemma Terms of Use, Google), embora esta última
+também permita uso e redistribuição.
+
+## Recomendação (aberta para decisão do orientador)
+
+Com os 4 modelos testados, dois se destacam claramente sobre os outros
+dois (DeepSeek-R1:8b e gemma3:12b, que apresentaram problemas repetidos
+de classificar decisões finais como pendentes, além da alucinação
+confirmada do DeepSeek-R1 no Teste 2):
+
+| | Qwen3:8b | gemma4:12b |
+|---|---|---|
+| Testes sem erro | 5/6 | 6/6 |
+| Licença | Apache 2.0 | Gemma Terms of Use |
+| Tamanho do modelo | 5.2GB | ~8GB |
+| Limitações conhecidas | Nuance de "não-executor" incompleta (Teste 3); overreach de julgamento em VETOED (Teste 5) | Nenhuma encontrada nos 6 testes realizados |
+
+**gemma4:12b teve o melhor resultado bruto** — resolveu exatamente as
+duas situações em que o Qwen3 pisou na bola. **Qwen3:8b** continua uma
+opção sólida, mais leve e com licença mais permissiva.
+
+Como só testamos 6 cenários (bastante variados, mas ainda uma amostra
+pequena), a decisão final entre os dois fica em aberto para revisão —
+qualquer um dos dois é uma escolha defensável com a evidência atual.
