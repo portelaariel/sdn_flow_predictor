@@ -305,24 +305,121 @@ critério relevante: Apache 2.0 é mais permissiva/simples de citar do que
 a licença do Gemma (Gemma Terms of Use, Google), embora esta última
 também permita uso e redistribuição.
 
+## qwen3.5:9b — todos os 6 testes
+
+Sucessor direto do Qwen3:8b (o modelo que o orientador mais gostou).
+**Resultado: 6/6 sem nenhum erro.** Resolveu bem as duas nuances que
+derrubaram o Qwen3 original:
+
+- Teste 3 (AGREED não-executor): "a decisão é tecnicamente correta
+  quanto ao consenso alcançado, embora a atuação física da mitigação
+  tenha sido suprimida por protocolo em favor da coordenação
+  hierárquica" — distingue certo "decisão válida" de "não foi esse
+  domínio que executou".
+- Teste 5 (VETOED): trata como fato neutro, sem tomar partido — "a
+  mitigação foi corretamente bloqueada... apesar da detecção de
+  provável ataque DDoS pela origem" — reconhece as duas evidências sem
+  escolher lado.
+
+## granite4.1:8b — todos os 6 testes
+
+**Resultado: 4/6 sem problema.** Duas questões encontradas:
+
+- Teste 1: imprecisão de linguagem — escreveu "a decisão foi executada
+  em um modo de authority-dry-run, simulando a mitigação sem alterações
+  reais", mas o registro mostra `executed: false, attempted: false`
+  (nada foi executado nem simulado de fato, só autorizado).
+- Teste 6: mesmo padrão de erro do DeepSeek-R1/gemma3 — tratou uma
+  decisão final ("decisão agentic terminou em NORMAL") como "ainda em
+  andamento, aguardando quórum". Também apresentou um artefato de
+  formatação (duplicação de parágrafo dentro de um bloco de código).
+
+## ornith:9b — todos os 6 testes
+
+**Resultado: 5/6, com um erro conceitual notável.** No Teste 1 (AGREED,
+executor), marcou como **"INCORRETA"** (veredito duro, não
+"indeterminado") só porque o dry-run bloqueou a execução física —
+confundindo um guard-rail de segurança intencional com uma falha. O
+mais revelador: no Teste 3, um evento quase idêntico (mesma lógica de
+fundo) foi corretamente marcado "coerente" pelo mesmo modelo — ou seja,
+foi inconsistente com ele mesmo. Testes 2, 4, 5, 6: sólidos.
+
+## ornith-1.5:9b — todos os 6 testes
+
+**Resultado: 6/6 sem nenhum erro.** Melhor formulação registrada até
+agora para a distinção "decisão de consenso correta" vs. "não resultou
+em ação real" (Teste 1). No Teste 6, foi além do pedido e acrescentou
+uma observação crítica proativa e factualmente correta: os dois
+domínios compartilham o mesmo `model_id`
+(`holt_residual:8dc3603f632f166d3f12b1c1`), o que "pode mascarar
+divergências reais no comportamento do tráfego" se reutilizado entre
+domínios distintos — um insight de auditoria genuíno, sem extrapolar
+além da evidência.
+
+## lfm2.5:8b — todos os 6 testes
+
+**Resultado: 2/6.** Mesmo padrão sistemático do DeepSeek-R1/gemma3/
+lfm2.5: trata decisões finais (AGREED, VETOED, NORMAL) como "ainda em
+andamento" mesmo quando o registro diz explicitamente "terminou". O
+raciocínio interno capturado (campo `_thinking`) mostra que, no Teste 5,
+o modelo chega a citar corretamente a instrução do prompt ("só
+classifique correta/incorreta quando final, ex: AGREED"), mas erra a
+aplicação, concluindo que VETOED "não é final" só por não estar
+explicitamente na lista de exemplos citados — ignorando o texto
+"terminou em VETOED" que estava na própria evidência. Modelo otimizado
+para velocidade em hardware fraco, não para profundidade de raciocínio;
+o resultado é consistente com esse objetivo declarado.
+
+## llama3.1:8b — pendente
+
+Não foi possível testar: o servidor do laboratório apresentou um
+problema de disco (partição WSL cheia por acúmulo dos pesos dos modelos
+já testados, ~52GB) durante o download deste modelo, causando erros de
+I/O em todo o sistema. Resolvido esvaziando
+`~/.ollama/models/blobs/` via PowerShell do Windows (fora do WSL). Teste
+deste modelo será concluído em uma sessão futura.
+
+## Resumo final (9 modelos testados, 6 cenários cada)
+
+| Teste | Qwen3:8b | DeepSeek-R1:8b | gemma4:12b | gemma3:12b | qwen3.5:9b | granite4.1:8b | ornith:9b | ornith-1.5:9b | lfm2.5:8b |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 AGREED (executor) | ✅ | ⚠️ | ✅ | ⚠️ | ✅ | ⚠️ | ❌ | ✅ | ⚠️ |
+| 2 WAITING_PROPOSALS | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 3 AGREED (não-executor) | ✅ | ❌ | ✅ | ⚠️ | ✅ | ✅ | ✅ | ✅ | ⚠️ |
+| 4 CORROBORATED | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 5 VETOED | ⚠️ | ❌ | ✅ | ⚠️ | ✅ | ✅ | ✅ | ✅ | ⚠️ |
+| 6 NORMAL (benigno) | ✅ | ✅ | ✅ | ⚠️ | ✅ | ⚠️ | ✅ | ✅ | ⚠️ |
+| **Sem erro/limitação** | 5/6 | 2/6 | **6/6** | 2/6 | **6/6** | 4/6 | 5/6 | **6/6** | 2/6 |
+
+Três modelos empatados no topo com **6/6 sem nenhum erro**:
+`gemma4:12b`, `qwen3.5:9b` e `ornith-1.5:9b`.
+
 ## Recomendação (aberta para decisão do orientador)
 
-Com os 4 modelos testados, dois se destacam claramente sobre os outros
-dois (DeepSeek-R1:8b e gemma3:12b, que apresentaram problemas repetidos
-de classificar decisões finais como pendentes, além da alucinação
-confirmada do DeepSeek-R1 no Teste 2):
+Com 9 modelos testados (falta só o `llama3.1:8b`, pendente por
+problema de infraestrutura), três empatam no topo com 6/6 sem erro:
 
-| | Qwen3:8b | gemma4:12b |
-|---|---|---|
-| Testes sem erro | 5/6 | 6/6 |
-| Licença | Apache 2.0 | Gemma Terms of Use |
-| Tamanho do modelo | 5.2GB | ~8GB |
-| Limitações conhecidas | Nuance de "não-executor" incompleta (Teste 3); overreach de julgamento em VETOED (Teste 5) | Nenhuma encontrada nos 6 testes realizados |
+| | qwen3.5:9b | gemma4:12b | ornith-1.5:9b |
+|---|---|---|---|
+| Testes sem erro | 6/6 | 6/6 | 6/6 |
+| Licença | Apache 2.0 | Gemma Terms of Use | **MIT** |
+| Tamanho | 6.6GB | ~8GB | 6.6GB |
+| Observação extra | Sucessor direto do Qwen3:8b (o modelo já aprovado) | Melhor resposta registrada nos Testes 3 e 5 na rodada anterior | Único que acrescentou um insight de auditoria proativo e correto (Teste 6) |
 
-**gemma4:12b teve o melhor resultado bruto** — resolveu exatamente as
-duas situações em que o Qwen3 pisou na bola. **Qwen3:8b** continua uma
-opção sólida, mais leve e com licença mais permissiva.
+Os três são escolhas defensáveis. Critérios para desempate, se
+necessário:
+- **Continuidade**: `qwen3.5:9b` é a evolução natural do modelo que já
+  foi validado e aprovado, reduzindo risco de mudança de comportamento.
+- **Licença**: `ornith-1.5:9b` tem a licença mais permissiva (MIT) das
+  três, seguido por `qwen3.5:9b` (Apache 2.0); `gemma4:12b` tem a
+  licença mais restritiva do trio (Gemma Terms of Use).
+- **Qualidade adicional observada**: `ornith-1.5:9b` foi o único a
+  agregar valor além do pedido (a observação sobre `model_id`
+  compartilhado no Teste 6), o que pode interessar para um caso de uso
+  de auditoria mais rico.
 
-Como só testamos 6 cenários (bastante variados, mas ainda uma amostra
-pequena), a decisão final entre os dois fica em aberto para revisão —
-qualquer um dos dois é uma escolha defensável com a evidência atual.
+`granite4.1:8b` (4/6) e `ornith:9b` (5/6) ficam como alternativas
+secundárias, com problemas pontuais documentados acima.
+`DeepSeek-R1:8b`, `gemma3:12b` e `lfm2.5:8b` (2/6 cada) apresentaram o
+mesmo padrão recorrente de tratar decisões finais como pendentes, e não
+são recomendados para esta tarefa.
