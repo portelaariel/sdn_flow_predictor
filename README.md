@@ -1,16 +1,16 @@
-# FlowPredictor
+# Coordinated Multi-Domain Agent-Based defense for SDN (CoMAS)
 
 [![Repository validation](https://github.com/portelaariel/sdn_flow_predictor/actions/workflows/validate.yml/badge.svg)](https://github.com/portelaariel/sdn_flow_predictor/actions/workflows/validate.yml)
 
-O FlowPredictor é um protótipo de pesquisa para detectar e mitigar ataques
-volumétricos em uma rede SDN com mais de um domínio administrativo. Ele observa
-o tráfego pelos controladores Ryu, prevê a vazão esperada com um modelo Holt,
-identifica desvios e pode coordenar uma regra de bloqueio entre os domínios.
+O Coordinated Multi-Domain Agent-Based defense for SDN (CoMAS) é um protótipo
+de pesquisa para detectar e mitigar ataques volumétricos em uma rede SDN com
+mais de um domínio administrativo. Ele observa o tráfego pelos controladores
+Ryu, prevê a vazão esperada com um modelo Holt, identifica desvios e coordena
+decisões e políticas de bloqueio entre os domínios.
 
-Este README foi escrito para quem nunca executou a ferramenta. A primeira parte
-leva o leitor de um servidor vazio até um experimento seguro no Mininet. As
-seções seguintes explicam o que acontece internamente e apresentam treinamento,
-MCDA, agentes, mitigação real e reprodução experimental.
+Identificadores técnicos legados, como `flow_predictor_cnsm`,
+`flow-predictor-*`, `/predictor/*` e `PREDICTOR_*`, são mantidos por
+compatibilidade com scripts, imagens, containers e APIs existentes.
 
 > **Aviso:** este é um ambiente de laboratório. O modo `authority-live` instala
 > regras DROP reais nos switches do Mininet. Comece sempre pelos modos
@@ -20,9 +20,9 @@ MCDA, agentes, mitigação real e reprodução experimental.
 
 - [O que será executado](#o-que-será-executado)
 - [Conceitos essenciais](#conceitos-essenciais)
-- [Antes de começar](#antes-de-começar)
-- [Primeira execução segura](#primeira-execução-segura)
-- [Primeiro benchmark automatizado](#primeiro-benchmark-automatizado)
+- [Requisitos e preparação](#requisitos-e-preparação)
+- [Execução segura em dry-run](#execução-segura-em-dry-run)
+- [Benchmark automatizado](#benchmark-automatizado)
 - [Como a detecção funciona](#como-a-detecção-funciona)
 - [Como a decisão multi-domínio funciona](#como-a-decisão-multi-domínio-funciona)
 - [Como a mitigação funciona](#como-a-mitigação-funciona)
@@ -37,21 +37,21 @@ MCDA, agentes, mitigação real e reprodução experimental.
 ## O que será executado
 
 A topologia padrão possui dois domínios. Cada domínio tem um controlador Ryu,
-um SimpleSwitch, um FlowBlocker e um FlowPredictor. Três containers ETCD mantêm
-o estado compartilhado. O Mininet cria quatro switches e oito hosts.
+um SimpleSwitch, um FlowBlocker e uma instância CoMAS. Três containers ETCD
+mantêm o estado compartilhado. O Mininet cria quatro switches e oito hosts.
 
 ```mermaid
 flowchart LR
     subgraph D0["Domínio 0"]
         H1["h1...h4"] --> S0["s1 e s2"]
         S0 --> R0["Ryu 0"]
-        R0 --> P0["FlowPredictor 0"]
+        R0 --> P0["CoMAS 0"]
         P0 --> B0["FlowBlocker 0"]
     end
     subgraph D1["Domínio 1"]
         H2["h5...h8"] --> S1["s3 e s4"]
         S1 --> R1["Ryu 1"]
-        R1 --> P1["FlowPredictor 1"]
+        R1 --> P1["CoMAS 1"]
         P1 --> B1["FlowBlocker 1"]
     end
     S0 <-->|"link entre domínios"| S1
@@ -73,24 +73,23 @@ aumenta para simular um ataque volumétrico.
 
 ### Papel de cada componente
 
-| Componente | Explicação para o primeiro uso |
+| Componente | Função |
 | --- | --- |
 | Mininet | Cria hosts, links e switches virtuais no servidor Linux. |
 | Open vSwitch | Implementa os switches e recebe regras OpenFlow. |
 | Ryu | É o controlador SDN. Mantém a sessão OpenFlow e expõe estatísticas por API. |
 | SimpleSwitch | Aprende onde estão os hosts e instala regras de encaminhamento IPv4. |
-| FlowPredictor | Calcula vazão, faz a previsão, detecta anomalias e coordena decisões. |
+| CoMAS | Calcula vazão, faz a previsão, detecta anomalias e coordena decisões. |
 | FlowBlocker | Converte uma decisão autorizada em regras DROP nos switches. |
 | ETCD | Compartilha evidências, propostas e claims entre os domínios. |
 | `iperf3` | Gera o tráfego benigno e o ataque experimental. |
 
-O FlowPredictor nunca instala uma regra diretamente. Toda mitigação passa pelo
+O CoMAS não instala regras diretamente. Toda mitigação passa pelo
 FlowBlocker, inclusive quando a decisão foi tomada pelos agentes.
 
 ## Conceitos essenciais
 
-Não é necessário dominar SDN ou séries temporais para executar o tutorial, mas
-estes termos aparecem nos logs e relatórios:
+Os termos a seguir aparecem nos logs e relatórios:
 
 - **SDN:** arquitetura que separa os switches, responsáveis por encaminhar
   pacotes, do controlador, responsável por decidir as regras.
@@ -126,10 +125,10 @@ Essa distinção evita uma confusão comum:
 3. **Inferência online:** a cada nova coleta, o modelo prevê, compara com o
    observado e classifica o desvio.
 
-O repositório já contém um modelo treinado. Portanto, não é necessário baixar
-os grandes CSVs do CIC-DDoS2019 para realizar a primeira execução.
+O repositório já contém um modelo treinado; os grandes CSVs do CIC-DDoS2019 não
+são necessários para executar o ambiente padrão.
 
-## Antes de começar
+## Requisitos e preparação
 
 ### Onde executar cada comando
 
@@ -152,7 +151,7 @@ Descubra a raiz a qualquer momento com:
 git rev-parse --show-toplevel
 ```
 
-Entre nela antes dos comandos deste guia:
+Entre nela antes de executar os comandos:
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
@@ -225,10 +224,10 @@ falhas determinísticas dos agentes e o formato do deploy. Ele não inicia
 containers nem o Mininet. O final esperado contém testes `OK` e
 `deploy_smoke: ok`.
 
-## Primeira execução segura
+## Execução segura em dry-run
 
 Esta seção usa o modelo offline incluído, dois domínios e `dry-run`. Nenhuma
-regra de bloqueio será instalada pelo FlowPredictor.
+regra de bloqueio será instalada pelo CoMAS.
 
 ### 1. Construir as quatro imagens
 
@@ -242,7 +241,7 @@ sudo docker build -t flow_predictor_cnsm -f Dockerfile.flow_predictor .
 ```
 
 O ponto final no quarto comando é o contexto de build e não pode ser omitido.
-`setup_env.sh` consegue construir a imagem do FlowPredictor quando necessário,
+`setup_env.sh` consegue construir a imagem do CoMAS quando necessário,
 mas pressupõe que as outras três imagens já existam.
 
 Confirme:
@@ -374,7 +373,7 @@ Volte ao **SERVIDOR — raiz**:
 
 ```bash
 for port in 6060 6061; do
-  echo "=== FlowPredictor $port ==="
+  echo "=== CoMAS $port ==="
   curl -fsS "http://127.0.0.1:$port/predictor/anomalies?limit=20" |
     jq '[.anomalies[] |
       select(.meta.nw_src == "10.0.0.1" and .meta.nw_dst == "10.0.0.8") |
@@ -408,11 +407,10 @@ O cleanup padrão remove somente containers, redes e recursos Mininet deste
 projeto. Não use `--all` em um servidor compartilhado: essa opção remove todos
 os containers e redes customizadas do host.
 
-## Primeiro benchmark automatizado
+## Benchmark automatizado
 
-O teste manual ajuda a entender os componentes. Para coletar resultados, use o
-runner, que automatiza limpeza, bootstrap, Mininet, tráfego, polling, logs e
-sumarização.
+O runner automatiza limpeza, bootstrap, Mininet, tráfego, polling, coleta de
+resultados e sumarização.
 
 Não mantenha outro Mininet ou benchmark ativo ao mesmo tempo.
 
@@ -469,7 +467,7 @@ Ambos indicam que a repetição não pode sustentar a conclusão pretendida.
 
 ### 1. Leitura dos contadores OpenFlow
 
-A cada dois segundos, por padrão, o FlowPredictor consulta o Ryu:
+A cada dois segundos, por padrão, o CoMAS consulta o Ryu:
 
 - `/stats/port/<dpid>` para dados agregados de portas;
 - `/stats/flow/<dpid>` para fluxos com IP de origem e destino.
@@ -620,8 +618,8 @@ modelo, o estado é `MODEL_MISMATCH`. Em modo MCDA live, somente depois de
 
 ### Agente de cada domínio
 
-Cada FlowPredictor pode executar um agente determinístico. Ele não conversa em
-linguagem natural e não usa LLM ou aprendizado por reforço. Suas regras são
+Cada instância CoMAS pode executar um agente determinístico. Ele não conversa
+em linguagem natural e não usa LLM ou aprendizado por reforço. Suas regras são
 explícitas e testáveis.
 
 O ciclo é:
@@ -683,7 +681,7 @@ Se o ETCD estiver indisponível, o sistema falha fechado: ninguém executa.
 
 ### Modos dos agentes
 
-| Modo | O que o leitor verá | Instala DROP? |
+| Modo | Comportamento | Instala DROP? |
 | --- | --- | --- |
 | `shadow` | propostas e consenso comparados ao MCDA | não |
 | `authority-dry-run` | gate e eleição reais; registra quem executaria | não |
@@ -786,7 +784,7 @@ relatório de validação JSON
 ### Por que o CSV original precisa ser preparado
 
 No CIC-DDoS2019, cada linha do CICFlowMeter descreve um fluxo concluído. No
-runtime, o FlowPredictor observa deltas de bytes em janelas de dois segundos.
+runtime, o CoMAS observa deltas de bytes em janelas de dois segundos.
 Treinar diretamente nas linhas originais misturaria duas representações
 diferentes.
 
@@ -972,13 +970,13 @@ campanha piloto que não tenha usado a mesma definição de episódio MCDA
 Campanhas longas devem ser executadas dentro de `tmux`:
 
 ```bash
-tmux new -s flowpredictor
+tmux new -s comas
 ```
 
 Use `Ctrl-b`, depois `d`, para deixar a sessão executando. Retorne com:
 
 ```bash
-tmux attach -t flowpredictor
+tmux attach -t comas
 ```
 
 ### Estatística produzida
@@ -1054,7 +1052,7 @@ apagados.
 
 ## API REST
 
-Cada FlowPredictor publica uma API. Na topologia padrão, o domínio 0 usa a
+Cada instância CoMAS publica uma API. Na topologia padrão, o domínio 0 usa a
 porta `6060` e o domínio 1 usa `6061`.
 
 | Método | Endpoint | Uso |
@@ -1170,14 +1168,14 @@ Para o domínio de índice `i`:
 | Ryu REST | `192.168.(10+i).10` | `8080+i` |
 | SimpleSwitch | `192.168.(10+i).20` | `9090+i` |
 | FlowBlocker | `192.168.(10+i).30` | `7070+i` |
-| FlowPredictor | `192.168.(10+i).40` | `6060+i` |
+| CoMAS | `192.168.(10+i).40` | `6060+i` |
 
 O bootstrap aceita outras quantidades de domínios e switches, mas as campanhas
 de promoção e replicação foram escritas e validadas para 2×2 e `h1` a `h8`.
 
 ## Estrutura do repositório
 
-| Caminho | Quando o novo leitor precisa dele |
+| Caminho | Função |
 | --- | --- |
 | `README.md` | ponto inicial e operação do projeto |
 | `config/runtime.env` | consultar ou substituir defaults |
@@ -1221,8 +1219,8 @@ Se o shell já está em `eMSN_ENV/`, não use caminhos iniciados novamente por
 
 ### `network ryu-network not found`
 
-`deploy_flow_predictor.sh` não cria infraestrutura e não deve ser o primeiro
-comando. Inicie o ambiente completo:
+`deploy_flow_predictor.sh` não cria a infraestrutura. Inicie o ambiente
+completo antes de utilizá-lo:
 
 ```bash
 bash eMSN_ENV/setup_env.sh 2 2
@@ -1301,7 +1299,7 @@ pessoal](#abrir-a-api-no-computador-pessoal). Não tente abrir diretamente o
 
 ### Reutilização do ambiente produz estado antigo
 
-Claims possuem TTL e um FlowPredictor antigo pode conservar decisões em
+Claims possuem TTL e uma instância CoMAS antiga pode conservar decisões em
 memória. Para uma execução experimental independente, prefira o bootstrap
 padrão do runner. Ele recria ETCD e serviços. Não misture manualmente resultados
 de duas execuções.
