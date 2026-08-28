@@ -2,15 +2,11 @@
 
 [![Repository validation](https://github.com/portelaariel/sdn_flow_predictor/actions/workflows/validate.yml/badge.svg)](https://github.com/portelaariel/sdn_flow_predictor/actions/workflows/validate.yml)
 
-O Coordinated Multi-Domain Agent-Based defense for SDN (CoMAS) é um protótipo
-de pesquisa para detectar e mitigar ataques volumétricos em uma rede SDN com
-mais de um domínio administrativo. Ele observa o tráfego pelos controladores
-Ryu, prevê a vazão esperada com um modelo Holt, identifica desvios e coordena
+O Coordinated Multi-Domain Agent-Based defense for SDN (CoMAS) é um framework
+de pesquisa para detecção e mitigação de ataques volumétricos em uma rede SDN com
+mais de um domínio. Ele observa o tráfego através de controladores
+Ryu, prevê a vazão esperada, identifica desvios e coordena
 decisões e políticas de bloqueio entre os domínios.
-
-Identificadores técnicos legados, como `flow_predictor_cnsm`,
-`flow-predictor-*`, `/predictor/*` e `PREDICTOR_*`, são mantidos por
-compatibilidade com scripts, imagens, containers e APIs existentes.
 
 > **Aviso:** este é um ambiente de laboratório. O modo `authority-live` instala
 > regras DROP reais nos switches do Mininet. Comece sempre pelos modos
@@ -85,7 +81,7 @@ aumenta para simular um ataque volumétrico.
 | `iperf3` | Gera o tráfego benigno e o ataque experimental. |
 
 O CoMAS não instala regras diretamente. Toda mitigação passa pelo
-FlowBlocker, inclusive quando a decisão foi tomada pelos agentes.
+FlowBlocker.
 
 ## Conceitos essenciais
 
@@ -125,24 +121,22 @@ Essa distinção evita uma confusão comum:
 3. **Inferência online:** a cada nova coleta, o modelo prevê, compara com o
    observado e classifica o desvio.
 
-O repositório já contém um modelo treinado; os grandes CSVs do CIC-DDoS2019 não
+O repositório já contém um modelo treinado; os CSVs completos do CIC-DDoS2019 não
 são necessários para executar o ambiente padrão.
 
 ## Requisitos e preparação
 
 ### Onde executar cada comando
 
-O runtime precisa de um **servidor Linux** porque utiliza Mininet, Open vSwitch
-e redes Docker. Um Mac ou outro computador pessoal pode ser usado para editar
-o código, acessar o GitHub e abrir túneis SSH, mas não substitui o servidor no
-experimento.
+O runtime precisa de um **ambiente Linux** porque utiliza Mininet, Open vSwitch
+e redes Docker.
 
 Os blocos deste README usam três rótulos:
 
 - **SERVIDOR — raiz:** shell Linux dentro da raiz do repositório;
 - **SERVIDOR — Mininet:** segundo shell Linux que permanecerá no CLI do
   Mininet;
-- **COMPUTADOR PESSOAL:** terminal do seu notebook, usado apenas quando
+- **COMPUTADOR PESSOAL:** terminal, se for o seu caso, usado apenas quando
   explicitamente indicado.
 
 Descubra a raiz a qualquer momento com:
@@ -151,7 +145,7 @@ Descubra a raiz a qualquer momento com:
 git rev-parse --show-toplevel
 ```
 
-Entre nela antes de executar os comandos:
+Acessar antes de executar os comandos:
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
@@ -159,7 +153,7 @@ cd "$(git rev-parse --show-toplevel)"
 
 ### Requisitos do servidor
 
-O testbed foi desenvolvido para Ubuntu/Linux e requer:
+O testbed foi desenvolvido para Linux e requer:
 
 - Docker;
 - Open vSwitch e Mininet;
@@ -167,7 +161,7 @@ O testbed foi desenvolvido para Ubuntu/Linux e requer:
 - `git`, `curl`, `jq`, `iperf3` e `tmux`;
 - permissão de `sudo` para Docker, OVS e Mininet.
 
-Em Ubuntu, uma instalação inicial típica é:
+Instalação inicial típica:
 
 ```bash
 sudo apt update
@@ -192,7 +186,7 @@ done
 
 ### Obter o repositório
 
-Se o repositório ainda não existe no servidor:
+Se o repositório ainda não existe no ambiente:
 
 ```bash
 git clone https://github.com/portelaariel/sdn_flow_predictor.git
@@ -207,7 +201,7 @@ git switch main
 git pull --ff-only origin main
 ```
 
-O caminho pode ser diferente no seu servidor. O importante é que
+O caminho pode ser diferente no seu cenário. O importante é que
 `git rev-parse --show-toplevel` termine no diretório que contém
 `Dockerfile.flow_predictor`, `eMSN_ENV/`, `scripts/` e `models/`.
 
@@ -231,7 +225,7 @@ regra de bloqueio será instalada pelo CoMAS.
 
 ### 1. Construir as quatro imagens
 
-**SERVIDOR — raiz**
+**AMBIENTE LINUX — raiz**
 
 ```bash
 sudo docker build -t ryu_core_cnsm ryu_apps
@@ -254,7 +248,7 @@ sudo docker image ls --format '{{.Repository}}' |
 
 ### 2. Criar os serviços dos dois domínios
 
-**SERVIDOR — raiz**
+**AMBIENTE LINUX — raiz**
 
 ```bash
 PREDICTOR_OFFLINE_MODEL="$PWD/models/cic2019-drddos-udp-holt.json" \
@@ -290,7 +284,7 @@ ryu-core-1, simple-switch-1, flow-blocker-1, flow-predictor-1
 
 ### 3. Confirmar que o modelo foi carregado
 
-**SERVIDOR — raiz**
+**AMBIENTE LINUX — raiz**
 
 ```bash
 for port in 6060 6061; do
@@ -319,7 +313,7 @@ montado e o comportamento não corresponde ao protocolo descrito aqui.
 
 Abra uma segunda conexão SSH ou uma nova janela do `tmux`.
 
-**SERVIDOR — Mininet**
+**AMBIENTE LINUX — Mininet**
 
 ```bash
 cd ~/sdn-ariel/sdn_flow_predictor
@@ -329,12 +323,7 @@ sudo MININET_CONTROLLER_HOST=127.0.0.1 \
 
 Usar `127.0.0.1` faz os switches alcançarem as portas OpenFlow publicadas
 pelos containers (`6633` e `6634`). Isso evita problemas de rota para as
-bridges Docker. Quando o prompt abaixo aparecer, os comandos seguintes devem
-ser digitados dentro do Mininet, sem repetir a palavra `mininet>`:
-
-```text
-mininet>
-```
+bridges Docker.
 
 Confira conectividade básica:
 
@@ -348,7 +337,7 @@ alcançar todos os hosts.
 
 ### 5. Gerar baseline e ataque manualmente
 
-Ainda no **SERVIDOR — Mininet**:
+Ainda no **AMBIENTE LINUX — Mininet**:
 
 ```text
 h8 iperf3 -s -D
@@ -367,9 +356,9 @@ O que cada linha faz:
 O salto de 1 Mbit/s para 100 Mbit/s é o evento que o detector deve observar.
 Como o ambiente está em dry-run, o tráfego não será bloqueado.
 
-### 6. Inspecionar a detecção
+### 6. Verificar a detecção
 
-Volte ao **SERVIDOR — raiz**:
+Volte ao **AMBIENTE LINUX — raiz**:
 
 ```bash
 for port in 6060 6061; do
@@ -391,13 +380,13 @@ outras verificações.
 
 ### 7. Encerrar o ambiente
 
-No **SERVIDOR — Mininet**:
+No **AMBIENTE LINUX — Mininet**:
 
 ```text
 exit
 ```
 
-Depois, no **SERVIDOR — raiz**:
+Depois, no **AMBIENTE LINUX — raiz**:
 
 ```bash
 bash eMSN_ENV/cleanup_setup_env.sh
@@ -460,7 +449,7 @@ As classes possíveis são:
 | `CONTAMINATED` | anomalia apareceu antes do início oficial do ataque |
 | `INVALID` | infraestrutura ou workload não permitiu uma medição válida |
 
-`INVALID` não é `FN`, e `CONTAMINATED` não deve ser descartado silenciosamente.
+`INVALID` não é `FN`, e `CONTAMINATED` não deve ser descartado.
 Ambos indicam que a repetição não pode sustentar a conclusão pretendida.
 
 ## Como a detecção funciona
@@ -480,7 +469,7 @@ vazão é:
 rate_bps = (byte_count_atual - byte_count_anterior) × 8 / Δt
 ```
 
-O coletor rejeita amostras fora de ordem, reconhece reinício de contador e não
+O coletor rejeita amostras fora de ordem, reconhece reinício do contador e não
 reingere regras DROP como tráfego legítimo. Uma série de porta serve para
 observação agregada; somente uma série de fluxo contém o par origem/destino
 necessário para bloquear tráfego.
@@ -525,7 +514,7 @@ Isso evita que um ataque prolongado seja absorvido como o novo normal.
 
 | Evento | Interpretação | Pode gerar DROP? |
 | --- | --- | --- |
-| `THROUGHPUT_SPIKE` de fluxo | vazão acima da previsão e do limiar | sim, após os gates |
+| `THROUGHPUT_SPIKE` de fluxo | vazão acima da previsão e do limiar | sim |
 | `THROUGHPUT_DROP` | vazão caiu muito abaixo da previsão | não |
 | `NEW_FLOW_SURGE` | quantidade de novos fluxos aumentou abruptamente | não |
 | spike de porta | aumento agregado, sem par IP inequívoco | não |
@@ -536,7 +525,7 @@ registro mantém `first_seen_ns`; as repetições atualizam `last_seen_ns`, pico
 
 ### 5. Fallback adaptativo
 
-Se nenhum artefato offline for configurado, existe um modo antigo que aprende
+Se nenhum artefato offline for configurado, existe um modo que aprende
 um baseline inicial com `PREDICTOR_WARMUP_SAMPLES`. Ele é útil apenas para
 compatibilidade. Experimentos reproduzíveis devem definir:
 
@@ -677,7 +666,7 @@ recebe `won=false` e o identificador do coordenador.
 A eleição atual é *first valid writer wins*. Ela não escolhe o maior score e
 não privilegia origem, destino ou menor endereço IP. O primeiro claim válido
 confirmado vence. A chave expira por TTL para permitir uma eleição posterior.
-Se o ETCD estiver indisponível, o sistema falha fechado: ninguém executa.
+Se o ETCD estiver indisponível, o sistema falha: ninguém executa.
 
 ### Modos dos agentes
 
@@ -792,7 +781,7 @@ diferentes.
 duração do fluxo e agrega os pares IP em janelas compatíveis com o runtime. O
 processamento streaming evita carregar gigabytes inteiros na memória.
 
-Os datasets originais não precisam ocupar o servidor. A preparação pode ser
+Os datasets originais não precisam ocupar espaço demasiadamente. A preparação pode ser
 executada na máquina que já armazena os CSVs; depois transfira apenas o CSV
 compacto, o `.metadata.json` e, se desejado, o modelo. `datasets/` é ignorado
 pelo Git para evitar publicação acidental dos arquivos grandes.
@@ -829,8 +818,7 @@ atacante→vítima.
 
 A preparação antepõe um baseline sintético quando uma série contém somente
 ataque. Esse baseline aproxima o roteiro baseline→ataque do Mininet, mas não é
-uma parte originalmente capturada. Essa limitação deve ser informada ao
-descrever o experimento.
+uma parte originalmente capturada.
 
 ### Criar o modelo
 
@@ -884,7 +872,7 @@ python3 train_offline_model.py prediction_history_domain*/ \
 
 Sem uma coluna independente de ground truth, o treinador considera os dados
 normais. A coluna `is_anomaly` foi produzida pelo próprio detector e não é
-verdade de referência sem revisão humana ou outra fonte de rótulos.
+verdade de referência sem revisão ou outra fonte de rótulos.
 
 ## Experimentos avançados
 
@@ -913,7 +901,7 @@ BENCHMARK_AGENTIC_ENABLED=true \
   bash scripts/run_collaborative_benchmark.sh collaborative-dry-run ddos
 ```
 
-Taxas e durações podem ser congeladas antes de uma campanha:
+Taxas e durações podem ser congeladas:
 
 ```bash
 BENCHMARK_BASELINE_RATE=5M \
@@ -1093,7 +1081,7 @@ curl -fsS -X POST http://127.0.0.1:6060/predictor/config \
   -d '{"event_cooldown_s":60}' | jq .
 ```
 
-Use booleanos JSON (`true` e `false` sem aspas). Alterar apenas `dry_run` pela
+Use booleanos JSON (`true` e `false`). Alterar apenas `dry_run` pela
 API não configura modelo, quórum, autoridade ou opt-in agentic. Use os runners
 dedicados para experimentos live.
 
