@@ -14,412 +14,402 @@ Para cada candidato, testamos: (1) se segue o formato de resposta pedido,
 alucinar dados que não existem no registro), e (3) velocidade em uso
 real (lote, pós-experimento, não interativo).
 
-## Modelos avaliados
+## Cenários de teste (os mesmos 6 para todos os modelos)
 
-- **Qwen3:8b** (Apache 2.0) — via Ollama, local
-- **DeepSeek-R1:8b** (MIT, distill sobre Qwen3) — via Ollama, local
+1. **AGREED (executor)** — decisão final positiva, domínio venceu o claim, mitigação autorizada.
+2. **WAITING_PROPOSALS** — decisão genuinamente pendente (1 de 2 domínios respondeu).
+3. **AGREED (não-executor)** — decisão final positiva, mas outro domínio coordenou a execução.
+4. **CORROBORATED** — estado intermediário do MCDA, quórum insuficiente (score 0.72, 1 de 2 domínios).
+5. **VETOED** — um domínio vetou por whitelist, decisão final negativa.
+6. **NORMAL (benigno)** — tráfego sem ataque, decisão final "sem indício de ataque".
 
 Ambiente de teste: servidor do laboratório (RTX A2000 12GB), via Ollama
 local — sem custo de API, dados não saem da rede do laboratório.
 
-## Teste 1 — AGREED, domínio vencedor do claim
+## Nota sobre a correção de prompt (aplicada após os Testes 1-2 do modelo 2)
 
-Decisão final positiva, quórum completo, mitigação autorizada.
+Nos primeiros testes, `CORROBORATED` foi ocasionalmente classificado
+como decisão "errada" em vez de estado intermediário válido. O prompt
+foi corrigido para instruir explicitamente que `CORROBORATED`,
+`WAITING`, `WAITING_PROPOSALS` são estados intermediários do protocolo,
+e só decisões finais (`AGREED`, `VETOED`, `NORMAL`, mitigação
+tentada/executada) devem ser classificadas como corretas/incorretas.
+Todos os modelos a partir do 3 (`gemma4:12b` em diante) já rodaram com o
+prompt corrigido.
 
-**Qwen3:8b** (38s) — ✅ correto, grounded na evidência:
-> A decisão "AGREED" foi tomada por quórum configurado propõe mitigação, e
-> foi correta pelos seguintes motivos: duas autoridades (192.168.10.10 e
-> 192.168.11.10) votaram por mitigação com confiança de 0,858, e a decisão
-> foi validada como "AGREED válido e fresco" com autorização. A confiança
-> elevada e a concordância entre os domínios indicam que a mitigação foi
-> justificada com base em evidências locais e contexto.
+## Nota sobre bug de detecção de veredito (script, não modelo)
 
-**DeepSeek-R1:8b** (26s) — ⚠️ ignorou evidência disponível:
-> A decisão `AGREED` foi tomada por agentes determinísticos, e foi
-> **impossível avaliar** pelos seguintes motivos: o registro não contém
-> informações sobre a necessidade de mitigação, nem sobre o resultado da
-> mitigação (se aplicada).
+Durante os testes descobrimos que a lógica original de detecção de
+veredito (buscar a palavra "incorreta" no texto) disparava falso
+positivo quando um modelo usava a frase "correta ou incorreta" dentro de
+uma explicação, sem que fosse o veredito de fato. Corrigido priorizando
+a busca por "impossível avaliar" (função `classify_assessment`,
+compartilhada entre provedores).
 
-*(O registro continha `would_execute: true`, `confidence: 0.858`, 2
-domínios votando MITIGATE — a informação existia e foi ignorada.)*
+---
 
-## Teste 2 — WAITING_PROPOSALS, decisão pendente (1 de 2 domínios respondeu)
+# Modelos ≥8B parâmetros
 
-**Qwen3:8b** (35s) — ✅ reconheceu corretamente o estado pendente:
-> A decisão "WAITING_PROPOSALS" foi tomada por falta de consenso entre os
-> domínios envolvidos, e foi impossível avaliar pelos seguintes motivos: o
-> domínio 192.168.11.10 não participou da negociação, e a decisão aguarda
-> a proposta desse domínio para ser avaliada. [...] A ausência de domínios
-> suficientes para validar a decisão impossibilita uma avaliação conclusiva.
+## Modelo 1: Qwen3:8b
 
-**DeepSeek-R1:8b** (23s) — ❌ **alucinação confirmada**:
-> [...] **Incompatibilidade de Domínios:** É observado que o domínio
-> 192.168.11.10 está ausente na lista de participantes e há uma
-> **incompatibilidade técnica entre as redes**. [...]
+**Teste 1 (AGREED, executor)** — ✅ correta, grounded:
+> "A decisão 'AGREED' foi tomada por quórum configurado propõe
+> mitigação, e foi correta pelos seguintes motivos: duas autoridades
+> (192.168.10.10 e 192.168.11.10) votaram por mitigação com confiança de
+> 0,858 [...]"
 
-*("Incompatibilidade técnica entre as redes" não existe em nenhum campo
-do registro — foi inventado pelo modelo.)*
+**Teste 2 (WAITING_PROPOSALS)** — ✅ indeterminado, correto:
+> "[...] foi impossível avaliar pelos seguintes motivos: o domínio
+> 192.168.11.10 não participou da negociação [...]"
 
-## Teste 3 — AGREED, mas domínio não venceu o claim de coordenação
+**Teste 3 (AGREED, não-executor)** — ✅ correta, mas incompleta (não menciona a nuance de "quem executa").
 
-**Qwen3:8b** — ✅ correto, mas incompleto (limitação registrada):
-> A decisão "AGREED" foi tomada por quórum configurado propõe mitigação, e
-> foi correta pelos seguintes motivos: a decisão foi autorizada, com votos
-> suficientes dos domínios relevantes, e o modelo de previsão foi avaliado
-> como confiável com um score elevado. A autoridade foi confirmada e a
-> decisão foi considerada válida e fresca.
+**Teste 4 (CORROBORATED)** — ⚠️ primeira tentativa marcou "incorreta" (bug de prompt, corrigido); após correção: ✅ indeterminado.
 
-*(Correto sobre a validade da decisão coletiva, mas não menciona a
-nuance de que esse domínio específico não foi o executor — "outro agente
-coordena". Não é erro, é uma simplificação.)*
+**Teste 5 (VETOED)** — ⚠️ overreach de julgamento: marcou "incorreta", tomando partido do lado que propôs MITIGATE ("a mitigação era necessária") sem essa conclusão estar sustentada só pela evidência.
 
-## Teste 4 — CORROBORATED, quórum insuficiente (1 de 2 domínios, score 0.72)
+**Teste 6 (NORMAL, benigno)** — ✅ correta, sem narrativa de ataque.
 
-**Qwen3:8b, primeira tentativa** — ❌ bug de prompt encontrado:
-> A decisão CORROBORATED foi tomada por pontuação/quórum ainda
-> insuficientes, e foi **incorreta** pelos seguintes motivos: o número de
-> domínios confirmados (1) é menor que o mínimo esperado (2) [...]
+**Resultado: 5/6 sem erro grave.**
 
-*(`CORROBORATED` com quórum insuficiente é um estado intermediário válido
-do protocolo, não uma decisão "errada" — o sistema está funcionando como
-projetado. O prompt original não deixava essa distinção clara.)*
+---
 
-**Correção aplicada:** o prompt passou a instruir explicitamente que
-`CORROBORATED`, `WAITING`, `WAITING_PROPOSALS` são estados intermediários
-válidos, e só decisões finais (`AGREED`, mitigação tentada/executada)
-devem ser classificadas como corretas/incorretas.
+## Modelo 2: DeepSeek-R1:8b
 
-**Qwen3:8b, após correção** — ✅ resolvido:
-> A decisão CORROBORATED foi tomada por motivo de pontuação/quórum ainda
-> insuficientes, e foi **impossível avaliar** pelos seguintes motivos: a
-> decisão é um estado intermediário do protocolo, indicando que o sistema
-> ainda não atingiu quórum ou consenso, portanto, não representa uma ação
-> final de mitigação ou acordo.
+**Teste 1 (AGREED, executor)** — ⚠️ ignorou evidência disponível:
+> "[...] foi impossível avaliar pelos seguintes motivos: o registro não
+> contém informações sobre a necessidade de mitigação [...]"
+(o registro continha `would_execute: true`, confiança 0.858, 2 domínios votando MITIGATE.)
 
-*(Reteste do Teste 1 após a correção confirmou que o caso "AGREED" não
-regrediu — continuou classificado como "correta".)*
+**Teste 2 (WAITING_PROPOSALS)** — ❌ alucinação confirmada:
+> "[...] há uma **incompatibilidade técnica entre as redes**. [...]"
+("Incompatibilidade técnica entre as redes" não existe em nenhum campo do registro.)
 
-## Teste 5 — VETOED (um domínio vetou por whitelist)
-
-**Qwen3:8b** — ⚠️ overreach de julgamento (limitação conhecida):
-> A decisão VETOED foi tomada por ao menos um domínio relevante aplicar
-> veto, e foi **incorreta** pelos seguintes motivos: o domínio de destino
-> (192.168.11.10) vetou o fluxo por estar em whitelist, mas o domínio de
-> origem (192.168.10.10) propôs mitigação com confiança de 0,82, indicando
-> que a mitigação era necessária. [...]
-
-*(Diferente de uma alucinação — não inventou nenhum dado que não existe
-— mas tomou partido de um dos lados da negociação ("a mitigação era
-necessária") sem essa conclusão estar sustentada apenas pela evidência.
-Um veto por whitelist é um mecanismo de segurança funcionando como
-projetado, não necessariamente um erro. Recomendação: revisão humana
-específica em decisões VETOED até refinarmos o prompt para esse caso.)*
-
-## Teste 6 — NORMAL, tráfego benigno (sem ataque)
-
-Este era o teste mais crítico: uma LLM que "inventa" narrativa de ataque
-onde não houve seria o pior tipo de falha possível para uma ferramenta de
-auditoria.
-
-**Qwen3:8b** — ✅ passou limpo:
-> A decisão NORMAL foi tomada por limiar Holt não confirmado, e foi
-> impossível avaliar pelos seguintes motivos: o sistema está em modo
-> authority-dry-run com atuação desativada, e a decisão agentic terminou
-> em NORMAL sem indício de ataque, indicando que o processo ainda não
-> atingiu quórum ou consenso final.
-
-Nenhuma menção a ataque, DDoS ou mitigação necessária — coerente com o
-cenário benigno.
-
-## Teste 3 (revisitado) — DeepSeek-R1:8b no mesmo evento AGREED não-executor
-
-Com o prompt já corrigido:
-
-> A decisão **AGREED** foi tomada por **quórum configurado propõe
-> mitigação**, e foi **impossível avaliar** pelos seguintes motivos: a
-> mitigação ainda não foi executada pelo sistema, apenas alcançada uma
-> decisão de consenso (AGREED) sem a implementação efetiva da mitigação.
-
-❌ **Confundiu decisão final com estado pendente.** `AGREED` é a decisão
-final do protocolo — o consenso foi alcançado. O fato de *esse domínio
-específico* não ter sido o executor (outro coordenou) não torna a
-decisão "pendente"; é uma nuance de papel, não de status. O Qwen3, no
-mesmo evento, classificou corretamente como "correta".
-
-## Teste 4 (revisitado) — DeepSeek-R1:8b em CORROBORATED
-
-> A decisão `CORROBORATED` foi tomada por um único domínio participante
-> (`192.168.10.10`) com uma pontuação de 0.720359, e foi **impossível
-> avaliar** pelos seguintes motivos: o estado `CORROBORATED` é um
-> intermediário válido do protocolo, exigindo pelo menos dois domínios
-> para atingir um consenso final [...]
-
-✅ Correto, grounded, equivalente à resposta do Qwen3 pós-correção.
-
-## Teste 5 (revisitado) — DeepSeek-R1:8b em VETOED
-
-> [...] A decisão final do protocolo (VETOED) é um estado **intermediário
-> válido** de negociação, **não uma decisão final** como AGREED ou
-> MITIGATED. Portanto, não há base para classificar sua corretude ou
-> incorreitude, pois **a decisão ainda está em andamento** e não foi
-> executada de fato.
-
-❌ **Contradição direta com a evidência.** O registro contém literalmente
-`"execution": {"reason": "decisão agentic terminou em VETOED, não em
-AGREED"}` — a palavra "terminou" (= encerrou, finalizou) está explícita
-no texto fornecido. O modelo afirmou o oposto do que o registro diz. Isso
-não é uma invenção de dado novo (como no Teste 2), mas uma contradição de
-um fato textual explícito — mesma gravidade prática.
-
-## Teste 6 (revisitado) — DeepSeek-R1:8b em NORMAL (benigno)
-
-> A decisão **NORMAL** foi tomada por ambos os agentes (fonte e destino)
-> concordarem que a taxa de transferência está dentro do intervalo
-> previsto pelo modelo Holt, e foi **correta** pelos seguintes motivos:
-> os votos coincidentes e a confirmação de que a vazão observada não
-> ultrapassa os limites do modelo demonstram que o tráfego é normal [...]
-
-✅ Correto e bem fundamentado — nesse caso específico, tão bom quanto (ou
-levemente mais completo que) a resposta do Qwen3.
-
-## Resumo (6 testes, ambos os modelos)
-
-| Teste | Cenário | Qwen3:8b | DeepSeek-R1:8b |
-|---|---|---|---|
-| 1 | AGREED (executor) | ✅ correto | ⚠️ ignorou evidência disponível |
-| 2 | WAITING_PROPOSALS | ✅ correto | ❌ alucinou dado inexistente |
-| 3 | AGREED (não-executor) | ✅ correto (incompleto) | ❌ confundiu decisão final com pendente |
-| 4 | CORROBORATED | ✅ correto | ✅ correto |
-| 5 | VETOED | ⚠️ overreach de julgamento | ❌ contradisse texto explícito da evidência |
-| 6 | NORMAL (benigno) | ✅ correto | ✅ correto |
-
-**Qwen3:8b: 5/6 sem erro grave (1 limitação leve, sem contradição de
-evidência). DeepSeek-R1:8b: 2/6 sem erro grave (1 alucinação de dado
-inexistente, 1 contradição direta de texto explícito, 2 confusões de
-classificação de estado).**
-
-Nota de rigor: os Testes 1 e 2 do DeepSeek-R1 rodaram antes da correção
-do prompt (mesma versão testada nos Testes 3-6 de ambos os modelos); a
-correção melhorou visivelmente as respostas dele nesses cenários também,
-mas mesmo assim ele cometeu 2 erros novos (Testes 3 e 5) que o Qwen3 não
-cometeu nos mesmos eventos.
-
-## Correção de bug no script (detecção de veredito)
-
-Durante os testes do gemma3:12b, o Teste 4 revelou um bug na própria
-lógica de detecção de veredito do script (não no modelo): a narrativa do
-gemma3 continha a frase *"classificar a decisão como correta ou
-incorreta seria prematuro"* — e a checagem simplista por substring
-(`"incorreta" in lowered`) disparou, marcando `assessment: "incoerente"`
-mesmo a resposta dizendo claramente "impossível avaliar". Corrigido
-dando prioridade à busca por "impossível avaliar" antes de checar
-"correta"/"incorreta" (função `classify_assessment`, compartilhada entre
-todos os provedores).
-
-## gemma4:12b — todos os 6 testes
-
-**Teste 1 (AGREED, executor)** — ✅ correto:
-> A decisão AGREED foi tomada porque o quórum de 2 votos exigidos [...]
-> foi alcançado [...]. A decisão foi correta, pois o sistema identificou
-> um consenso unânime de mitigação com confiança de 0.858386 [...].
-> Embora a execução não tenha ocorrido, isso se deve ao modo de operação
-> "authority-dry-run" [...], e não a uma falha lógica na tomada de decisão.
-
-**Teste 2 (WAITING_PROPOSALS)** — ✅ correto, grounded.
-
-**Teste 3 (AGREED, não-executor)** — ✅ **melhor resposta registrada até
-agora para este cenário**, resolvendo a limitação que o Qwen3 tinha:
-> [...] Embora a execução não tenha ocorrido localmente (dry-run), isso
-> se deve ao fato de o fluxo pertencer a outro coordenador, e não a um
-> erro de detecção ou lógica do protocolo.
+**Teste 3 (AGREED, não-executor)** — ❌ confundiu decisão final com estado pendente ("a mitigação ainda não foi executada... sem a implementação efetiva").
 
 **Teste 4 (CORROBORATED)** — ✅ correto, grounded.
 
-**Teste 5 (VETOED)** — ✅ **melhor resposta registrada até agora para
-este cenário**, resolvendo a limitação que o Qwen3 tinha (overreach de
-julgamento):
-> [...] o sistema operou conforme o protocolo de consenso multi-domínio,
-> onde a proposta de mitigação do domínio de origem foi invalidada pelo
-> status de "whitelist" do destino [...] o sistema agiu corretamente ao
-> respeitar a autoridade do domínio de destino sobre sua própria
-> infraestrutura.
+**Teste 5 (VETOED)** — ❌ contradição direta com a evidência: disse que VETOED "ainda está em andamento", mas o registro diz literalmente "decisão agentic terminou em VETOED".
 
-*(Diferente do Qwen3, que havia dito "a mitigação era necessária"
-tomando partido do lado que propôs MITIGATE, o gemma4 avalia o
-**resultado do protocolo** como correto — o veto funcionando como
-mecanismo de segurança projetado — sem tomar partido não sustentado
-pela evidência.)*
+**Teste 6 (NORMAL, benigno)** — ✅ correto e bem fundamentado.
 
-**Teste 6 (NORMAL, benigno)** — ✅ correto, sem narrativa de ataque.
+**Resultado: 2/6 sem erro grave.**
 
-**Resultado: 6/6 sem nenhum erro, incluindo as duas nuances que
-derrubaram o Qwen3.**
+---
 
-## gemma3:12b — todos os 6 testes
+## Modelo 3: gemma4:12b
 
-Padrão sistemático encontrado: em 4 dos 6 testes, o modelo tratou
-decisões **finais** (`AGREED`, `VETOED`, `NORMAL` — que o próprio
-registro descreve com a palavra "terminou") como se ainda estivessem
-"em andamento", só porque a execução real não foi tentada (efeito do
-modo dry-run). Mesmo tipo de confusão vista no DeepSeek-R1, mas mais
-frequente.
+**Teste 1 (AGREED, executor)** — ✅ correta:
+> "[...] Embora a execução não tenha ocorrido, isso se deve ao modo de
+> operação 'authority-dry-run' [...], e não a uma falha lógica na tomada
+> de decisão."
 
-- **Teste 1 (AGREED, executor)** — ⚠️ conservador demais: disse
-  "impossível avaliar" porque "a execução da mitigação não foi tentada",
-  ignorando que AGREED já é a decisão final segundo o protocolo.
-- **Teste 2 (WAITING_PROPOSALS)** — ✅ correto (esse é genuinamente
-  pendente, então a resposta "indeterminado" está certa aqui).
-- **Teste 3 (AGREED, não-executor)** — ⚠️ mesmo padrão do Teste 1.
-- **Teste 4 (CORROBORATED)** — ✅ correto (rótulo já corrigido pelo bug
-  do script, ver acima).
-- **Teste 5 (VETOED)** — ⚠️ mesmo padrão: disse que "o processo ainda
-  não atingiu um estado final", contradizendo o texto explícito do
-  registro ("decisão agentic terminou em VETOED").
-- **Teste 6 (NORMAL, benigno)** — ⚠️ mesmo padrão, tratou a decisão como
-  "provisória".
+**Teste 2 (WAITING_PROPOSALS)** — ✅ indeterminado, grounded.
 
-**Resultado: 2/6 sem o padrão de erro (nenhuma alucinação de dado novo,
-mas confusão sistemática entre "não executado por config" e "decisão
-não finalizada").**
+**Teste 3 (AGREED, não-executor)** — ✅ **melhor resposta registrada** para este cenário:
+> "[...] isso se deve ao fato de o fluxo pertencer a outro coordenador, e
+> não a um erro de detecção ou lógica do protocolo."
 
-## Resumo final (4 modelos, 6 testes cada)
+**Teste 4 (CORROBORATED)** — ✅ correta, grounded.
 
-| Teste | Qwen3:8b | DeepSeek-R1:8b | gemma4:12b | gemma3:12b |
-|---|---|---|---|---|
-| 1 AGREED (executor) | ✅ | ⚠️ | ✅ | ⚠️ |
-| 2 WAITING_PROPOSALS | ✅ | ❌ alucinou | ✅ | ✅ |
-| 3 AGREED (não-executor) | ✅ (incompleto) | ❌ | ✅ **melhor** | ⚠️ |
-| 4 CORROBORATED | ✅ | ✅ | ✅ | ✅ |
-| 5 VETOED | ⚠️ | ❌ | ✅ **melhor** | ⚠️ |
-| 6 NORMAL (benigno) | ✅ | ✅ | ✅ | ⚠️ |
-| **Sem erro/limitação** | **5/6** | **2/6** | **6/6** | **2/6** |
+**Teste 5 (VETOED)** — ✅ **melhor resposta registrada** para este cenário, sem overreach:
+> "[...] o sistema agiu corretamente ao respeitar a autoridade do
+> domínio de destino sobre sua própria infraestrutura."
 
-**gemma4:12b teve o melhor resultado entre os 4 modelos testados —
-zero erros, incluindo as duas únicas limitações que o Qwen3:8b (segundo
-melhor colocado) apresentou.** Ambiente de teste idêntico para todos
-(mesmo servidor, RTX A2000 12GB, mesmo prompt corrigido, mesmos 6
-`decision_events`).
+**Teste 6 (NORMAL, benigno)** — ✅ correta, sem narrativa de ataque.
 
-Considerações que ainda pesam a favor do Qwen3:8b caso a licença seja um
-critério relevante: Apache 2.0 é mais permissiva/simples de citar do que
-a licença do Gemma (Gemma Terms of Use, Google), embora esta última
-também permita uso e redistribuição.
+**Resultado: 6/6 sem nenhum erro.**
 
-## qwen3.5:9b — todos os 6 testes
+---
 
-Sucessor direto do Qwen3:8b (o modelo que o orientador mais gostou).
-**Resultado: 6/6 sem nenhum erro.** Resolveu bem as duas nuances que
-derrubaram o Qwen3 original:
+## Modelo 4: gemma3:12b
 
-- Teste 3 (AGREED não-executor): "a decisão é tecnicamente correta
-  quanto ao consenso alcançado, embora a atuação física da mitigação
-  tenha sido suprimida por protocolo em favor da coordenação
-  hierárquica" — distingue certo "decisão válida" de "não foi esse
-  domínio que executou".
-- Teste 5 (VETOED): trata como fato neutro, sem tomar partido — "a
-  mitigação foi corretamente bloqueada... apesar da detecção de
-  provável ataque DDoS pela origem" — reconhece as duas evidências sem
-  escolher lado.
+Padrão sistemático: trata decisões **finais** como "ainda em andamento" mesmo quando o registro diz "terminou".
 
-## granite4.1:8b — todos os 6 testes
+**Teste 1 (AGREED, executor)** — ⚠️ conservador demais: "impossível avaliar" porque "a execução da mitigação não foi tentada".
 
-**Resultado: 4/6 sem problema.** Duas questões encontradas:
+**Teste 2 (WAITING_PROPOSALS)** — ✅ correto (este caso é genuinamente pendente).
 
-- Teste 1: imprecisão de linguagem — escreveu "a decisão foi executada
-  em um modo de authority-dry-run, simulando a mitigação sem alterações
-  reais", mas o registro mostra `executed: false, attempted: false`
-  (nada foi executado nem simulado de fato, só autorizado).
-- Teste 6: mesmo padrão de erro do DeepSeek-R1/gemma3 — tratou uma
-  decisão final ("decisão agentic terminou em NORMAL") como "ainda em
-  andamento, aguardando quórum". Também apresentou um artefato de
-  formatação (duplicação de parágrafo dentro de um bloco de código).
+**Teste 3 (AGREED, não-executor)** — ⚠️ mesmo padrão do Teste 1.
 
-## ornith:9b — todos os 6 testes
+**Teste 4 (CORROBORATED)** — ✅ correto (rótulo corrigido pelo bug do script).
 
-**Resultado: 5/6, com um erro conceitual notável.** No Teste 1 (AGREED,
-executor), marcou como **"INCORRETA"** (veredito duro, não
-"indeterminado") só porque o dry-run bloqueou a execução física —
-confundindo um guard-rail de segurança intencional com uma falha. O
-mais revelador: no Teste 3, um evento quase idêntico (mesma lógica de
-fundo) foi corretamente marcado "coerente" pelo mesmo modelo — ou seja,
-foi inconsistente com ele mesmo. Testes 2, 4, 5, 6: sólidos.
+**Teste 5 (VETOED)** — ⚠️ "o processo ainda não atingiu um estado final", contradizendo "decisão agentic terminou em VETOED".
 
-## ornith-1.5:9b — todos os 6 testes
+**Teste 6 (NORMAL, benigno)** — ⚠️ mesmo padrão, tratou como "provisória".
 
-**Resultado: 6/6 sem nenhum erro.** Melhor formulação registrada até
-agora para a distinção "decisão de consenso correta" vs. "não resultou
-em ação real" (Teste 1). No Teste 6, foi além do pedido e acrescentou
-uma observação crítica proativa e factualmente correta: os dois
-domínios compartilham o mesmo `model_id`
-(`holt_residual:8dc3603f632f166d3f12b1c1`), o que "pode mascarar
-divergências reais no comportamento do tráfego" se reutilizado entre
-domínios distintos — um insight de auditoria genuíno, sem extrapolar
-além da evidência.
+**Resultado: 2/6 sem o padrão de erro.**
 
-## lfm2.5:8b — todos os 6 testes
+---
 
-**Resultado: 2/6.** Mesmo padrão sistemático do DeepSeek-R1/gemma3/
-lfm2.5: trata decisões finais (AGREED, VETOED, NORMAL) como "ainda em
-andamento" mesmo quando o registro diz explicitamente "terminou". O
-raciocínio interno capturado (campo `_thinking`) mostra que, no Teste 5,
-o modelo chega a citar corretamente a instrução do prompt ("só
-classifique correta/incorreta quando final, ex: AGREED"), mas erra a
-aplicação, concluindo que VETOED "não é final" só por não estar
-explicitamente na lista de exemplos citados — ignorando o texto
-"terminou em VETOED" que estava na própria evidência. Modelo otimizado
-para velocidade em hardware fraco, não para profundidade de raciocínio;
-o resultado é consistente com esse objetivo declarado.
+## Modelo 5: qwen3.5:9b
 
-## llama3.1:8b — pendente
+**Teste 1 (AGREED, executor)** — ✅ correta, grounded.
 
-Não foi possível testar: o servidor do laboratório apresentou um
-problema de disco (partição WSL cheia por acúmulo dos pesos dos modelos
-já testados, ~52GB) durante o download deste modelo, causando erros de
-I/O em todo o sistema. Resolvido esvaziando
-`~/.ollama/models/blobs/` via PowerShell do Windows (fora do WSL). Teste
-deste modelo será concluído em uma sessão futura.
+**Teste 2 (WAITING_PROPOSALS)** — ✅ indeterminado, correto.
 
-## Resumo final (9 modelos testados, 6 cenários cada)
+**Teste 3 (AGREED, não-executor)** — ✅ boa distinção:
+> "[...] embora a atuação física da mitigação tenha sido suprimida por
+> protocolo em favor da coordenação hierárquica."
 
-| Teste | Qwen3:8b | DeepSeek-R1:8b | gemma4:12b | gemma3:12b | qwen3.5:9b | granite4.1:8b | ornith:9b | ornith-1.5:9b | lfm2.5:8b |
-|---|---|---|---|---|---|---|---|---|---|
-| 1 AGREED (executor) | ✅ | ⚠️ | ✅ | ⚠️ | ✅ | ⚠️ | ❌ | ✅ | ⚠️ |
-| 2 WAITING_PROPOSALS | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| 3 AGREED (não-executor) | ✅ | ❌ | ✅ | ⚠️ | ✅ | ✅ | ✅ | ✅ | ⚠️ |
-| 4 CORROBORATED | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| 5 VETOED | ⚠️ | ❌ | ✅ | ⚠️ | ✅ | ✅ | ✅ | ✅ | ⚠️ |
-| 6 NORMAL (benigno) | ✅ | ✅ | ✅ | ⚠️ | ✅ | ⚠️ | ✅ | ✅ | ⚠️ |
-| **Sem erro/limitação** | 5/6 | 2/6 | **6/6** | 2/6 | **6/6** | 4/6 | 5/6 | **6/6** | 2/6 |
+**Teste 4 (CORROBORATED)** — ✅ indeterminado, correto.
 
-Três modelos empatados no topo com **6/6 sem nenhum erro**:
-`gemma4:12b`, `qwen3.5:9b` e `ornith-1.5:9b`.
+**Teste 5 (VETOED)** — ✅ neutro, sem tomar partido:
+> "[...] a mitigação foi corretamente bloqueada... apesar da detecção de
+> provável ataque DDoS pela origem."
 
-## Recomendação (aberta para decisão do orientador)
+**Teste 6 (NORMAL, benigno)** — ✅ correta, sem narrativa de ataque.
 
-Com 9 modelos testados (falta só o `llama3.1:8b`, pendente por
-problema de infraestrutura), três empatam no topo com 6/6 sem erro:
+**Resultado: 6/6 sem nenhum erro.**
 
-| | qwen3.5:9b | gemma4:12b | ornith-1.5:9b |
-|---|---|---|---|
-| Testes sem erro | 6/6 | 6/6 | 6/6 |
-| Licença | Apache 2.0 | Gemma Terms of Use | **MIT** |
-| Tamanho | 6.6GB | ~8GB | 6.6GB |
-| Observação extra | Sucessor direto do Qwen3:8b (o modelo já aprovado) | Melhor resposta registrada nos Testes 3 e 5 na rodada anterior | Único que acrescentou um insight de auditoria proativo e correto (Teste 6) |
+---
 
-Os três são escolhas defensáveis. Critérios para desempate, se
-necessário:
-- **Continuidade**: `qwen3.5:9b` é a evolução natural do modelo que já
-  foi validado e aprovado, reduzindo risco de mudança de comportamento.
-- **Licença**: `ornith-1.5:9b` tem a licença mais permissiva (MIT) das
-  três, seguido por `qwen3.5:9b` (Apache 2.0); `gemma4:12b` tem a
-  licença mais restritiva do trio (Gemma Terms of Use).
-- **Qualidade adicional observada**: `ornith-1.5:9b` foi o único a
-  agregar valor além do pedido (a observação sobre `model_id`
-  compartilhado no Teste 6), o que pode interessar para um caso de uso
-  de auditoria mais rico.
+## Modelo 6: granite4.1:8b
 
-`granite4.1:8b` (4/6) e `ornith:9b` (5/6) ficam como alternativas
-secundárias, com problemas pontuais documentados acima.
-`DeepSeek-R1:8b`, `gemma3:12b` e `lfm2.5:8b` (2/6 cada) apresentaram o
-mesmo padrão recorrente de tratar decisões finais como pendentes, e não
-são recomendados para esta tarefa.
+**Teste 1 (AGREED, executor)** — ⚠️ imprecisão de linguagem: disse que a mitigação "foi executada... simulando", mas o registro mostra `executed: false, attempted: false` (nada foi executado nem simulado, só autorizado).
+
+**Teste 2 (WAITING_PROPOSALS)** — ✅ indeterminado, correto.
+
+**Teste 3 (AGREED, não-executor)** — ✅ correta, grounded (cita MCDA score 0.915).
+
+**Teste 4 (CORROBORATED)** — ✅ indeterminado, correto.
+
+**Teste 5 (VETOED)** — ✅ correta, grounded.
+
+**Teste 6 (NORMAL, benigno)** — ⚠️ mesmo padrão de tratar decisão final como pendente; também apresentou artefato de formatação (duplicação de parágrafo).
+
+**Resultado: 4/6 sem problema.**
+
+---
+
+## Modelo 7: ornith:9b
+
+**Teste 1 (AGREED, executor)** — ❌ marcou **"INCORRETA"** (veredito duro) só porque o dry-run bloqueou a execução física, confundindo guard-rail de segurança com falha.
+
+**Teste 2 (WAITING_PROPOSALS)** — ✅ indeterminado, correto.
+
+**Teste 3 (AGREED, não-executor)** — ✅ correta — evento quase idêntico ao Teste 1, mas classificado certo (inconsistência do próprio modelo).
+
+**Teste 4 (CORROBORATED)** — ✅ indeterminado, correto.
+
+**Teste 5 (VETOED)** — ✅ correta, grounded.
+
+**Teste 6 (NORMAL, benigno)** — ✅ correta, sem narrativa de ataque.
+
+**Resultado: 5/6, com um erro conceitual notável (e auto-inconsistência entre Testes 1 e 3).**
+
+---
+
+## Modelo 8: ornith-1.5:9b
+
+**Teste 1 (AGREED, executor)** — ✅ melhor formulação registrada:
+> "[...] embora a decisão de *consenso* seja correta, [...] não resultou
+> em ação real de mitigação."
+
+**Teste 2 (WAITING_PROPOSALS)** — ✅ indeterminado, correto.
+
+**Teste 3 (AGREED, não-executor)** — ✅ correta, grounded.
+
+**Teste 4 (CORROBORATED)** — ✅ indeterminado, correto.
+
+**Teste 5 (VETOED)** — ✅ correta, reconheceu como decisão terminal.
+
+**Teste 6 (NORMAL, benigno)** — ✅ correta **+ insight extra proativo e correto**: apontou que os dois domínios compartilham o mesmo `model_id`, o que "pode mascarar divergências reais" se reutilizado entre domínios distintos.
+
+**Resultado: 6/6 sem nenhum erro.**
+
+---
+
+## Modelo 9: lfm2.5:8b
+
+Mesmo padrão sistemático de tratar decisões finais como pendentes. O campo `_thinking` capturado mostra que, no Teste 5, o modelo chega a citar a instrução correta do prompt mas erra a aplicação.
+
+**Teste 1 (AGREED, executor)** — ⚠️ mesmo padrão.
+
+**Teste 2 (WAITING_PROPOSALS)** — ✅ correto.
+
+**Teste 3 (AGREED, não-executor)** — ⚠️ mesmo padrão.
+
+**Teste 4 (CORROBORATED)** — ✅ correto.
+
+**Teste 5 (VETOED)** — ⚠️ mesmo padrão, apesar de citar a regra certa no raciocínio interno.
+
+**Teste 6 (NORMAL, benigno)** — ⚠️ mesmo padrão.
+
+**Resultado: 2/6 sem o padrão de erro.**
+
+---
+
+## Modelo 10: llama3.1:8b
+
+Confirmou a expectativa de ser o candidato mais fraco entre os ≥8B (mais antigo, sem thinking mode). Marcou **todos os 6 testes como "indeterminado"**, incluindo os três casos de decisão final.
+
+**Teste 1 (AGREED, executor)** — ⚠️ mesmo padrão.
+
+**Teste 2 (WAITING_PROPOSALS)** — ✅ correto (com bug de repetição de frase).
+
+**Teste 3 (AGREED, não-executor)** — ⚠️ mesmo padrão + generalização não fundamentada no registro ("outros estados intermediários... podem ser alcançados antes que uma decisão final seja tomada").
+
+**Teste 4 (CORROBORATED)** — ✅ correto.
+
+**Teste 5 (VETOED)** — ⚠️ mesmo padrão.
+
+**Teste 6 (NORMAL, benigno)** — ⚠️ mesmo padrão.
+
+**Resultado: 2/6 sem o padrão de erro.**
+
+---
+
+# SLMs — modelos até 1 bilhão de parâmetros
+
+Pedido específico do orientador: testar 3-5 modelos ≤1B para avaliar se
+o limite de tamanho ainda permite uso confiável. Resultado adiantado:
+**nenhum dos 5 modelos testados foi utilizável** — ver conclusão ao final.
+
+## Modelo 11: qwen3.5:0.8b
+
+**Teste 1 (AGREED, executor)** — ⚠️ superficial, sem citar dado concreto: "foi classificada como correta nos termos do fluxo de rede [...] baseado na solicitação e nos votos confirmados".
+
+**Teste 2 (WAITING_PROPOSALS)** — ❌ inventou termo técnico inexistente: "o evento de segurança ainda não atingiu o critério de 'GREGATORIAL' (agrego)".
+
+**Teste 3 (AGREED, não-executor)** — ⚠️ superficial.
+
+**Teste 4 (CORROBORATED)** — ⚠️ superficial.
+
+**Teste 5 (VETOED)** — ❌ **alucinação grave**: "gerou uma validação suficiente para que a decisão de VETOED se transformasse em AGREED na execução final" — isso nunca aconteceu; o registro diz "terminou em VETOED, não em AGREED".
+
+**Teste 6 (NORMAL, benigno)** — ❌ **alucinação mais grave de toda a avaliação**: "confirmando a existência do ataque mas aguardando o quórum" — o registro diz explicitamente "sem indício de ataque", tráfego benigno com confiança 0.91/0.89. O modelo inventou um ataque onde não havia nenhum.
+
+**Resultado: 0/6 confiável.**
+
+---
+
+## Modelo 12: granite4:350m
+
+**Teste 1 (AGREED, executor)** — ⚠️ vago, sem dado concreto: "foi finalizada com a aprovação do modelo".
+
+**Teste 2 (WAITING_PROPOSALS)** — ⚠️ vago.
+
+**Teste 3 (AGREED, não-executor)** — ⚠️ quase sem conteúdo informativo: "foi tomada por a autoridade, e foi final, com motivos de autoridade e avaliação".
+
+**Teste 4 (CORROBORATED)** — ❌ **copiou o template do prompt literalmente**, incluindo os marcadores `<...>`: "é <correta/incorreta/impossível avaliar>. A decisão foi <correta> e foi tomada por <motivo>, <motivo>."
+
+**Teste 5 (VETOED)** — ⚠️ vago, termina sem conclusão real.
+
+**Teste 6 (NORMAL, benigno)** — ⚠️ vago, não sintetiza os dados de fato.
+
+**Resultado: 0/6 utilizável.**
+
+---
+
+## Modelo 13: gemma3:1b
+
+**Teste 1 (AGREED, executor)** — ⚠️ verboso mas sem citar números reais, termina de forma confusa.
+
+**Teste 2 (WAITING_PROPOSALS)** — ⚠️ confundiu unidade: tratou um timestamp em nanossegundos como "minutos".
+
+**Teste 3 (AGREED, não-executor)** — ⚠️ verboso, com algum conteúdo real.
+
+**Teste 4 (CORROBORATED)** — ❌ **alucinou IPs inexistentes**: "os domínios 192.2.2.10 e 192.2.2.11" (os reais são 192.168.10.10 e 192.168.11.10).
+
+**Teste 5 (VETOED)** — ❌ **inverteu a lógica do veto**: disse que o motivo foi considerar a aplicação "uma fonte de ameaça significativa", quando na verdade foi porque o destino estava em **whitelist** (confiável) — o oposto exato.
+
+**Teste 6 (NORMAL, benigno)** — ❌ vazou marcadores de template literais (`<decision>`, `<agentic>`).
+
+**Resultado: 0/6 confiável, com 2 alucinações graves.**
+
+---
+
+## Modelo 14: qwen2.5:0.5b
+
+**Teste 1 (AGREED, executor)** — ⚠️ vago.
+
+**Teste 2 (WAITING_PROPOSALS)** — ⚠️ vago.
+
+**Teste 3 (AGREED, não-executor)** — ❌ vazou placeholder de instrução literal: "O motivo final do rejeito é: 'Aqui está o motivo de rejeição: [motivo para rejeição]'".
+
+**Teste 4 (CORROBORATED)** — ❌ **texto sem sentido gramatical/semântico**: "A decisão tomada foi COBRADA e está em andamento. A análise do registro é SORTEIRA, então a decisão foi FEITA."
+
+**Teste 5 (VETOED)** — ❌ loop repetitivo quase idêntico 3 vezes seguidas, degeneração de texto.
+
+**Teste 6 (NORMAL, benigno)** — ⚠️ vago, sem síntese real.
+
+**Resultado: 0/6, pior nível de coerência textual da avaliação.**
+
+---
+
+## Modelo 15: llama3.2:1b
+
+**Teste 1 (AGREED, executor)** — ❌ repetiu a mesma frase genérica 4 vezes seguidas, com placeholder `<X>` não preenchido.
+
+**Teste 2 (WAITING_PROPOSALS)** — ⚠️ vago, sem dado concreto citado.
+
+**Teste 3 (AGREED, não-executor)** — ⚠️ vago.
+
+**Teste 4 (CORROBORATED)** — ❌ vazou dois placeholders de template (`<X>` e `<Y>`).
+
+**Teste 5 (VETOED)** — ❌ **alucinação grave**: "a mitigação de DDoS foi realizada e a mitigação de fato foi tentada" — o registro diz `attempted: false, executed: false` (a mitigação foi bloqueada pelo veto, nunca tentada).
+
+**Teste 6 (NORMAL, benigno)** — ⚠️ vago, sem dado concreto.
+
+**Resultado: 0/6, com alucinação factual grave.**
+
+---
+
+# Resumo geral — 15 modelos, 6 cenários cada
+
+## Modelos ≥8B (10 modelos)
+
+| Teste | Qwen3:8b | DeepSeek-R1:8b | gemma4:12b | gemma3:12b | qwen3.5:9b | granite4.1:8b | ornith:9b | ornith-1.5:9b | lfm2.5:8b | llama3.1:8b |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 AGREED (executor) | ✅ | ⚠️ | ✅ | ⚠️ | ✅ | ⚠️ | ❌ | ✅ | ⚠️ | ⚠️ |
+| 2 WAITING_PROPOSALS | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 3 AGREED (não-executor) | ✅ | ❌ | ✅ | ⚠️ | ✅ | ✅ | ✅ | ✅ | ⚠️ | ⚠️ |
+| 4 CORROBORATED | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 5 VETOED | ⚠️ | ❌ | ✅ | ⚠️ | ✅ | ✅ | ✅ | ✅ | ⚠️ | ⚠️ |
+| 6 NORMAL (benigno) | ✅ | ✅ | ✅ | ⚠️ | ✅ | ⚠️ | ✅ | ✅ | ⚠️ | ⚠️ |
+| **Sem erro/limitação** | 5/6 | 2/6 | **6/6** | 2/6 | **6/6** | 4/6 | 5/6 | **6/6** | 2/6 | 2/6 |
+
+Três modelos empatados no topo com **6/6 sem nenhum erro**: `gemma4:12b`, `qwen3.5:9b` e `ornith-1.5:9b`.
+
+## SLMs ≤1B (5 modelos)
+
+| Teste | qwen3.5:0.8b | granite4:350m | gemma3:1b | qwen2.5:0.5b | llama3.2:1b |
+|---|---|---|---|---|---|
+| 1 AGREED (executor) | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ❌ |
+| 2 WAITING_PROPOSALS | ❌ | ⚠️ | ⚠️ | ⚠️ | ⚠️ |
+| 3 AGREED (não-executor) | ⚠️ | ⚠️ | ⚠️ | ❌ | ⚠️ |
+| 4 CORROBORATED | ⚠️ | ❌ | ❌ | ❌ | ❌ |
+| 5 VETOED | ❌ | ⚠️ | ❌ | ❌ | ❌ |
+| 6 NORMAL (benigno) | ❌ | ⚠️ | ❌ | ⚠️ | ⚠️ |
+| **Sem erro/limitação** | **0/6** | **0/6** | **0/6** | **0/6** | **0/6** |
+
+**Resultado unânime: nenhum modelo ≤1B testado foi utilizável.** Cinco
+famílias diferentes (Qwen, IBM, Google, Meta), 30 testes no total, com
+falhas sistematicamente piores que qualquer modelo ≥8B: vazamento
+literal de placeholders de template, texto sem sentido gramatical, e
+alucinações graves que inverteram fatos de segurança (inventar ataque
+em tráfego benigno, inverter o motivo de um veto, afirmar que uma
+mitigação foi executada quando foi bloqueada). Isso indica um **limiar
+mínimo de capacidade**, em algum ponto entre ~1B e ~8B parâmetros, abaixo
+do qual a tarefa de síntese estruturada + julgamento simplesmente não
+funciona de forma confiável.
+
+# Recomendação final
+
+**Para uso em produção: `qwen3.5:9b`, `gemma4:12b` ou `ornith-1.5:9b`**
+(empatados em 6/6). Critérios de desempate:
+- **Continuidade**: `qwen3.5:9b` é a evolução direta do modelo que já
+  foi aprovado (Qwen3:8b).
+- **Licença**: `ornith-1.5:9b` tem a licença mais permissiva (MIT).
+- **Qualidade extra observada**: `ornith-1.5:9b` foi o único a agregar
+  um insight de auditoria proativo e correto.
+
+**Para SLMs ≤1B: nenhum recomendado.** Todos os 5 testados apresentaram
+falhas graves o suficiente (alucinações factuais, vazamento de
+template, texto sem sentido) para serem descartados desta tarefa
+específica. Se o requisito de tamanho ≤1B for inegociável por outro
+motivo (custo, latência, hardware), recomenda-se reavaliar o desenho da
+tarefa (ex: usar o SLM só para classificação categórica simples, não
+para geração de texto livre) em vez de usar um desses modelos como
+estão.
