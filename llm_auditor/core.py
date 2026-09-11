@@ -346,6 +346,9 @@ def evaluate_episode(
         if (((event.get("authority") or {}).get("claim") or {}).get("won")
             is True)
     ]
+    authorized_non_winners = [
+        event for event in authorized if event not in winners
+    ]
     mode = str(
         metadata.get("agentic_mode")
         or next((event.get("mode") for event in agent_events
@@ -433,9 +436,8 @@ def evaluate_episode(
                 winner_execution,
             ))
 
-            non_winners = [event for event in authorized if event not in winners]
             non_winner_executions = [
-                event.get("execution") or {} for event in non_winners
+                event.get("execution") or {} for event in authorized_non_winners
             ]
             checks.append(_check(
                 "non_winners_do_not_actuate",
@@ -445,7 +447,7 @@ def evaluate_episode(
                     and execution.get("would_execute") is not True
                     for execution in non_winner_executions
                 ) else "FAIL",
-                {"events": len(non_winners)},
+                {"events": len(authorized_non_winners)},
             ))
 
             if mode == "authority-dry-run":
@@ -597,6 +599,36 @@ def evaluate_episode(
                                or "unknown") for event in events)
     executions = [event.get("execution") or {} for event in agent_events
                   if isinstance(event.get("execution"), dict)]
+    winner_executions = [event.get("execution") or {} for event in winners]
+    if (mode == "authority-dry-run" and len(winners) == 1
+            and winner_executions
+            and winner_executions[0].get("would_execute") is True
+            and winner_executions[0].get("attempted") is not True
+            and winner_executions[0].get("executed") is not True):
+        winner_behavior = "SELECTED_WOULD_EXECUTE_DRY_RUN_SUPPRESSED"
+    elif any(item.get("executed") is True for item in winner_executions):
+        winner_behavior = "EXECUTED"
+    elif any(item.get("attempted") is True for item in winner_executions):
+        winner_behavior = "ATTEMPTED_NOT_EXECUTED"
+    elif winners:
+        winner_behavior = "SELECTED_WITHOUT_EXECUTION_EVIDENCE"
+    else:
+        winner_behavior = "NO_CLAIM_WINNER"
+
+    non_winner_executions = [
+        event.get("execution") or {} for event in authorized_non_winners
+    ]
+    if authorized_non_winners and all(
+        item.get("attempted") is not True
+        and item.get("executed") is not True
+        and item.get("would_execute") is not True
+        for item in non_winner_executions
+    ):
+        non_winner_behavior = "ABSTAINED_OTHER_COORDINATOR"
+    elif authorized_non_winners:
+        non_winner_behavior = "UNEXPECTED_EXECUTION_EVIDENCE"
+    else:
+        non_winner_behavior = "NO_AUTHORIZED_NON_WINNER"
 
     return {
         "episode_id": episode["episode_id"],
@@ -623,6 +655,9 @@ def evaluate_episode(
             "agentic_agreed_events": len(agreed),
             "agentic_authorized_events": len(authorized),
             "atomic_claim_winner_events": len(winners),
+            "authorized_non_winner_events": len(authorized_non_winners),
+            "claim_winner_behavior": winner_behavior,
+            "authorized_non_winner_behavior": non_winner_behavior,
             "attempted_execution_events": sum(
                 item.get("attempted") is True for item in executions
             ),

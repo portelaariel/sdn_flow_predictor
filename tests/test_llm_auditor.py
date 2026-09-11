@@ -14,6 +14,7 @@ from llm_auditor.ollama import (
     EXPLANATION_SCHEMA,
     OllamaAuditClient,
     OllamaAuditError,
+    explanation_prompt,
 )
 
 
@@ -158,6 +159,17 @@ class LLMAuditorTests(unittest.TestCase):
         )
         self.assertEqual(episode["claim_winners"], ["domain-0"])
         self.assertEqual(
+            episode["normalized_facts"]["claim_winner_behavior"],
+            "SELECTED_WOULD_EXECUTE_DRY_RUN_SUPPRESSED",
+        )
+        self.assertEqual(
+            episode["normalized_facts"]["authorized_non_winner_behavior"],
+            "ABSTAINED_OTHER_COORDINATOR",
+        )
+        self.assertEqual(
+            episode["normalized_facts"]["authorized_non_winner_events"], 1
+        )
+        self.assertEqual(
             [item["state"] for item in episode["transitions"]],
             ["SUSPECT", "WAITING_PROPOSALS", "MITIGATE", "AGREED"],
         )
@@ -270,6 +282,11 @@ class LLMAuditorTests(unittest.TestCase):
         self.assertEqual(payload["options"]["num_ctx"], 4096)
         self.assertEqual(payload["keep_alive"], 0)
         self.assertEqual(response["result"], explanation)
+
+    def test_explanation_prompt_distinguishes_winner_from_non_winners(self):
+        prompt = explanation_prompt({"protocol_consistency": "CONSISTENT"})
+        self.assertIn("O vencedor do claim NÃO se absteve", prompt)
+        self.assertIn("Somente os agentes que não venceram", prompt)
 
     def test_ollama_rejects_non_json_content(self):
         client = OllamaAuditClient(opener=lambda request, timeout: FakeResponse({
