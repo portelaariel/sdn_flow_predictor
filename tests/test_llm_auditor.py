@@ -319,14 +319,20 @@ class LLMAuditorTests(unittest.TestCase):
     def test_evaluation_contract_distinguishes_suppressed_from_not_requested(self):
         prompt = evaluation_prompt({"execution_mode": "authority-dry-run"})
         self.assertIn("DRY_RUN_SUPPRESSED se execution_mode", prompt)
-        self.assertIn("NOT_REQUESTED somente", prompt)
+        self.assertIn("WAITING_PROPOSALS é CONSISTENT", prompt)
+        self.assertIn("um não vencedor nunca deve ser classificado", prompt)
         self.assertIn("AGREED, VETOED e NORMAL são finais", prompt)
         self.assertIn("um estado intermediário é UNKNOWN", prompt)
+        protocol_description = EVALUATION_SCHEMA["properties"][
+            "protocol_consistency"
+        ]["description"]
+        self.assertIn("quórum ainda incompleto", protocol_description)
         description = EVALUATION_SCHEMA["properties"]["execution_status"][
             "description"
         ]
         self.assertIn("DRY_RUN_SUPPRESSED", description)
         self.assertIn("NOT_REQUESTED", description)
+        self.assertIn("SKIPPED_OTHER_COORDINATOR", description)
 
     def test_protocol_campaign_defines_six_transparent_fixtures(self):
         cases = protocol_cases()

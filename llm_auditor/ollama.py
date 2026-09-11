@@ -51,7 +51,13 @@ EVALUATION_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
         "protocol_consistency": {
-            "type": "string", "enum": PROTOCOL_VALUES
+            "type": "string",
+            "enum": PROTOCOL_VALUES,
+            "description": (
+                "Verifica se o estado observado respeita as regras do "
+                "protocolo. Um estado intermediário válido com quórum ainda "
+                "incompleto é CONSISTENT, não INCONSISTENT."
+            ),
         },
         "scenario_correctness": {
             "type": "string", "enum": SCENARIO_VALUES
@@ -63,8 +69,10 @@ EVALUATION_SCHEMA: Dict[str, Any] = {
             "description": (
                 "Status agregado do episódio. DRY_RUN_SUPPRESSED quando um "
                 "vencedor do claim teria executado, mas authority-dry-run "
-                "impediu a atuação; NOT_REQUESTED somente quando nenhuma "
-                "decisão final solicitou execução."
+                "impediu a atuação; SKIPPED_OTHER_COORDINATOR quando uma "
+                "decisão AGREED foi autorizada localmente, mas outro agente "
+                "venceu o claim; NOT_REQUESTED somente quando nenhuma "
+                "decisão solicitou execução local."
             ),
         },
         "operational_effectiveness": {
@@ -167,7 +175,14 @@ def evaluation_prompt(evidence: Dict[str, Any]) -> str:
         "Você é um avaliador experimental, não autoritativo, de decisões do "
         "CoMAS. Classifique separadamente consistência do protocolo, correção "
         "diante do cenário de laboratório, estágio da decisão, execução e "
-        "eficácia operacional. AGREED é uma decisão final de consenso e não "
+        "eficácia operacional. Consistência significa que o estado e as ações "
+        "observadas obedecem às regras do protocolo; não significa que o "
+        "processo já terminou. WAITING_PROPOSALS é CONSISTENT quando existem "
+        "domínios/propostas faltantes, o quórum ainda não foi atingido e não "
+        "houve atuação. CORROBORATED também pode ser CONSISTENT abaixo do "
+        "quórum. Use INCONSISTENT somente se um estado, transição ou ação "
+        "violar os fatos ou um invariante do protocolo. AGREED é uma decisão "
+        "final de consenso e não "
         "significa que a regra foi executada. Em authority-dry-run, a não "
         "execução é intencional e a eficácia operacional é NOT_APPLICABLE. O "
         "vencedor foi selecionado e teria executado, mas o dry-run suprimiu o "
@@ -177,10 +192,13 @@ def evaluation_prompt(evidence: Dict[str, Any]) -> str:
         "houve tentativa que falhou; DRY_RUN_SUPPRESSED se execution_mode é "
         "authority-dry-run, existe atomic_claim_winner_events>=1 e "
         "would_execute_events>=1, mas attempted_execution_events=0 e "
-        "executed_events=0; SKIPPED_OTHER_COORDINATOR somente quando há "
-        "decisão autorizada, mas nenhum vencedor local; NOT_REQUESTED somente "
-        "quando nenhuma decisão final solicitou execução; caso contrário, "
-        "UNKNOWN. "
+        "executed_events=0; SKIPPED_OTHER_COORDINATOR quando existe AGREED "
+        "autorizado, o agente observado não venceu o claim e há evidência de "
+        "que outro coordenador foi eleito; NOT_REQUESTED para estados "
+        "intermediários e para decisões finais negativas, como VETOED ou "
+        "NORMAL, que não solicitam mitigação; caso contrário, UNKNOWN. Uma "
+        "decisão AGREED autorizada solicitou mitigação, portanto um não "
+        "vencedor nunca deve ser classificado como NOT_REQUESTED. "
         "Use as seguintes regras de estágio: AGREED, VETOED e NORMAL são "
         "finais; SUSPECT, CORROBORATED e WAITING* são intermediários válidos. "
         "Para scenario_correctness, um estado intermediário é UNKNOWN; em "
