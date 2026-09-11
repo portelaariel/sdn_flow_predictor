@@ -50,6 +50,11 @@ required_files=(
   experiments/evaluate_agentic_live_campaign.py
   experiments/evaluate_agentic_live_replication.py
   experiments/package_agentic_live_replication.py
+  llm_auditor/__init__.py
+  llm_auditor/__main__.py
+  llm_auditor/cli.py
+  llm_auditor/core.py
+  llm_auditor/ollama.py
   scripts/run_collaborative_benchmark.sh
   scripts/run_agentic_runtime_faults.sh
   scripts/run_agentic_authority_dry_run.sh

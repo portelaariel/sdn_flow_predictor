@@ -452,6 +452,33 @@ As classes possíveis são:
 `INVALID` não é `FN`, e `CONTAMINATED` não deve ser descartado.
 Ambos indicam que a repetição não pode sustentar a conclusão pretendida.
 
+### Auditoria pós-experimento com LLM
+
+O módulo opcional `llm_auditor` agrupa as transições do mesmo episódio e
+verifica deterministicamente quórum, autorização, claim único e execução. Ele
+lê apenas os artefatos de uma execução concluída e não publica no ETCD, chama
+o FlowBlocker ou altera decisões do CoMAS.
+
+Primeiro produza o relatório que serve como referência reproduzível:
+
+```bash
+python3 -m llm_auditor experiments/results/<execução> --mode audit
+```
+
+Para acrescentar uma explicação via Ollama sem permitir que a LLM altere o
+veredito:
+
+```bash
+python3 -m llm_auditor experiments/results/<execução> \
+  --mode explain \
+  --model qwen3.5:9b \
+  --ollama-url http://127.0.0.1:12434
+```
+
+O modo `evaluate` é exclusivamente experimental: ele oculta o veredito da LLM
+e registra a concordância campo a campo com o avaliador determinístico. Os
+detalhes e o contrato de saída estão em `llm_auditor/README.md`.
+
 ## Como a detecção funciona
 
 ### 1. Leitura dos contadores OpenFlow
