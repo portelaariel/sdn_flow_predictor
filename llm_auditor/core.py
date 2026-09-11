@@ -15,6 +15,13 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 
 SCHEMA_VERSION = "1.0"
+VERDICT_FIELDS = [
+    "protocol_consistency",
+    "scenario_correctness",
+    "decision_stage",
+    "execution_status",
+    "operational_effectiveness",
+]
 INTERMEDIATE_STATES = {
     "NO_EVIDENCE",
     "NO_PROPOSALS",
@@ -280,7 +287,7 @@ def _execution_status(events: Sequence[Dict[str, Any]], mode: str) -> str:
         return "DRY_RUN_SUPPRESSED"
     if any(event.get("decision") == "AGREED" for event in agent_events):
         return "SKIPPED_OTHER_COORDINATOR"
-    if _decision_stage(events) == "INTERMEDIATE":
+    if _decision_stage(events) in {"FINAL", "INTERMEDIATE"}:
         return "NOT_REQUESTED"
     return "UNKNOWN"
 
@@ -577,6 +584,7 @@ def evaluate_episode(
     else:
         protocol_consistency = "CONSISTENT"
 
+    decision_stage = _decision_stage(events)
     execution_status = _execution_status(events, mode)
     relevant_domains = sorted({
         str(domain)
@@ -668,9 +676,12 @@ def evaluate_episode(
                 item.get("would_execute") is True for item in executions
             ),
         },
-        "decision_stage": _decision_stage(events),
+        "decision_stage": decision_stage,
         "protocol_consistency": protocol_consistency,
-        "scenario_correctness": _scenario_correctness(metadata, summary),
+        "scenario_correctness": (
+            _scenario_correctness(metadata, summary)
+            if decision_stage == "FINAL" else "UNKNOWN"
+        ),
         "execution_status": execution_status,
         "operational_effectiveness": _operational_effectiveness(
             execution_status, summary
@@ -752,3 +763,22 @@ def evaluation_evidence(record: Dict[str, Any]) -> Dict[str, Any]:
     laboratory.pop("classification", None)
     evidence["laboratory_context"] = laboratory
     return evidence
+
+
+def compare_verdicts(
+    deterministic: Dict[str, Any],
+    llm: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Compara apenas as dimensões categóricas do contrato de avaliação."""
+    comparisons = {
+        field: {
+            "deterministic": deterministic.get(field),
+            "llm": llm.get(field),
+            "matches": deterministic.get(field) == llm.get(field),
+        }
+        for field in VERDICT_FIELDS
+    }
+    return {
+        "all_match": all(value["matches"] for value in comparisons.values()),
+        "fields": comparisons,
+    }

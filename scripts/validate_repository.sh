@@ -55,6 +55,7 @@ required_files=(
   llm_auditor/cli.py
   llm_auditor/core.py
   llm_auditor/ollama.py
+  llm_auditor/protocol_campaign.py
   scripts/run_collaborative_benchmark.sh
   scripts/run_agentic_runtime_faults.sh
   scripts/run_agentic_authority_dry_run.sh

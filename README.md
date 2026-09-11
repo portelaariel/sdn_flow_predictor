@@ -479,6 +479,22 @@ O modo `evaluate` é exclusivamente experimental: ele oculta o veredito da LLM
 e registra a concordância campo a campo com o avaliador determinístico. Os
 detalhes e o contrato de saída estão em `llm_auditor/README.md`.
 
+Para testar isoladamente se a LLM interpreta seis estados representativos do
+protocolo, execute a campanha de fixtures sintéticas:
+
+```bash
+python3 -m llm_auditor.protocol_campaign \
+  --model qwen3.5:9b \
+  --ollama-url http://127.0.0.1:12434 \
+  --seeds 42 \
+  --output llm_protocol_campaign.json
+```
+
+Cada entrada é identificada como `synthetic_protocol_fixture`. Portanto, essa
+campanha mede interpretação semântica da LLM, não desempenho ou escalabilidade
+da rede real. Repetições das mesmas fixtures também não são tratadas como
+experimentos de rede independentes.
+
 ## Como a detecção funciona
 
 ### 1. Leitura dos contadores OpenFlow

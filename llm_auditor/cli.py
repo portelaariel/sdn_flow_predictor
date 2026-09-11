@@ -9,30 +9,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .core import audit_run, evaluation_evidence
+from .core import audit_run, compare_verdicts, evaluation_evidence
 from .ollama import OllamaAuditClient, OllamaAuditError
-
-
-def _agreement(deterministic: Dict[str, Any], llm: Dict[str, Any]) -> Dict[str, Any]:
-    fields = [
-        "protocol_consistency",
-        "scenario_correctness",
-        "decision_stage",
-        "execution_status",
-        "operational_effectiveness",
-    ]
-    comparisons = {
-        field: {
-            "deterministic": deterministic.get(field),
-            "llm": llm.get(field),
-            "matches": deterministic.get(field) == llm.get(field),
-        }
-        for field in fields
-    }
-    return {
-        "all_match": all(value["matches"] for value in comparisons.values()),
-        "fields": comparisons,
-    }
 
 
 def apply_llm(
@@ -47,7 +25,7 @@ def apply_llm(
         elif mode == "evaluate":
             response = client.evaluate(evaluation_evidence(episode))
             episode["llm_evaluation"] = response
-            episode["llm_vs_deterministic"] = _agreement(
+            episode["llm_vs_deterministic"] = compare_verdicts(
                 episode, response["result"]
             )
         else:
@@ -173,4 +151,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

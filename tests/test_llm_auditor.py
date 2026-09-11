@@ -18,6 +18,11 @@ from llm_auditor.ollama import (
     explanation_prompt,
     evaluation_prompt,
 )
+from llm_auditor.protocol_campaign import (
+    evaluate_campaign,
+    new_report,
+    protocol_cases,
+)
 
 
 FLOW = "10.0.0.1->10.0.0.8"
@@ -217,6 +222,26 @@ class LLMAuditorTests(unittest.TestCase):
             episode = audit_run(Path(tmp))["episodes"][0]
         self.assertEqual(episode["decision_stage"], "FINAL")
         self.assertEqual(episode["protocol_consistency"], "CONSISTENT")
+        self.assertEqual(episode["scenario_correctness"], "CORRECT")
+        self.assertEqual(episode["execution_status"], "NOT_REQUESTED")
+
+    def test_intermediate_episode_does_not_inherit_run_classification(self):
+        waiting = {
+            "event_id": "agent:waiting", "flow": FLOW,
+            "decision": "WAITING_PROPOSALS", "evaluated_ns": 160,
+            "missing_domains": ["domain-1"],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_run(
+                tmp,
+                [timeline_row("domain-0", 160, [waiting])],
+                scenario="ddos",
+                classification="TP",
+            )
+            episode = audit_run(Path(tmp))["episodes"][0]
+        self.assertEqual(episode["decision_stage"], "INTERMEDIATE")
+        self.assertEqual(episode["scenario_correctness"], "UNKNOWN")
+        self.assertEqual(episode["execution_status"], "NOT_REQUESTED")
 
     def test_mcda_normal_is_consistent_without_confirming_domains(self):
         normal = {
@@ -232,6 +257,7 @@ class LLMAuditorTests(unittest.TestCase):
             episode = audit_run(Path(tmp))["episodes"][0]
         self.assertEqual(episode["protocol_consistency"], "CONSISTENT")
         self.assertEqual(episode["scenario_correctness"], "CORRECT")
+        self.assertEqual(episode["execution_status"], "NOT_REQUESTED")
 
     def test_evaluation_evidence_hides_deterministic_oracle(self):
         record = {
@@ -294,11 +320,85 @@ class LLMAuditorTests(unittest.TestCase):
         prompt = evaluation_prompt({"execution_mode": "authority-dry-run"})
         self.assertIn("DRY_RUN_SUPPRESSED se execution_mode", prompt)
         self.assertIn("NOT_REQUESTED somente", prompt)
+        self.assertIn("AGREED, VETOED e NORMAL são finais", prompt)
+        self.assertIn("um estado intermediário é UNKNOWN", prompt)
         description = EVALUATION_SCHEMA["properties"]["execution_status"][
             "description"
         ]
         self.assertIn("DRY_RUN_SUPPRESSED", description)
         self.assertIn("NOT_REQUESTED", description)
+
+    def test_protocol_campaign_defines_six_transparent_fixtures(self):
+        cases = protocol_cases()
+        self.assertEqual(
+            [case["case_id"] for case in cases],
+            [
+                "agreed-executor",
+                "waiting-proposals",
+                "agreed-non-executor",
+                "corroborated",
+                "vetoed",
+                "normal-benign",
+            ],
+        )
+        for case in cases:
+            self.assertEqual(
+                case["evidence"]["evidence_origin"],
+                "synthetic_protocol_fixture",
+            )
+            self.assertEqual(case["evidence"]["fixture_id"], case["case_id"])
+
+    def test_protocol_campaign_oracles_keep_intermediate_states_unknown(self):
+        cases = {case["case_id"]: case for case in protocol_cases()}
+        for case_id in ("waiting-proposals", "corroborated"):
+            expected = cases[case_id]["expected"]
+            self.assertEqual(expected["decision_stage"], "INTERMEDIATE")
+            self.assertEqual(expected["scenario_correctness"], "UNKNOWN")
+            self.assertEqual(expected["execution_status"], "NOT_REQUESTED")
+        self.assertEqual(
+            cases["agreed-non-executor"]["expected"]["execution_status"],
+            "SKIPPED_OTHER_COORDINATOR",
+        )
+
+    def test_protocol_campaign_aggregates_case_and_field_matches(self):
+        cases = protocol_cases()[:2]
+        expected_by_id = {
+            case["case_id"]: case["expected"] for case in cases
+        }
+
+        class Client:
+            @staticmethod
+            def evaluate(evidence):
+                result = dict(expected_by_id[evidence["fixture_id"]])
+                result.update({
+                    "confidence": 0.9,
+                    "summary": "fixture correctly classified",
+                    "supporting_evidence": [],
+                    "contradicting_evidence": [],
+                    "missing_information": [],
+                })
+                return {
+                    "result": result,
+                    "metrics": {"total_duration_ns": 1_000_000_000},
+                    "inference_parameters": {"seed": 42},
+                }
+
+        report = new_report(
+            cases,
+            model="fixture-model",
+            seeds=[42],
+            temperature=0.0,
+            num_ctx=4096,
+            keep_alive="5m",
+        )
+        evaluate_campaign(report, client_factory=lambda seed: Client())
+        self.assertEqual(report["campaign_status"], "COMPLETED")
+        self.assertEqual(report["summary"]["complete_matches"], 2)
+        self.assertEqual(report["summary"]["complete_match_rate"], 1.0)
+        self.assertEqual(
+            report["summary"]["field_results"]["execution_status"]["matches"],
+            2,
+        )
 
     def test_ollama_rejects_non_json_content(self):
         client = OllamaAuditClient(opener=lambda request, timeout: FakeResponse({
