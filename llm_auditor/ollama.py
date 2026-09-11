@@ -58,7 +58,14 @@ EVALUATION_SCHEMA: Dict[str, Any] = {
         },
         "decision_stage": {"type": "string", "enum": STAGE_VALUES},
         "execution_status": {
-            "type": "string", "enum": EXECUTION_VALUES
+            "type": "string",
+            "enum": EXECUTION_VALUES,
+            "description": (
+                "Status agregado do episódio. DRY_RUN_SUPPRESSED quando um "
+                "vencedor do claim teria executado, mas authority-dry-run "
+                "impediu a atuação; NOT_REQUESTED somente quando nenhuma "
+                "decisão final solicitou execução."
+            ),
         },
         "operational_effectiveness": {
             "type": "string", "enum": EFFECTIVENESS_VALUES
@@ -165,7 +172,15 @@ def evaluation_prompt(evidence: Dict[str, Any]) -> str:
         "execução é intencional e a eficácia operacional é NOT_APPLICABLE. O "
         "vencedor foi selecionado e teria executado, mas o dry-run suprimiu o "
         "FlowBlocker; somente os não vencedores se abstiveram por já existir "
-        "outro coordenador. "
+        "outro coordenador. Classifique o status agregado do episódio usando "
+        "estas regras, nesta ordem: EXECUTED se executed_events>0; FAILED se "
+        "houve tentativa que falhou; DRY_RUN_SUPPRESSED se execution_mode é "
+        "authority-dry-run, existe atomic_claim_winner_events>=1 e "
+        "would_execute_events>=1, mas attempted_execution_events=0 e "
+        "executed_events=0; SKIPPED_OTHER_COORDINATOR somente quando há "
+        "decisão autorizada, mas nenhum vencedor local; NOT_REQUESTED somente "
+        "quando nenhuma decisão final solicitou execução; caso contrário, "
+        "UNKNOWN. "
         "Estados SUSPECT, CORROBORATED e WAITING* são intermediários válidos. "
         "Não invente fatos e retorne somente o JSON solicitado.\n\n"
         f"Evidência normalizada:\n{_json_block(evidence)}"

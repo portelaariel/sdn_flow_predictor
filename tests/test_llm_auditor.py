@@ -11,10 +11,12 @@ from llm_auditor.core import (
     group_decision_events,
 )
 from llm_auditor.ollama import (
+    EVALUATION_SCHEMA,
     EXPLANATION_SCHEMA,
     OllamaAuditClient,
     OllamaAuditError,
     explanation_prompt,
+    evaluation_prompt,
 )
 
 
@@ -287,6 +289,16 @@ class LLMAuditorTests(unittest.TestCase):
         prompt = explanation_prompt({"protocol_consistency": "CONSISTENT"})
         self.assertIn("O vencedor do claim NÃO se absteve", prompt)
         self.assertIn("Somente os agentes que não venceram", prompt)
+
+    def test_evaluation_contract_distinguishes_suppressed_from_not_requested(self):
+        prompt = evaluation_prompt({"execution_mode": "authority-dry-run"})
+        self.assertIn("DRY_RUN_SUPPRESSED se execution_mode", prompt)
+        self.assertIn("NOT_REQUESTED somente", prompt)
+        description = EVALUATION_SCHEMA["properties"]["execution_status"][
+            "description"
+        ]
+        self.assertIn("DRY_RUN_SUPPRESSED", description)
+        self.assertIn("NOT_REQUESTED", description)
 
     def test_ollama_rejects_non_json_content(self):
         client = OllamaAuditClient(opener=lambda request, timeout: FakeResponse({
